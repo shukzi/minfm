@@ -6,9 +6,6 @@ minfm is a minimal terminal file manager for Linux, written in Rust. It provides
 intuitive keyboard navigation and integrated disk management (including LUKS
 functionality).
 
-It focuses on predictable file operations and guided encrypted-volume handling
-without a plugin system, embedded editor, database, or background daemon.
-
 ## Current scope
 
 - Responsive file table with size, Unix permissions, and modification time
@@ -55,12 +52,11 @@ latest release:
 curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.0/install.sh | MINFM_VERSION=v0.1.0 sh
 ```
 
-The installer installs the binary to `~/.local/bin/minfm` and creates the user
-configuration directory at `~/.config/minfm`. It never replaces an existing
-configuration file. Add `~/.local/bin` to `PATH` if your shell does not already
-include it, then run:
+The installer puts minfm in `~/.local/bin` and creates `~/.config/minfm` for
+your configuration. Existing configuration is kept.
 
 ```sh
+export PATH="$HOME/.local/bin:$PATH"
 minfm
 ```
 
@@ -74,16 +70,25 @@ can use the manual Rust build path.
 
 ## Manual build
 
-Install a stable Rust toolchain, then run:
+Build from source with:
 
 ```sh
+git clone https://github.com/shukzi/minfm.git
+cd minfm
 cargo build --release --locked
+./target/release/minfm
 ```
 
-The binary is written to `target/release/minfm`.
+If Rust is not installed yet:
 
-For a portable static x86-64 binary on Fedora/Debian-like systems, install the
-musl toolchain and build with:
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+Run those commands before the build commands above.
+
+For a portable static x86-64 binary, install the musl toolchain first:
 
 ```sh
 # Fedora
