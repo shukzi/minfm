@@ -102,7 +102,7 @@ minfm
 
 ## Run
 
-Start minfm from any terminal with:
+Start minfm from your terminal with:
 
 ```sh
 minfm
