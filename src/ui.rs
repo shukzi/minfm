@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, AppMode, ClipboardMode, DeviceView, Prompt, TrashView},
+    app::{App, AppMode, ClipboardMode, DeviceView, Prompt, SearchScope, SearchView, TrashView},
     entry::{human_size, EntryKind},
 };
 
@@ -34,6 +34,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::Browser => {}
         AppMode::Prompt(prompt) => draw_prompt(frame, prompt),
         AppMode::Progress => draw_progress_modal(frame, app),
+        AppMode::SearchProgress => draw_search_progress(frame, app),
+        AppMode::SearchResults(view) => draw_search_results(frame, view),
         AppMode::Trash(view) => draw_trash(frame, view),
         AppMode::Devices(view) => draw_devices(frame, view),
         AppMode::Help => draw_help(frame),
@@ -77,6 +79,7 @@ fn draw_browser(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
+    let search_query = app.search_filter.as_deref();
     let rows = app.entries.iter().map(|entry| {
         let marker = if entry.selected { "●" } else { " " };
         let suffix = if entry.kind == EntryKind::Directory {
@@ -84,9 +87,18 @@ fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             ""
         };
+        let name = format!("{}{suffix}", entry.name);
+        let name_cell = if search_query.is_some() {
+            Cell::from(Span::styled(
+                name,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Cell::from(name)
+        };
         Row::new(vec![
             Cell::from(marker),
-            Cell::from(format!("{}{suffix}", entry.name)),
+            name_cell,
             Cell::from(entry.size_text()),
             Cell::from(entry.permissions()),
             Cell::from(entry.modified_text()),
@@ -180,7 +192,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         "↑"
     };
     let base = format!(
-        " {} items · selected: {} · hidden: {} · sort: {} {} ",
+        " {} items · selected: {} · hidden: {} · sort: {} {}{}",
         app.entries.len(),
         selected,
         if app.config.ui.show_hidden {
@@ -190,6 +202,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         },
         app.sort_label(),
         arrow,
+        app.search_filter
+            .as_deref()
+            .map(|query| format!(" · search: {query}"))
+            .unwrap_or_default(),
     );
     let message = app.visible_status();
     let status = if message.is_empty() {
@@ -205,7 +221,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     let line = if matches!(app.mode, AppMode::Browser) {
-        " ↑/↓ j/k Move │ ←/h Parent │ →/l/Enter Open │ g Path │ Space Select │ ? Help\n x Cut │ c Copy │ p Paste │ r Rename │ a New directory │ d/D Trash │ T Bin │ . Hidden │ s Sort │ m Device manager "
+        " ↑/↓ j/k Move │ ←/h Parent │ →/l/Enter Open │ g Path │ / Search here │ F Search filesystem │ Space Select │ ? Help\n x Cut │ c Copy │ p Paste │ r Rename │ a New directory │ d/D Trash │ T Bin │ . Hidden │ s Sort │ m Device manager "
     } else {
         " A dialog owns input. File shortcuts are disabled until it closes. "
     };
@@ -220,11 +236,14 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
     match prompt {
         Prompt::GoTo { input } => input_modal(frame, "Go to path", input, "Enter go · Esc cancel"),
-        Prompt::Search { input } => input_modal(
+        Prompt::Search { input, scope } => input_modal(
             frame,
-            "Search current directory",
+            match scope {
+                SearchScope::CurrentDirectory => "Search current directory",
+                SearchScope::Filesystem => "Search entire filesystem",
+            },
             input,
-            "Enter find · Esc cancel",
+            "Enter search · Esc cancel",
         ),
         Prompt::Rename { input, cursor, .. } => rename_modal(frame, input, *cursor),
         Prompt::CreateDirectory { input } => input_modal(
@@ -487,6 +506,80 @@ fn draw_progress_modal(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_search_progress(frame: &mut Frame, app: &App) {
+    let area = centered(frame.area(), 76, 12);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Search entire filesystem ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let message = if app.search_cancelling {
+        "Cancellation requested…"
+    } else {
+        "Searching from / …"
+    };
+    let body = format!(
+        "{}\n\nMatches found: {}\nPermission errors skipped: {}\n\nEsc cancel",
+        message, app.search_matches, app.search_skipped
+    );
+    frame.render_widget(
+        Paragraph::new(body)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        inner,
+    );
+}
+
+fn draw_search_results(frame: &mut Frame, view: &SearchView) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let rows = view.results.iter().map(|path| {
+        Row::new([Cell::from(path.display().to_string())])
+    });
+    let table = Table::new(rows, [Constraint::Min(20)])
+        .header(
+            Row::new([format!(
+                "{} · {} result(s)",
+                view.query,
+                view.results.len()
+            )])
+            .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("> ")
+        .block(Block::default().borders(Borders::ALL).title(" Filesystem search "));
+    let mut state = TableState::default().with_selected(if view.results.is_empty() {
+        None
+    } else {
+        Some(view.selected)
+    });
+    frame.render_stateful_widget(table, area, &mut state);
+    let footer = if view.limited {
+        "10,000 result limit reached · ↑/↓ j/k Move · Enter open · Esc return".to_string()
+    } else if view.skipped == 0 {
+        "↑/↓ j/k Move · Enter open · / Search here · F Search filesystem · Esc return"
+            .to_string()
+    } else {
+        format!(
+            "↑/↓ j/k Move · Enter open · Esc return · {} permission error(s) skipped",
+            view.skipped
+        )
+    };
+    let footer_area = Rect {
+        x: area.x + 1,
+        y: area.bottom().saturating_sub(2),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED)),
+        footer_area,
+    );
+}
+
 fn append_trash_names(body: &mut String, entries: &[crate::trash::TrashEntry]) {
     for entry in entries.iter().take(6) {
         body.push_str(&format!("{}\n", entry.display_name()));
@@ -637,7 +730,7 @@ fn draw_devices(frame: &mut Frame, view: &DeviceView) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter or →/l  open\n  ←/h            parent\n  g              go to path\n  /              search current directory\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
+    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter or →/l  open\n  ←/h            parent\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
     message_modal(frame, "Help", body, "Esc/Enter close", 70, 44);
 }
 
@@ -711,7 +804,7 @@ fn input_modal(frame: &mut Frame, title: &str, input: &str, footer: &str) {
         .split(inner);
     frame.render_widget(Paragraph::new("Enter a value:"), rows[0]);
     frame.render_widget(
-        Paragraph::new(format!("> {input}"))
+        Paragraph::new(format!("> {input}▌"))
             .block(Block::default().borders(Borders::ALL))
             .style(Style::default().fg(ACCENT)),
         rows[1],

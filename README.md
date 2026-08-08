@@ -16,6 +16,7 @@ functionality.
 
 - File and directory navigation
 - Arrow-key and Vim-style navigation
+- Current-directory search and filesystem-wide search
 - Hidden-file toggle
 - Sorting by name, extension, size, type, permissions, and modification time
 - File size, permissions, and modification-time display

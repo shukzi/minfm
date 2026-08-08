@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while app.running {
         app.poll_operation();
         app.poll_luks_operation();
+        app.poll_search();
         app.poll_devices();
         terminal.draw(|frame| ui::draw(frame, &app))?;
         if event::poll(Duration::from_millis(100))? {
