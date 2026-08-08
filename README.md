@@ -1,6 +1,6 @@
 # minfm
 
-[![CI](https://github.com/shukzi/minfm/actions/workflows/ci.yml/badge.svg)](https://github.com/shukzi/minfm/actions/workflows/ci.yml)
+[CI status](https://github.com/shukzi/minfm/actions/workflows/ci.yml)
 
 minfm is a minimal terminal file manager for Linux, written in Rust. It provides
 intuitive keyboard navigation and integrated disk management, including LUKS
