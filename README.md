@@ -80,6 +80,22 @@ they may be installed using the detected package manager:
 The installer itself requires `curl` and `sha256sum`. These are normally already
 available on Linux systems.
 
+## Uninstall
+
+Remove the installed binary:
+
+```sh
+rm -f ~/.local/bin/minfm
+```
+
+To also remove minfm's configuration:
+
+```sh
+rm -f ~/.config/minfm/config.toml
+```
+
+The trash is not removed by uninstalling minfm.
+
 ## Install a specific version
 
 For a reproducible installation, pin the installer and release assets to the
