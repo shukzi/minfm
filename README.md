@@ -41,6 +41,11 @@ Install the latest release:
 
 ```sh
 curl -fsSL https://github.com/shukzi/minfm/raw/main/install.sh | sh
+```
+
+Run minfm from your terminal with:
+
+```sh
 minfm
 ```
 
@@ -97,14 +102,6 @@ same version:
 
 ```sh
 curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.1/install.sh | MINFM_VERSION=v0.1.1 sh
-minfm
-```
-
-## Run
-
-Start minfm from your terminal with:
-
-```sh
 minfm
 ```
 
