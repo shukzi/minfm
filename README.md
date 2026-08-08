@@ -100,6 +100,14 @@ curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.1/install.sh | MINFM_VERSION
 minfm
 ```
 
+## Run
+
+Start minfm from any terminal with:
+
+```sh
+minfm
+```
+
 ## Configuration
 
 The configuration file is:
