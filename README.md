@@ -1,6 +1,7 @@
 # minfm
 
 [CI status](https://github.com/shukzi/minfm/actions/workflows/ci.yml)
+[Latest release](https://github.com/shukzi/minfm/releases/latest) · [MIT License](LICENSE) · [Linux](https://www.kernel.org/) · Tested with Rust 1.88 · Ratatui 0.30 · Crossterm 0.29
 
 minfm is a minimal terminal file manager for Linux, written in Rust. It provides
 intuitive keyboard navigation and integrated disk management, including LUKS
