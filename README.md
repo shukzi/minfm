@@ -44,17 +44,21 @@ curl -fsSL https://github.com/shukzi/minfm/raw/main/install.sh | sh
 minfm
 ```
 
-The installer:
+The installer downloads the static Linux x86-64 binary and its SHA-256 checksum.
+It verifies the checksum before installing anything.
 
-- Downloads the static Linux x86-64 binary
-- Verifies its SHA-256 checksum
-- Installs it to `~/.local/bin/minfm`
-- Creates `~/.config/minfm`
-- Keeps existing configuration files
-- Checks for missing LUKS tools
-- Asks before installing missing packages
+The installer writes to:
 
-Basic file management does not require extra runtime tools.
+```text
+~/.local/bin/minfm        installed binary
+~/.config/minfm/          user configuration directory
+```
+
+It creates a temporary directory while downloading and removes it when finished.
+It does not write to the source directory and does not replace an existing
+configuration file.
+
+The basic file manager needs only a Linux terminal and the installed binary.
 
 The device manager requires:
 
@@ -66,31 +70,24 @@ cryptsetup
 ```
 
 It also requires a running UDisks2 service and the system's normal authorization
-agent. The installer checks `lsblk`, `udisksctl`, and `cryptsetup`; `findmnt` is
-provided by `util-linux` on supported distributions.
+agent. The installer checks all four tools. If any are missing, it asks whether
+they may be installed using the detected package manager:
 
-For a specific release:
+- Fedora: `util-linux`, `udisks2`, and `cryptsetup`
+- Debian or Ubuntu: `util-linux`, `udisks2`, and `cryptsetup`
+- Arch: `util-linux`, `udisks2`, and `cryptsetup`
 
-```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.0/install.sh | MINFM_VERSION=v0.1.0 sh
-```
+The installer itself requires `curl` and `sha256sum`. These are normally already
+available on Linux systems.
 
-## Build from source
+## Install a specific version
 
-Install Rust if needed:
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-. "$HOME/.cargo/env"
-```
-
-Download, build, and run minfm:
+For a reproducible installation, pin the installer and release assets to the
+same version:
 
 ```sh
-git clone https://github.com/shukzi/minfm.git
-cd minfm
-cargo build --release --locked
-./target/release/minfm
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.1/install.sh | MINFM_VERSION=v0.1.1 sh
+minfm
 ```
 
 ## Configuration
@@ -110,6 +107,24 @@ An example configuration is included in:
 
 ```text
 config.example.toml
+```
+
+## Build from source
+
+Install Rust if needed:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+Download, build, and run minfm:
+
+```sh
+git clone https://github.com/shukzi/minfm.git
+cd minfm
+cargo build --release --locked
+./target/release/minfm
 ```
 
 ## Safety

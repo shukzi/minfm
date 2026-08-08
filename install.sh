@@ -55,7 +55,7 @@ if ! command -v minfm >/dev/null 2>&1; then
 fi
 
 missing=""
-for tool in lsblk udisksctl cryptsetup; do
+for tool in lsblk findmnt udisksctl cryptsetup; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         missing="$missing $tool"
     fi
