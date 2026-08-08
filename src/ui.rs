@@ -36,6 +36,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::Progress => draw_progress_modal(frame, app),
         AppMode::SearchProgress => draw_search_progress(frame, app),
         AppMode::SearchResults(view) => draw_search_results(frame, view),
+        AppMode::UpdateProgress => draw_update_progress(frame),
         AppMode::Trash(view) => draw_trash(frame, view),
         AppMode::Devices(view) => draw_devices(frame, view),
         AppMode::Help => draw_help(frame),
@@ -393,6 +394,14 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
             78,
             12,
         ),
+        Prompt::UpdateAvailable { current, latest } => message_modal(
+            frame,
+            "Update available",
+            &format!("Installed: {current}\nLatest:    {latest}"),
+            "[Enter] Update now   [Esc] Continue",
+            62,
+            11,
+        ),
         Prompt::Message { title, body } => {
             message_modal(frame, title, body, "Enter/Esc close", 72, 12)
         }
@@ -531,24 +540,50 @@ fn draw_search_progress(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_update_progress(frame: &mut Frame) {
+    let area = centered(frame.area(), 68, 10);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Updating minfm ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let phase = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 180) as usize % 4)
+        .unwrap_or(0);
+    let mut squares = ["□", "□", "□", "□"];
+    squares[phase] = "■";
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}\n\nDownloading and verifying the update…\n\nPlease wait",
+            squares.join(" ")
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT)),
+        inner,
+    );
+}
+
 fn draw_search_results(frame: &mut Frame, view: &SearchView) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    let rows = view.results.iter().map(|path| {
-        Row::new([Cell::from(path.display().to_string())])
-    });
+    let rows = view
+        .results
+        .iter()
+        .map(|path| Row::new([Cell::from(path.display().to_string())]));
     let table = Table::new(rows, [Constraint::Min(20)])
         .header(
-            Row::new([format!(
-                "{} · {} result(s)",
-                view.query,
-                view.results.len()
-            )])
-            .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Row::new([format!("{} · {} result(s)", view.query, view.results.len())])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
         )
         .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
         .highlight_symbol("> ")
-        .block(Block::default().borders(Borders::ALL).title(" Filesystem search "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Filesystem search "),
+        );
     let mut state = TableState::default().with_selected(if view.results.is_empty() {
         None
     } else {
@@ -558,8 +593,7 @@ fn draw_search_results(frame: &mut Frame, view: &SearchView) {
     let footer = if view.limited {
         "10,000 result limit reached · ↑/↓ j/k Move · Enter open · Esc return".to_string()
     } else if view.skipped == 0 {
-        "↑/↓ j/k Move · Enter open · / Search here · F Search filesystem · Esc return"
-            .to_string()
+        "↑/↓ j/k Move · Enter open · / Search here · F Search filesystem · Esc return".to_string()
     } else {
         format!(
             "↑/↓ j/k Move · Enter open · Esc return · {} permission error(s) skipped",

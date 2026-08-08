@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -21,6 +20,7 @@ use crate::{
     luks::{self, LuksAction, LuksDevice, LuksOutcome, SecretInput},
     operation::{self, OperationRequest, OperationSummary, OperationUpdate, RunningOperation},
     trash::{TrashEntry, TrashManager},
+    updater,
 };
 
 #[derive(Debug, Clone)]
@@ -84,6 +84,10 @@ pub enum Prompt {
     Mounted {
         path: PathBuf,
     },
+    UpdateAvailable {
+        current: String,
+        latest: String,
+    },
     Message {
         title: String,
         body: String,
@@ -124,6 +128,14 @@ struct RunningSearch {
     skipped: usize,
 }
 
+struct RunningUpdateCheck {
+    receiver: Receiver<updater::CheckOutcome>,
+}
+
+struct RunningUpdate {
+    receiver: Receiver<Result<String, String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrashView {
     pub manager: TrashManager,
@@ -144,6 +156,7 @@ pub enum AppMode {
     Progress,
     SearchProgress,
     SearchResults(SearchView),
+    UpdateProgress,
     Trash(TrashView),
     Devices(DeviceView),
     Help,
@@ -214,9 +227,12 @@ pub struct App {
     loaded_dir: PathBuf,
     pub search_filter: Option<String>,
     search: Option<RunningSearch>,
-    search_matches: usize,
-    search_skipped: usize,
-    search_cancelling: bool,
+    pub search_matches: usize,
+    pub search_skipped: usize,
+    pub search_cancelling: bool,
+    update_check: Option<RunningUpdateCheck>,
+    update: Option<RunningUpdate>,
+    pending_update: Option<String>,
 }
 
 impl App {
@@ -232,7 +248,7 @@ impl App {
         config.behavior.read_only |= force_read_only;
         let mut app = Self {
             running: true,
-            current_dir: start,
+            current_dir: start.clone(),
             entries: Vec::new(),
             cursor: 0,
             config,
@@ -254,9 +270,15 @@ impl App {
             search_matches: 0,
             search_skipped: 0,
             search_cancelling: false,
+            update_check: None,
+            update: None,
+            pending_update: None,
         };
         if matches!(app.mode, AppMode::Browser) {
             app.refresh();
+            if cfg!(not(test)) {
+                app.start_update_check();
+            }
         }
         app
     }
@@ -297,6 +319,7 @@ impl App {
             AppMode::Progress => self.handle_progress_key(key),
             AppMode::SearchProgress => self.handle_search_progress_key(key),
             AppMode::SearchResults(view) => self.handle_search_results_key(view, key),
+            AppMode::UpdateProgress => AppMode::UpdateProgress,
             AppMode::Trash(view) => self.handle_trash_key(view, key),
             AppMode::Devices(view) => self.handle_device_key(view, key),
             AppMode::Help => self.handle_readonly_popup(key, AppMode::Help),
@@ -459,6 +482,58 @@ impl App {
             });
             if self.search_matches == 0 {
                 self.set_notice("No filesystem matches found");
+            }
+        }
+    }
+
+    pub fn poll_update(&mut self) {
+        let check_result =
+            self.update_check
+                .as_ref()
+                .and_then(|check| match check.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => Some(updater::CheckOutcome::Unavailable),
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = check_result {
+            self.update_check = None;
+            if let updater::CheckOutcome::Available { version } = result {
+                self.pending_update = Some(version);
+            }
+        }
+
+        let update_result =
+            self.update
+                .as_ref()
+                .and_then(|update| match update.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("The update worker stopped unexpectedly".into()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = update_result {
+            self.update = None;
+            self.mode = match result {
+                Ok(version) => AppMode::Prompt(Prompt::Message {
+                    title: "Update installed".into(),
+                    body: format!(
+                        "minfm {version} was installed successfully.\n\nRestart minfm to use the new version."
+                    ),
+                }),
+                Err(error) => AppMode::Prompt(Prompt::Message {
+                    title: "Update failed".into(),
+                    body: error,
+                }),
+            };
+        }
+
+        if matches!(self.mode, AppMode::Browser) {
+            if let Some(latest) = self.pending_update.take() {
+                self.mode = AppMode::Prompt(Prompt::UpdateAvailable {
+                    current: env!("CARGO_PKG_VERSION").into(),
+                    latest,
+                });
             }
         }
     }
@@ -828,6 +903,21 @@ impl App {
                 KeyCode::Esc => return AppMode::Browser,
                 _ => {}
             },
+            Prompt::UpdateAvailable { latest, .. } => match key.code {
+                KeyCode::Enter => {
+                    let latest = latest.clone();
+                    return if self.start_update(&latest) {
+                        AppMode::UpdateProgress
+                    } else {
+                        AppMode::Prompt(Prompt::Message {
+                            title: "Update failed".into(),
+                            body: "Could not locate the installed minfm binary".into(),
+                        })
+                    };
+                }
+                KeyCode::Esc => return AppMode::Browser,
+                _ => {}
+            },
             Prompt::Message { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     return AppMode::Browser;
@@ -1127,9 +1217,7 @@ impl App {
                 self.entries = entries
                     .into_iter()
                     .filter(|entry| {
-                        query.is_none_or(|query| {
-                            entry.name.to_lowercase().contains(query)
-                        })
+                        query.is_none_or(|query| entry.name.to_lowercase().contains(query))
                     })
                     .collect();
                 self.cursor = self
@@ -1224,6 +1312,32 @@ impl App {
             results: Vec::new(),
             skipped: 0,
         });
+    }
+
+    fn start_update_check(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(updater::check(env!("CARGO_PKG_VERSION")));
+        });
+        self.update_check = Some(RunningUpdateCheck { receiver });
+    }
+
+    fn start_update(&mut self, version: &str) -> bool {
+        let version = version.to_string();
+        let executable = match env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Could not locate the installed binary: {error}");
+                return false;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = updater::install(&version, &executable).map(|()| version);
+            let _ = sender.send(result);
+        });
+        self.update = Some(RunningUpdate { receiver });
+        true
     }
 
     fn open_search_result(&mut self, path: &Path) {
@@ -1599,12 +1713,7 @@ fn resolve_editor(configured: &str) -> String {
     }
 }
 
-fn search_filesystem(
-    root: &Path,
-    query: &str,
-    sender: &Sender<SearchUpdate>,
-    cancel: &AtomicBool,
-) {
+fn search_filesystem(root: &Path, query: &str, sender: &Sender<SearchUpdate>, cancel: &AtomicBool) {
     const MAX_RESULTS: usize = 10_000;
     let mut pending = vec![root.to_path_buf()];
     let mut result_count = 0;
@@ -1670,6 +1779,9 @@ fn search_filesystem(
 }
 
 fn is_virtual_search_path(path: &Path) -> bool {
+    if path == Path::new("/run") || path.starts_with("/run/media") {
+        return false;
+    }
     ["/proc", "/sys", "/dev", "/run"]
         .iter()
         .map(Path::new)
@@ -1710,6 +1822,29 @@ mod tests {
         assert!(app.operation.is_none());
         assert!(app.running);
         assert!(matches!(app.mode, AppMode::Prompt(Prompt::GoTo { .. })));
+    }
+
+    #[test]
+    fn update_confirmation_ignores_file_shortcuts() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("untouched.txt");
+        std::fs::write(&file, b"safe").unwrap();
+        let mut app = test_app(temp.path());
+        app.mode = AppMode::Prompt(Prompt::UpdateAvailable {
+            current: "0.1.2".into(),
+            latest: "v0.1.3".into(),
+        });
+
+        for ch in ['d', 'D', 'x', 'c', 'p', 'r', 'm', 'q'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        assert!(file.exists());
+        assert!(app.update.is_none());
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::UpdateAvailable { .. })
+        ));
     }
 
     #[test]
@@ -2052,12 +2187,19 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         search_filesystem(temp.path(), "report", &sender, &cancel);
+        drop(sender);
         let updates = receiver.into_iter().collect::<Vec<_>>();
 
         assert!(updates
             .iter()
             .any(|update| matches!(update, SearchUpdate::Match(path) if path == &target)));
-        assert!(matches!(updates.last(), Some(SearchUpdate::Finished { cancelled: false, .. })));
+        assert!(matches!(
+            updates.last(),
+            Some(SearchUpdate::Finished {
+                cancelled: false,
+                ..
+            })
+        ));
     }
 
     #[test]

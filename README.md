@@ -17,6 +17,7 @@ functionality.
 - File and directory navigation
 - Arrow-key and Vim-style navigation
 - Current-directory search and filesystem-wide search
+- Background update checks with confirmed, checksum-verified updates
 - Hidden-file toggle
 - Sorting by name, extension, size, type, permissions, and modification time
 - File size, permissions, and modification-time display
@@ -81,8 +82,9 @@ cryptsetup       cryptsetup    authorization agent
 
 The installer checks all four commands and asks before offering to install
 missing packages using Fedora's, Debian/Ubuntu's, or Arch's package manager.
-The installer itself requires `curl` and `sha256sum`, which are normally already
-available on Linux systems.
+The installer and in-app updater require `curl` and `sha256sum`, which are
+normally already available on Linux systems. Update checks run in the
+background. minfm asks before downloading and installing a newer release.
 
 ## Uninstall
 

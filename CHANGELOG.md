@@ -12,6 +12,10 @@
   background worker.
 - Search — filesystem-wide: cancel searches with Esc, report skipped permission
   errors, and limit results to 10,000 entries.
+- Updater: check GitHub for a newer release in the background when minfm starts.
+- Updater: offer an in-TUI confirmation before downloading an available update.
+- Updater: verify the release SHA-256 checksum and atomically replace only the
+  installed binary.
 
 ### Changed
 
@@ -21,3 +25,6 @@
 - UI: document both search shortcuts in the footer and help popup.
 - Navigation: selector restoration uses entry paths rather than numeric
   indexes.
+- Updater: keep startup responsive and continue normally when the update check
+  is offline, unavailable, or times out.
+- Documentation: explain the updater's `curl` and `sha256sum` requirements.

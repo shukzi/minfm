@@ -7,6 +7,7 @@ mod operation;
 mod safety;
 mod trash;
 mod ui;
+mod updater;
 
 use std::{
     env,
@@ -54,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.poll_operation();
         app.poll_luks_operation();
         app.poll_search();
+        app.poll_update();
         app.poll_devices();
         terminal.draw(|frame| ui::draw(frame, &app))?;
         if event::poll(Duration::from_millis(100))? {
