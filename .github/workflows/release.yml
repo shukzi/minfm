@@ -29,6 +29,15 @@ jobs:
           toolchain: 1.88.0
           targets: x86_64-unknown-linux-musl
 
+      - name: Verify release version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo pkgid | awk -F@ '{print $NF}')"
+          test "$tag_version" = "$package_version" || {
+            echo "Release tag v$tag_version does not match Cargo.toml version $package_version" >&2
+            exit 1
+          }
+
       - name: Build static release binary
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
 

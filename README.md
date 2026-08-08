@@ -49,6 +49,10 @@ Run minfm from your terminal with:
 minfm
 ```
 
+To update an existing installation, run the same install command again. The
+latest binary replaces only `~/.local/bin/minfm`; your configuration and trash
+remain in place.
+
 The installer downloads the static Linux x86-64 binary and its SHA-256 checksum.
 It verifies the checksum before installing anything.
 
@@ -98,7 +102,7 @@ The trash is not removed by uninstalling minfm.
 ## Install a specific version
 
 For a reproducible installation, pin the installer and release assets to the
-same version:
+same published version:
 
 ```sh
 curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.1/install.sh | MINFM_VERSION=v0.1.1 sh
