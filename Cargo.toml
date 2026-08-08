@@ -1,0 +1,27 @@
+[package]
+name = "minfm"
+version = "0.1.0"
+edition = "2021"
+description = "A small, safety-first terminal file manager for Linux"
+license = "MIT"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.29"
+filetime = "0.2"
+nix = { version = "0.29", default-features = false, features = ["fs", "user"] }
+percent-encoding = "2.3"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+rustix = { version = "1.1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+xattr = "1.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

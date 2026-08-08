@@ -1,0 +1,16 @@
+[ui]
+show_hidden = false
+directories_first = true
+sort = "name"
+reverse_sort = false
+show_size = true
+show_permissions = true
+show_modified = true
+
+[behavior]
+verify_copies = true
+read_only = false
+
+[open]
+editor = "$EDITOR"
+opener = "xdg-open"

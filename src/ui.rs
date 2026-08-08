@@ -1,0 +1,807 @@
+use ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap},
+    Frame,
+};
+
+use crate::{
+    app::{App, AppMode, ClipboardMode, DeviceView, Prompt, TrashView},
+    entry::{human_size, EntryKind},
+};
+
+const ACCENT: Color = Color::Cyan;
+const MUTED: Color = Color::DarkGray;
+
+pub fn draw(frame: &mut Frame, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(1),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+
+    draw_header(frame, app, rows[0]);
+    draw_browser(frame, app, rows[1]);
+    draw_status(frame, app, rows[2]);
+    draw_shortcuts(frame, app, rows[3]);
+
+    match &app.mode {
+        AppMode::Browser => {}
+        AppMode::Prompt(prompt) => draw_prompt(frame, prompt),
+        AppMode::Progress => draw_progress_modal(frame, app),
+        AppMode::Trash(view) => draw_trash(frame, view),
+        AppMode::Devices(view) => draw_devices(frame, view),
+        AppMode::Help => draw_help(frame),
+        AppMode::Info => draw_info(frame, app),
+        AppMode::ConfigError { path, error } => draw_config_error(frame, path, error),
+    }
+}
+
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" {} ", app.current_dir.display());
+    let mode = if app.config.behavior.read_only {
+        "READ ONLY"
+    } else {
+        "minfm"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                title,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(mode, Style::default().fg(MUTED)),
+        ]))
+        .block(Block::default().borders(Borders::ALL).title(" minfm ")),
+        area,
+    );
+}
+
+fn draw_browser(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width < 86 {
+        draw_file_table(frame, app, area);
+        return;
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(area);
+    draw_file_table(frame, app, columns[0]);
+    draw_details(frame, app, columns[1]);
+}
+
+fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = app.entries.iter().map(|entry| {
+        let marker = if entry.selected { "●" } else { " " };
+        let suffix = if entry.kind == EntryKind::Directory {
+            "/"
+        } else {
+            ""
+        };
+        Row::new(vec![
+            Cell::from(marker),
+            Cell::from(format!("{}{suffix}", entry.name)),
+            Cell::from(entry.size_text()),
+            Cell::from(entry.permissions()),
+            Cell::from(entry.modified_text()),
+        ])
+    });
+    let size_width = if app.config.ui.show_size { 10 } else { 0 };
+    let permission_width = if app.config.ui.show_permissions {
+        11
+    } else {
+        0
+    };
+    let modified_width = if app.config.ui.show_modified { 19 } else { 0 };
+    let widths = if area.width > 105 {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(18),
+            Constraint::Length(size_width),
+            Constraint::Length(permission_width),
+            Constraint::Length(modified_width),
+        ]
+    } else if area.width > 65 {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(18),
+            Constraint::Length(size_width),
+            Constraint::Length(permission_width),
+            Constraint::Length(0),
+        ]
+    } else {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(15),
+            Constraint::Length(10),
+            Constraint::Length(0),
+            Constraint::Length(0),
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(["", "Name", "Size", "Permissions", "Modified"])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("> ")
+        .block(Block::default().borders(Borders::ALL).title(" Files "));
+    let mut state = TableState::default().with_selected(Some(app.cursor));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
+    let text = if let Some(entry) = app.selected_entry() {
+        let clipboard = app
+            .clipboard
+            .as_ref()
+            .map(|clip| {
+                format!(
+                    "{} item(s) {}",
+                    clip.paths.len(),
+                    match clip.mode {
+                        ClipboardMode::Copy => "copied",
+                        ClipboardMode::Cut => "cut",
+                    }
+                )
+            })
+            .unwrap_or_else(|| "empty".into());
+        format!(
+            "Name: {}\nType: {:?}\nSize: {}\nPermissions: {}\nModified: {}\n\nClipboard: {}",
+            entry.name,
+            entry.kind,
+            entry.size_text(),
+            entry.permissions(),
+            entry.modified_text(),
+            clipboard,
+        )
+    } else {
+        "This directory is empty.".into()
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" Details ")),
+        area,
+    );
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    let selected = app.entries.iter().filter(|entry| entry.selected).count();
+    let arrow = if app.config.ui.reverse_sort {
+        "↓"
+    } else {
+        "↑"
+    };
+    let base = format!(
+        " {} items · selected: {} · hidden: {} · sort: {} {} ",
+        app.entries.len(),
+        selected,
+        if app.config.ui.show_hidden {
+            "on"
+        } else {
+            "off"
+        },
+        app.sort_label(),
+        arrow,
+    );
+    let message = app.visible_status();
+    let status = if message.is_empty() {
+        base
+    } else {
+        format!("{base}· {message}")
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(MUTED)),
+        area,
+    );
+}
+
+fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
+    let line = if matches!(app.mode, AppMode::Browser) {
+        " ↑/↓ j/k Move │ ←/h Parent │ →/l/Enter Open │ g Path │ Space Select │ ? Help\n x Cut │ c Copy │ p Paste │ r Rename │ a New directory │ d/D Trash │ T Bin │ . Hidden │ s Sort │ m Device manager "
+    } else {
+        " A dialog owns input. File shortcuts are disabled until it closes. "
+    };
+    frame.render_widget(
+        Paragraph::new(line)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+        area,
+    );
+}
+
+fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
+    match prompt {
+        Prompt::GoTo { input } => input_modal(frame, "Go to path", input, "Enter go · Esc cancel"),
+        Prompt::Search { input } => input_modal(
+            frame,
+            "Search current directory",
+            input,
+            "Enter find · Esc cancel",
+        ),
+        Prompt::Rename { input, cursor, .. } => rename_modal(frame, input, *cursor),
+        Prompt::CreateDirectory { input } => input_modal(
+            frame,
+            "Create directory",
+            input,
+            "Enter create · Esc cancel",
+        ),
+        Prompt::ConfirmTrash { paths } => {
+            let mut body = format!("Move {} item(s) to trash?\n\n", paths.len());
+            for path in paths.iter().take(6) {
+                body.push_str(&format!("{}\n", path.display()));
+            }
+            if paths.len() > 6 {
+                body.push_str(&format!("… and {} more\n", paths.len() - 6));
+            }
+            message_modal(
+                frame,
+                "Confirm move to trash",
+                &body,
+                "Enter confirm · Esc cancel",
+                70,
+                16,
+            );
+        }
+        Prompt::ConfirmOverwrite { sources, .. } => {
+            let conflicts = sources
+                .iter()
+                .filter_map(|source| source.file_name())
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("\n");
+            message_modal(
+                frame,
+                "Destination already exists",
+                &format!("Existing destination items will be moved to trash before replacement.\n\n{conflicts}"),
+                "o/Enter overwrite · s skip conflicts · a/Esc abort",
+                76,
+                16,
+            );
+        }
+        Prompt::ConfirmRestore { entries, .. } => {
+            let mut body = format!("Restore {} item(s)?\n\n", entries.len());
+            append_trash_names(&mut body, entries);
+            message_modal(
+                frame,
+                "Confirm restore",
+                &body,
+                "r/Enter restore · Esc cancel",
+                76,
+                16,
+            );
+        }
+        Prompt::ConfirmPermanentDelete {
+            entries,
+            clear_all,
+            total_bytes,
+            ..
+        } => {
+            let mut body = if *clear_all {
+                format!(
+                    "Permanently delete all {} trash item(s)?\n\nThis will clear the entire trash bin.\n\n",
+                    entries.len()
+                )
+            } else {
+                format!("Permanently delete {} item(s)?\n\n", entries.len())
+            };
+            body.push_str(&format!("Total size: {}\n\n", human_size(*total_bytes)));
+            append_trash_names(&mut body, entries);
+            body.push_str("\nThis cannot be undone.");
+            message_modal(
+                frame,
+                if *clear_all {
+                    "Clear entire trash bin"
+                } else {
+                    "Permanently delete from trash"
+                },
+                &body,
+                "d/Enter permanently delete · Esc cancel",
+                78,
+                18,
+            );
+        }
+        Prompt::ConfirmLuks { title, body, .. } => {
+            message_modal(frame, title, body, "Enter continue · Esc cancel", 80, 17)
+        }
+        Prompt::LuksPassphrase {
+            source,
+            label,
+            size,
+            input,
+            error,
+        } => {
+            let area = centered(frame.area(), 80, 16);
+            frame.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Unlock and mount LUKS volume ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Device: {}\nLabel: {}\nSize: {}",
+                    source.display(),
+                    label.as_deref().unwrap_or("—"),
+                    human_size(*size),
+                )),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(format!("> {}", "•".repeat(input.character_count())))
+                    .block(Block::default().borders(Borders::ALL).title(" Passphrase "))
+                    .style(Style::default().fg(ACCENT)),
+                rows[1],
+            );
+            let instruction = error
+                .as_deref()
+                .map(|message| format!("{message}\nThe volume remains locked."))
+                .unwrap_or_else(|| "Enter your passphrase to unlock this volume.".into());
+            frame.render_widget(
+                Paragraph::new(instruction)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(MUTED)),
+                rows[2],
+            );
+            frame.render_widget(
+                Paragraph::new("Enter unlock · Esc cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(ACCENT)),
+                rows[3],
+            );
+        }
+        Prompt::Mounted { path } => message_modal(
+            frame,
+            "Volume mounted",
+            &format!("Mounted successfully:\n\n{}", path.display()),
+            "[Enter] Open volume   [Esc] Stay in current directory",
+            78,
+            12,
+        ),
+        Prompt::Message { title, body } => {
+            message_modal(frame, title, body, "Enter/Esc close", 72, 12)
+        }
+        Prompt::Summary { summary, .. } => {
+            let mut body = format!(
+                "Completed: {}\nFailed: {}\nWarnings: {}\nCancelled: {}",
+                summary.completed,
+                summary.failed.len(),
+                summary.warnings.len(),
+                if summary.cancelled { "yes" } else { "no" },
+            );
+            for (path, error) in summary.failed.iter().take(4) {
+                body.push_str(&format!("\n\n{}\n  {}", path.display(), error));
+            }
+            for warning in summary
+                .warnings
+                .iter()
+                .take(4usize.saturating_sub(summary.failed.len().min(4)))
+            {
+                body.push_str(&format!("\n\nWarning\n  {warning}"));
+            }
+            message_modal(frame, "Operation summary", &body, "Enter/Esc close", 80, 20);
+        }
+    }
+}
+
+fn draw_progress_modal(frame: &mut Frame, app: &App) {
+    let area = centered(frame.area(), 72, 13);
+    frame.render_widget(Clear, area);
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", app.progress.label))
+        .inner(area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", app.progress.label)),
+        area,
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let ratio = if app.progress.total_bytes > 0 {
+        app.progress.completed_bytes as f64 / app.progress.total_bytes as f64
+    } else if app.progress.total_items > 0 {
+        app.progress.completed_items as f64 / app.progress.total_items as f64
+    } else {
+        0.0
+    };
+    if app.progress.total_items == 0 && app.progress.total_bytes == 0 {
+        let phase = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| (duration.as_millis() / 180) as usize % 4)
+            .unwrap_or(0);
+        let mut squares = ["□", "□", "□", "□"];
+        squares[phase] = "■";
+        frame.render_widget(
+            Paragraph::new(format!("{}  Working…", squares.join(" ")))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(ACCENT)),
+            rows[0],
+        );
+    } else {
+        frame.render_widget(
+            Gauge::default()
+                .gauge_style(Style::default().fg(ACCENT))
+                .ratio(ratio.clamp(0.0, 1.0))
+                .label(format!(
+                    "{} / {} items",
+                    app.progress.completed_items, app.progress.total_items
+                )),
+            rows[0],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} / {}",
+            human_size(app.progress.completed_bytes),
+            human_size(app.progress.total_bytes)
+        )),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            app.progress
+                .current
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Preparing…".into()),
+        )
+        .wrap(Wrap { trim: false }),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(if app.progress.cancelling {
+            "Cancellation requested…"
+        } else if app.progress.cancellable {
+            "Esc requests cancellation"
+        } else {
+            "Please wait · this disk operation cannot be interrupted safely"
+        })
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(MUTED)),
+        rows[3],
+    );
+}
+
+fn append_trash_names(body: &mut String, entries: &[crate::trash::TrashEntry]) {
+    for entry in entries.iter().take(6) {
+        body.push_str(&format!("{}\n", entry.display_name()));
+    }
+    if entries.len() > 6 {
+        body.push_str(&format!("… and {} more\n", entries.len() - 6));
+    }
+}
+
+fn draw_trash(frame: &mut Frame, view: &TrashView) {
+    let screen = frame.area();
+    let area = Rect {
+        x: screen.x.saturating_add(1),
+        y: screen.y.saturating_add(1),
+        width: screen.width.saturating_sub(2).max(1),
+        height: screen.height.saturating_sub(2).max(1),
+    };
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(4)])
+        .split(area);
+    let rows = view.entries.iter().map(|entry| {
+        Row::new(vec![
+            Cell::from(if view.marked.contains(&entry.trashed_path) {
+                "●"
+            } else {
+                " "
+            }),
+            Cell::from(entry.display_name()),
+            Cell::from(entry.deleted_text()),
+            Cell::from(entry.original_path.display().to_string()),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Percentage(45),
+            Constraint::Length(19),
+            Constraint::Min(20),
+        ],
+    )
+    .header(Row::new(["", "Name", "Deleted", "Original path"]).style(Style::default().fg(MUTED)))
+    .row_highlight_style(Style::default().bg(Color::DarkGray))
+    .highlight_symbol("> ")
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Trash · {} item(s) · {} ",
+        view.entries.len(),
+        view.manager.root().display()
+    )));
+    let mut state = TableState::default().with_selected(if view.entries.is_empty() {
+        None
+    } else {
+        Some(view.selected)
+    });
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new(
+            "Space select │ Enter/r restore │ d permanent delete │ D quick permanent delete\nC clear trash │ T/Esc return",
+        )
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT))
+            .block(Block::default().borders(Borders::ALL)),
+        sections[1],
+    );
+}
+
+fn draw_devices(frame: &mut Frame, view: &DeviceView) {
+    let area = centered(frame.area(), 92, 80);
+    frame.render_widget(Clear, area);
+    let rows = view.devices.iter().map(|device| {
+        Row::new(vec![
+            Cell::from(device.source.display().to_string()),
+            Cell::from(device.label.clone().unwrap_or_else(|| "—".into())),
+            Cell::from(human_size(device.size)),
+            Cell::from(device.state_text()),
+            Cell::from(
+                device
+                    .mountpoints
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(18),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(20),
+            Constraint::Min(10),
+        ],
+    )
+    .header(
+        Row::new(["Device", "Label", "Size", "State", "Mountpoint"])
+            .style(Style::default().fg(MUTED)),
+    )
+    .row_highlight_style(Style::default().bg(Color::DarkGray))
+    .highlight_symbol("> ")
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Encrypted devices · {} found ",
+        view.devices.len()
+    )));
+    let mut state = TableState::default().with_selected(if view.devices.is_empty() {
+        None
+    } else {
+        Some(view.selected)
+    });
+    frame.render_stateful_widget(table, area, &mut state);
+    let footer = Rect {
+        x: area.x + 2,
+        y: area.y + area.height.saturating_sub(2),
+        width: area.width.saturating_sub(4),
+        height: 1,
+    };
+    let action = view
+        .devices
+        .get(view.selected)
+        .map(|device| {
+            if device.system_protected {
+                return "Protected system volume · disk actions unavailable".to_string();
+            }
+            let mut action = if device.is_locked() {
+                "Enter/u unlock and mount".to_string()
+            } else if device.is_mounted() {
+                "Enter/u unmount and lock".to_string()
+            } else {
+                "Enter/m mount".to_string()
+            };
+            if device.ejectable && !device.eject_blocked {
+                action.push_str(" · e eject");
+            } else if device.ejectable && device.eject_blocked {
+                action.push_str(" · eject unavailable: drive in use");
+            }
+            action
+        })
+        .unwrap_or_else(|| "No encrypted volumes found".into());
+    frame.render_widget(
+        Paragraph::new(format!("{action} · r refresh · Esc return"))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        footer,
+    );
+}
+
+fn draw_help(frame: &mut Frame) {
+    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter or →/l  open\n  ←/h            parent\n  g              go to path\n  /              search current directory\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
+    message_modal(frame, "Help", body, "Esc/Enter close", 70, 44);
+}
+
+fn draw_info(frame: &mut Frame, app: &App) {
+    let binary = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let body = format!(
+        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}",
+        env!("CARGO_PKG_VERSION"),
+        binary,
+        app.config_path.display(),
+        app.current_dir.display(),
+        if app.config.behavior.read_only { "read only" } else { "normal" },
+        app.sort_label(),
+        if app.config.ui.reverse_sort { "descending" } else { "ascending" },
+        availability("lsblk"),
+        availability("udisksctl"),
+        availability("cryptsetup"),
+    );
+    message_modal(
+        frame,
+        "Application information",
+        &body,
+        "Esc/Enter close",
+        78,
+        30,
+    );
+}
+
+fn availability(command: &str) -> &'static str {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|directory| directory.join(command).is_file())
+        })
+        .filter(|available| *available)
+        .map(|_| "available")
+        .unwrap_or("missing")
+}
+
+fn draw_config_error(frame: &mut Frame, path: &std::path::Path, error: &str) {
+    let body = format!(
+        "minfm cannot use its configuration.\n\nFile:\n{}\n\n{}\n\nAll file interaction is disabled until the configuration is corrected and reloaded.",
+        path.display(), error
+    );
+    message_modal(
+        frame,
+        "Configuration error",
+        &body,
+        "e edit config · r reload · q quit",
+        84,
+        24,
+    );
+}
+
+fn input_modal(frame: &mut Frame, title: &str, input: &str, footer: &str) {
+    let area = centered(frame.area(), 72, 9);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new("Enter a value:"), rows[0]);
+    frame.render_widget(
+        Paragraph::new(format!("> {input}"))
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED)),
+        rows[2],
+    );
+}
+
+fn rename_modal(frame: &mut Frame, input: &str, cursor: usize) {
+    let area = centered(frame.area(), 72, 9);
+    frame.render_widget(Clear, area);
+    let block = Block::default().borders(Borders::ALL).title(" Rename ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new("Enter a new name:"), rows[0]);
+
+    let characters = input.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(characters.len());
+    let visible_width = rows[1].width.saturating_sub(6) as usize;
+    let start = cursor.saturating_sub(visible_width);
+    let end = (start + visible_width).min(characters.len());
+    let visible = characters[start..end].iter().collect::<String>();
+    frame.render_widget(
+        Paragraph::new(format!("> {visible}"))
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+    let cursor_x = rows[1].x + 3 + cursor.saturating_sub(start).min(visible_width) as u16;
+    frame.set_cursor_position((cursor_x, rows[1].y + 1));
+    frame.render_widget(
+        Paragraph::new("←/→ move · Home/End jump · Enter rename · Esc cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED)),
+        rows[2],
+    );
+}
+
+fn message_modal(
+    frame: &mut Frame,
+    title: &str,
+    body: &str,
+    footer: &str,
+    width: u16,
+    height: u16,
+) {
+    let area = centered(frame.area(), width, height);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[0]);
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = if height > 50 {
+        (area.height * height / 100).max(6)
+    } else {
+        height
+    };
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
