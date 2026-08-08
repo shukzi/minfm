@@ -109,7 +109,7 @@ For a reproducible installation, pin the installer and release assets to the
 same published version:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.1/install.sh | MINFM_VERSION=v0.1.1 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.3/install.sh | MINFM_VERSION=v0.1.3 sh
 minfm
 ```
 

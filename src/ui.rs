@@ -771,7 +771,8 @@ fn draw_devices(frame: &mut Frame, view: &DeviceView) {
 
 fn draw_help(frame: &mut Frame) {
     let body = "Navigation\n  ↑/k ↓/j       move\n  Enter or →/l  open\n  ←/h            parent\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
-    message_modal(frame, "Help", body, "Esc/Enter close", 70, 44);
+    let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
+    message_modal(frame, &title, body, "Esc/Enter close", 70, 44);
 }
 
 fn draw_info(frame: &mut Frame, app: &App) {

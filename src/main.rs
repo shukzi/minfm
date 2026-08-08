@@ -124,6 +124,9 @@ fn parse_args() -> Result<(bool, PathBuf), Box<dyn std::error::Error>> {
     for argument in env::args_os().skip(1) {
         if argument == "--read-only" {
             force_read_only = true;
+        } else if argument == "--version" || argument == "-V" {
+            println!("minfm {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
         } else if argument == "--help" || argument == "-h" {
             println!("minfm [--read-only] [path]");
             std::process::exit(0);

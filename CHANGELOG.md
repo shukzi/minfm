@@ -1,6 +1,6 @@
 # minfm changelog
 
-## Unreleased
+## v0.1.3
 
 ### Changed
 
@@ -28,8 +28,11 @@
   monopolize the UI loop.
 - Safety: preserve symlink identification without following links during the
   optimized directory metadata read.
+- Version display: show the embedded application version in the Help and
+  Application information views, and report it with `minfm --version`, so all
+  version displays stay synchronized with each release.
 - Binary size: the stripped static binary increases from 1,851,880 bytes to
-  1,911,048 bytes, a 3.2% increase, with no new runtime dependencies.
+  1,911,784 bytes, a 3.2% increase, with no new runtime dependencies.
 
 ## v0.1.2
 
