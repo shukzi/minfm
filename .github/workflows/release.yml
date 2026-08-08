@@ -36,7 +36,8 @@ jobs:
         run: |
           mkdir release
           cp target/x86_64-unknown-linux-musl/release/minfm release/minfm-linux-x86_64
-          sha256sum release/minfm-linux-x86_64 > release/minfm-linux-x86_64.sha256
+          cd release
+          sha256sum minfm-linux-x86_64 > minfm-linux-x86_64.sha256
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

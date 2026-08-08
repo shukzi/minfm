@@ -1,8 +1,11 @@
 # minfm
 
-`minfm` is a safety-first terminal file manager for Linux. It focuses on
-predictable file operations and guided encrypted-volume handling without a
-plugin system, embedded editor, database, or background daemon.
+minfm is a minimal terminal file manager for Linux, written in Rust. It provides
+intuitive keyboard navigation and integrated disk management (including LUKS
+functionality).
+
+It focuses on predictable file operations and guided encrypted-volume handling
+without a plugin system, embedded editor, database, or background daemon.
 
 ## Current scope
 
@@ -30,15 +33,56 @@ The device manager discovers encrypted volumes regardless of which session unloc
 them. Devices backing system mounts are protected and never receive mount, unmount,
 lock, or eject actions.
 
-## Build
+## Install
+
+The simplest installation downloads the latest checksum-verified static Linux
+x86-64 release binary:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/shukzi/minfm/main/install.sh | sh
+```
+
+The installer installs the binary to `~/.local/bin/minfm` and creates the user
+configuration directory at `~/.config/minfm`. It never replaces an existing
+configuration file. Add `~/.local/bin` to `PATH` if your shell does not already
+include it, then run:
+
+```sh
+minfm
+```
+
+The static binary does not include Linux desktop services. For device management
+and LUKS operations, the installer detects missing `lsblk`, `udisksctl`, and
+`cryptsetup` tools and asks before offering the appropriate Fedora, Debian/Ubuntu,
+or Arch package command. File management works without those optional tools.
+
+## Manual build
 
 Install a stable Rust toolchain, then run:
 
 ```sh
-cargo build --release
+cargo build --release --locked
 ```
 
 The binary is written to `target/release/minfm`.
+
+For a portable static x86-64 binary on Fedora/Debian-like systems, install the
+musl toolchain and build with:
+
+```sh
+# Fedora
+sudo dnf install musl-gcc
+
+# Debian/Ubuntu
+sudo apt install musl-tools
+
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --locked --target x86_64-unknown-linux-musl
+```
+
+The static binary is written to
+`target/x86_64-unknown-linux-musl/release/minfm`. Published releases include a
+SHA-256 checksum beside the binary.
 
 ## Run
 
