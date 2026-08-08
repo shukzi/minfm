@@ -5,7 +5,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
         Arc,
     },
     thread,
@@ -328,15 +328,17 @@ impl App {
         };
     }
 
-    pub fn poll_operation(&mut self) {
+    pub fn poll_operation(&mut self) -> bool {
         let Some(operation) = &self.operation else {
-            return;
+            return false;
         };
-        let mut updates = Vec::new();
-        while let Ok(update) = operation.receiver.try_recv() {
-            updates.push(update);
-        }
-        for update in updates {
+        let mut finished = None;
+        let mut changed = false;
+        for _ in 0..512 {
+            let Ok(update) = operation.receiver.try_recv() else {
+                break;
+            };
+            changed = true;
             match update {
                 OperationUpdate::Started {
                     label,
@@ -357,34 +359,37 @@ impl App {
                     self.progress.completed_bytes = completed_bytes;
                 }
                 OperationUpdate::Finished(summary) => {
-                    self.operation = None;
-                    let return_to_trash = self.operation_trash_manager.take();
-                    self.refresh();
-                    if summary.failed.is_empty()
-                        && summary.warnings.is_empty()
-                        && !summary.cancelled
-                    {
-                        self.set_notice(format!(
-                            "{} completed: {} item(s)",
-                            summary.label, summary.completed
-                        ));
-                        self.mode = if let Some(manager) = return_to_trash {
-                            self.open_trash_manager(manager)
-                        } else {
-                            AppMode::Browser
-                        };
-                    } else {
-                        self.mode = AppMode::Prompt(Prompt::Summary {
-                            summary,
-                            return_to_trash,
-                        });
-                    }
+                    finished = Some(summary);
+                    break;
                 }
             }
         }
+        let Some(summary) = finished else {
+            return changed;
+        };
+        self.operation = None;
+        let return_to_trash = self.operation_trash_manager.take();
+        self.refresh();
+        if summary.failed.is_empty() && summary.warnings.is_empty() && !summary.cancelled {
+            self.set_notice(format!(
+                "{} completed: {} item(s)",
+                summary.label, summary.completed
+            ));
+            self.mode = if let Some(manager) = return_to_trash {
+                self.open_trash_manager(manager)
+            } else {
+                AppMode::Browser
+            };
+        } else {
+            self.mode = AppMode::Prompt(Prompt::Summary {
+                summary,
+                return_to_trash,
+            });
+        }
+        true
     }
 
-    pub fn poll_luks_operation(&mut self) {
+    pub fn poll_luks_operation(&mut self) -> bool {
         let retry = self.luks_operation.as_ref().and_then(|running| {
             running.retry.as_ref().map(|retry| LuksRetry {
                 source: retry.source.clone(),
@@ -398,7 +403,7 @@ impl App {
             .map(|running| running.receiver.try_recv())
         {
             Some(Ok(result)) => result,
-            Some(Err(TryRecvError::Empty)) | None => return,
+            Some(Err(TryRecvError::Empty)) | None => return false,
             Some(Err(TryRecvError::Disconnected)) => Err(crate::error::MinfmError::Message(
                 "encrypted-volume worker stopped unexpectedly".into(),
             )),
@@ -434,30 +439,28 @@ impl App {
                 self.mode = self.open_devices();
             }
         }
+        true
     }
 
-    pub fn poll_search(&mut self) {
-        let Some(search) = &self.search else {
-            return;
+    pub fn poll_search(&mut self) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
         };
-        let mut updates = Vec::new();
-        while let Ok(update) = search.receiver.try_recv() {
-            updates.push(update);
-        }
         let mut finished = None;
-        for update in updates {
+        let mut changed = false;
+        for _ in 0..1_024 {
+            let Ok(update) = search.receiver.try_recv() else {
+                break;
+            };
+            changed = true;
             match update {
                 SearchUpdate::Match(path) => {
-                    if let Some(search) = &mut self.search {
-                        search.results.push(path);
-                        self.search_matches = search.results.len();
-                    }
+                    search.results.push(path);
+                    self.search_matches = search.results.len();
                 }
                 SearchUpdate::PermissionDenied => {
-                    if let Some(search) = &mut self.search {
-                        search.skipped += 1;
-                        self.search_skipped = search.skipped;
-                    }
+                    search.skipped += 1;
+                    self.search_skipped = search.skipped;
                 }
                 SearchUpdate::Finished { cancelled, limited } => {
                     finished = Some((cancelled, limited))
@@ -465,7 +468,7 @@ impl App {
             }
         }
         let Some((cancelled, limited)) = finished else {
-            return;
+            return changed;
         };
         let search = self.search.take().expect("search exists while polling");
         self.search_cancelling = false;
@@ -484,9 +487,11 @@ impl App {
                 self.set_notice("No filesystem matches found");
             }
         }
+        true
     }
 
-    pub fn poll_update(&mut self) {
+    pub fn poll_update(&mut self) -> bool {
+        let mut changed = false;
         let check_result =
             self.update_check
                 .as_ref()
@@ -496,6 +501,7 @@ impl App {
                     Err(TryRecvError::Empty) => None,
                 });
         if let Some(result) = check_result {
+            changed = true;
             self.update_check = None;
             if let updater::CheckOutcome::Available { version } = result {
                 self.pending_update = Some(version);
@@ -513,6 +519,7 @@ impl App {
                     Err(TryRecvError::Empty) => None,
                 });
         if let Some(result) = update_result {
+            changed = true;
             self.update = None;
             self.mode = match result {
                 Ok(version) => AppMode::Prompt(Prompt::Message {
@@ -530,19 +537,21 @@ impl App {
 
         if matches!(self.mode, AppMode::Browser) {
             if let Some(latest) = self.pending_update.take() {
+                changed = true;
                 self.mode = AppMode::Prompt(Prompt::UpdateAvailable {
                     current: env!("CARGO_PKG_VERSION").into(),
                     latest,
                 });
             }
         }
+        changed
     }
 
-    pub fn poll_devices(&mut self) {
+    pub fn poll_devices(&mut self) -> bool {
         if !matches!(self.mode, AppMode::Devices(_))
             || self.last_device_refresh.elapsed() < Duration::from_secs(1)
         {
-            return;
+            return false;
         }
         self.last_device_refresh = Instant::now();
         let selected_source = match &self.mode {
@@ -561,6 +570,28 @@ impl App {
             }
             Err(error) => self.status = format!("Automatic disk refresh failed: {error}"),
         }
+        true
+    }
+
+    pub fn poll_status_expiry(&mut self) -> bool {
+        let Some((message, deadline)) = &self.status_expiry else {
+            return false;
+        };
+        if Instant::now() < *deadline {
+            return false;
+        }
+        if &self.status == message {
+            self.status.clear();
+        }
+        self.status_expiry = None;
+        true
+    }
+
+    pub fn needs_animation(&self) -> bool {
+        matches!(self.mode, AppMode::UpdateProgress)
+            || (matches!(self.mode, AppMode::Progress)
+                && self.progress.total_items == 0
+                && self.progress.total_bytes == 0)
     }
 
     pub fn selected_entry(&self) -> Option<&FileEntry> {
@@ -1217,7 +1248,9 @@ impl App {
                 self.entries = entries
                     .into_iter()
                     .filter(|entry| {
-                        query.is_none_or(|query| entry.name.to_lowercase().contains(query))
+                        query.is_none_or(|query| {
+                            entry::contains_case_insensitive(&entry.name, query)
+                        })
                     })
                     .collect();
                 self.cursor = self
@@ -1295,7 +1328,8 @@ impl App {
     }
 
     fn start_filesystem_search(&mut self, query: &str) {
-        let (sender, receiver) = mpsc::channel();
+        const SEARCH_QUEUE_CAPACITY: usize = 512;
+        let (sender, receiver) = mpsc::sync_channel(SEARCH_QUEUE_CAPACITY);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let query_lower = query.to_lowercase();
@@ -1713,7 +1747,12 @@ fn resolve_editor(configured: &str) -> String {
     }
 }
 
-fn search_filesystem(root: &Path, query: &str, sender: &Sender<SearchUpdate>, cancel: &AtomicBool) {
+fn search_filesystem(
+    root: &Path,
+    query: &str,
+    sender: &SyncSender<SearchUpdate>,
+    cancel: &AtomicBool,
+) {
     const MAX_RESULTS: usize = 10_000;
     let mut pending = vec![root.to_path_buf()];
     let mut result_count = 0;
@@ -1747,7 +1786,6 @@ fn search_filesystem(root: &Path, query: &str, sender: &Sender<SearchUpdate>, ca
                     continue;
                 }
             };
-            let path = item.path();
             let file_type = match item.file_type() {
                 Ok(file_type) => file_type,
                 Err(_) => {
@@ -1755,20 +1793,28 @@ fn search_filesystem(root: &Path, query: &str, sender: &Sender<SearchUpdate>, ca
                     continue;
                 }
             };
-            if file_type.is_dir() && !file_type.is_symlink() {
+            let file_name = item.file_name();
+            let matches = entry::contains_case_insensitive(&file_name.to_string_lossy(), query);
+            let is_directory = file_type.is_dir() && !file_type.is_symlink();
+            if is_directory {
+                let path = item.path();
                 pending.push(path.clone());
-            }
-            if path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_lowercase().contains(query))
-                .unwrap_or(false)
-            {
+                if !matches {
+                    continue;
+                }
                 if result_count >= MAX_RESULTS {
                     limited = true;
                     break;
                 }
                 result_count += 1;
                 let _ = sender.send(SearchUpdate::Match(path));
+            } else if matches {
+                if result_count >= MAX_RESULTS {
+                    limited = true;
+                    break;
+                }
+                result_count += 1;
+                let _ = sender.send(SearchUpdate::Match(item.path()));
             }
         }
         if cancelled || limited {
@@ -2183,7 +2229,7 @@ mod tests {
         std::fs::create_dir(&nested).unwrap();
         let target = nested.join("Report.txt");
         std::fs::write(&target, b"report").unwrap();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(512);
         let cancel = AtomicBool::new(false);
 
         search_filesystem(temp.path(), "report", &sender, &cancel);
@@ -2200,6 +2246,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_filesystem_search() {
+        let root = std::env::var_os("MINFM_PERF_SEARCH_DIR")
+            .map(PathBuf::from)
+            .expect("MINFM_PERF_SEARCH_DIR is required");
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let (sender, receiver) = mpsc::sync_channel(512);
+            let cancel = AtomicBool::new(false);
+            let started = Instant::now();
+            search_filesystem(&root, "needle", &sender, &cancel);
+            drop(sender);
+            let matches = receiver
+                .into_iter()
+                .filter(|update| matches!(update, SearchUpdate::Match(_)))
+                .count();
+            assert_eq!(matches, 250);
+            samples.push(started.elapsed());
+        }
+        samples.sort();
+        eprintln!("PERF search_median_us={}", samples[4].as_micros());
     }
 
     #[test]

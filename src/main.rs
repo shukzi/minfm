@@ -13,7 +13,7 @@ use std::{
     env,
     io::{self, stdout},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use app::{App, PendingSystemAction, SystemActionOutcome};
@@ -51,17 +51,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    let mut redraw = true;
+    let mut last_animation = Instant::now();
     while app.running {
-        app.poll_operation();
-        app.poll_luks_operation();
-        app.poll_search();
-        app.poll_update();
-        app.poll_devices();
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        redraw |= app.poll_operation();
+        redraw |= app.poll_luks_operation();
+        redraw |= app.poll_search();
+        redraw |= app.poll_update();
+        redraw |= app.poll_devices();
+        redraw |= app.poll_status_expiry();
+        if app.needs_animation() && last_animation.elapsed() >= Duration::from_millis(180) {
+            redraw = true;
+            last_animation = Instant::now();
+        }
+        if redraw {
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+            redraw = false;
+        }
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => app.handle_key(key),
-                Event::Resize(_, _) => {}
+                Event::Key(key) => {
+                    app.handle_key(key);
+                    redraw = true;
+                }
+                Event::Resize(_, _) => redraw = true,
                 _ => {}
             }
         }
@@ -75,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             terminal.clear()?;
             terminal.hide_cursor()?;
             app.finish_system_action(&action, result);
+            redraw = true;
         }
     }
     Ok(())

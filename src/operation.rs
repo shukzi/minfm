@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, SyncSender},
         Arc,
     },
     thread,
@@ -76,14 +76,15 @@ pub struct RunningOperation {
 }
 
 pub fn spawn(request: OperationRequest) -> RunningOperation {
-    let (sender, receiver) = mpsc::channel();
+    const UPDATE_QUEUE_CAPACITY: usize = 256;
+    let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     thread::spawn(move || run(request, sender, worker_cancel));
     RunningOperation { receiver, cancel }
 }
 
-fn run(request: OperationRequest, sender: Sender<OperationUpdate>, cancel: Arc<AtomicBool>) {
+fn run(request: OperationRequest, sender: SyncSender<OperationUpdate>, cancel: Arc<AtomicBool>) {
     let (label, paths) = match &request {
         OperationRequest::Copy { sources, cut, .. } => (
             if *cut { "Moving" } else { "Copying" }.to_string(),
@@ -98,7 +99,14 @@ fn run(request: OperationRequest, sender: Sender<OperationUpdate>, cancel: Arc<A
                 .collect(),
         ),
     };
-    let total_bytes = paths.iter().map(|path| estimate_size(path)).sum();
+    let paths = paths
+        .into_iter()
+        .map(|path| {
+            let estimated_size = estimate_size(&path);
+            (path, estimated_size)
+        })
+        .collect::<Vec<_>>();
+    let total_bytes = paths.iter().map(|(_, size)| size).sum();
     let _ = sender.send(OperationUpdate::Started {
         label: label.clone(),
         total_items: paths.len(),
@@ -110,12 +118,11 @@ fn run(request: OperationRequest, sender: Sender<OperationUpdate>, cancel: Arc<A
     };
     let mut completed_bytes: u64 = 0;
 
-    for path in paths {
+    for (path, path_bytes) in paths {
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;
         }
-        let path_bytes = estimate_size(&path);
         let result = match &request {
             OperationRequest::Copy {
                 destination,
@@ -712,6 +719,26 @@ fn cleanup_partial(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn benchmark_operation_size_preflight() {
+        let root = std::env::var_os("MINFM_PERF_SEARCH_DIR")
+            .map(PathBuf::from)
+            .expect("MINFM_PERF_SEARCH_DIR is required");
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let started = Instant::now();
+            assert_eq!(estimate_size(&root), 0);
+            samples.push(started.elapsed());
+        }
+        samples.sort();
+        eprintln!(
+            "PERF operation_preflight_median_us={}",
+            samples[4].as_micros()
+        );
+    }
 
     #[test]
     fn failed_copy_does_not_replace_destination() {

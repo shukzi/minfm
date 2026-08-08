@@ -2,7 +2,34 @@
 
 ## Unreleased
 
-Changes for the next release will be recorded here.
+### Changed
+
+- Performance: render only visible browser, search-result, and trash rows, and
+  redraw only when state changes or an operation indicator is animated.
+- Rendering: reduce median frame time in a 20,000-entry directory from
+  22.625 ms to 0.299 ms, a 98.7% reduction and 75.7× speedup.
+- Idle resource usage: reduce five-second CPU time from 1.033 seconds to
+  0.045 seconds—about 20.5% to 0.9% of one CPU core—and peak resident memory
+  from 54.9 MiB to 12.1 MiB.
+- Navigation: reduce CPU time for 100 selector movements from 2.601 seconds to
+  0.080 seconds and peak resident memory from 54.9 MiB to 12.1 MiB.
+- Directory loading: use directory-entry metadata and cached sort keys,
+  reducing median load-and-sort time in a randomized 20,000-entry directory
+  from 44.384 ms to 31.136 ms, a 29.8% reduction.
+- Search: avoid constructing complete paths for nonmatching files and use an
+  allocation-free fast path for common case-insensitive matches, reducing
+  median traversal time across 25,250 files from 9.593 ms to 7.770 ms, a
+  19.0% reduction.
+- File operations: calculate recursive operation sizes once and reuse them,
+  reducing median preflight time across 25,250 files from 88.006 ms to
+  44.240 ms, a 49.7% reduction.
+- Resource limits: bound search and file-operation update queues and process
+  updates in batches so fast workers cannot grow memory without limit or
+  monopolize the UI loop.
+- Safety: preserve symlink identification without following links during the
+  optimized directory metadata read.
+- Binary size: the stripped static binary increases from 1,851,880 bytes to
+  1,911,048 bytes, a 3.2% increase, with no new runtime dependencies.
 
 ## v0.1.2
 

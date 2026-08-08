@@ -81,7 +81,10 @@ fn draw_browser(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
     let search_query = app.search_filter.as_deref();
-    let rows = app.entries.iter().map(|entry| {
+    let visible_count = usize::from(area.height.saturating_sub(3)).max(1);
+    let start = viewport_start(app.cursor, app.entries.len(), visible_count);
+    let end = (start + visible_count).min(app.entries.len());
+    let rows = app.entries[start..end].iter().map(|entry| {
         let marker = if entry.selected { "●" } else { " " };
         let suffix = if entry.kind == EntryKind::Directory {
             "/"
@@ -145,7 +148,8 @@ fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
         .highlight_symbol("> ")
         .block(Block::default().borders(Borders::ALL).title(" Files "));
-    let mut state = TableState::default().with_selected(Some(app.cursor));
+    let selected = (!app.entries.is_empty()).then_some(app.cursor.saturating_sub(start));
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -568,8 +572,13 @@ fn draw_update_progress(frame: &mut Frame) {
 fn draw_search_results(frame: &mut Frame, view: &SearchView) {
     let area = frame.area();
     frame.render_widget(Clear, area);
+    let visible_count = usize::from(area.height.saturating_sub(4)).max(1);
+    let start = viewport_start(view.selected, view.results.len(), visible_count);
+    let end = (start + visible_count).min(view.results.len());
     let rows = view
         .results
+        .get(start..end)
+        .unwrap_or_default()
         .iter()
         .map(|path| Row::new([Cell::from(path.display().to_string())]));
     let table = Table::new(rows, [Constraint::Min(20)])
@@ -584,11 +593,8 @@ fn draw_search_results(frame: &mut Frame, view: &SearchView) {
                 .borders(Borders::ALL)
                 .title(" Filesystem search "),
         );
-    let mut state = TableState::default().with_selected(if view.results.is_empty() {
-        None
-    } else {
-        Some(view.selected)
-    });
+    let selected = (!view.results.is_empty()).then_some(view.selected.saturating_sub(start));
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
     let footer = if view.limited {
         "10,000 result limit reached · ↑/↓ j/k Move · Enter open · Esc return".to_string()
@@ -636,7 +642,10 @@ fn draw_trash(frame: &mut Frame, view: &TrashView) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(4)])
         .split(area);
-    let rows = view.entries.iter().map(|entry| {
+    let visible_count = usize::from(sections[0].height.saturating_sub(3)).max(1);
+    let start = viewport_start(view.selected, view.entries.len(), visible_count);
+    let end = (start + visible_count).min(view.entries.len());
+    let rows = view.entries[start..end].iter().map(|entry| {
         Row::new(vec![
             Cell::from(if view.marked.contains(&entry.trashed_path) {
                 "●"
@@ -665,11 +674,8 @@ fn draw_trash(frame: &mut Frame, view: &TrashView) {
         view.entries.len(),
         view.manager.root().display()
     )));
-    let mut state = TableState::default().with_selected(if view.entries.is_empty() {
-        None
-    } else {
-        Some(view.selected)
-    });
+    let selected = (!view.entries.is_empty()).then_some(view.selected.saturating_sub(start));
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
         Paragraph::new(
@@ -930,5 +936,59 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
+    }
+}
+
+fn viewport_start(selected: usize, item_count: usize, visible_count: usize) -> usize {
+    if item_count <= visible_count || selected < visible_count {
+        0
+    } else {
+        (selected + 1 - visible_count).min(item_count - visible_count)
+    }
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+    use crate::config::{Config, ConfigLoad};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::{path::PathBuf, time::Instant};
+
+    #[test]
+    fn viewport_tracks_selection_without_exceeding_bounds() {
+        assert_eq!(viewport_start(0, 100, 10), 0);
+        assert_eq!(viewport_start(9, 100, 10), 0);
+        assert_eq!(viewport_start(10, 100, 10), 1);
+        assert_eq!(viewport_start(99, 100, 10), 90);
+        assert_eq!(viewport_start(0, 5, 10), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_large_directory_render() {
+        let path = std::env::var_os("MINFM_PERF_LARGE_DIR")
+            .map(PathBuf::from)
+            .expect("MINFM_PERF_LARGE_DIR is required");
+        let app = App::new(
+            path.clone(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: path.join("config.toml"),
+            },
+            true,
+        );
+        assert_eq!(app.entries.len(), 20_000);
+        let backend = TestBackend::new(160, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let started = Instant::now();
+        for _ in 0..100 {
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "PERF render_100_us={} render_mean_us={}",
+            elapsed.as_micros(),
+            elapsed.as_micros() / 100
+        );
     }
 }

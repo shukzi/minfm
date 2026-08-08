@@ -1,6 +1,5 @@
 use std::{
-    cmp::Ordering,
-    ffi::OsStr,
+    ffi::OsString,
     fs,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -32,8 +31,9 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    pub fn from_path(path: PathBuf) -> std::io::Result<Self> {
-        let metadata = fs::symlink_metadata(&path)?;
+    fn from_dir_entry(item: fs::DirEntry) -> std::io::Result<Self> {
+        let metadata = item.metadata()?;
+        let path = item.path();
         let file_type = metadata.file_type();
         let kind = if file_type.is_symlink() {
             EntryKind::Symlink
@@ -46,11 +46,7 @@ impl FileEntry {
         } else {
             EntryKind::Other
         };
-        let name = path
-            .file_name()
-            .unwrap_or_else(|| OsStr::new("/"))
-            .to_string_lossy()
-            .into_owned();
+        let name = item.file_name().to_string_lossy().into_owned();
         Ok(Self {
             path,
             name,
@@ -122,40 +118,68 @@ pub fn read_directory(
     let mut entries = Vec::new();
     for item in read {
         let Ok(item) = item else { continue };
-        let Ok(entry) = FileEntry::from_path(item.path()) else {
+        let Ok(entry) = FileEntry::from_dir_entry(item) else {
             continue;
         };
         if show_hidden || !entry.is_hidden() {
             entries.push(entry);
         }
     }
-    entries.sort_by(|left, right| compare(left, right, sort, directories_first));
+    let directory_rank = |entry: &FileEntry| {
+        if directories_first && entry.kind != EntryKind::Directory {
+            1_u8
+        } else {
+            0_u8
+        }
+    };
+    match sort {
+        SortSetting::Name => {
+            entries.sort_by_cached_key(|entry| (directory_rank(entry), entry.name.to_lowercase()))
+        }
+        SortSetting::Extension => entries.sort_by_cached_key(|entry| {
+            (
+                directory_rank(entry),
+                entry.path.extension().map(OsString::from),
+                entry.name.to_lowercase(),
+            )
+        }),
+        SortSetting::Size => entries.sort_by_cached_key(|entry| {
+            (directory_rank(entry), entry.size, entry.name.to_lowercase())
+        }),
+        SortSetting::Modified => entries.sort_by_cached_key(|entry| {
+            (
+                directory_rank(entry),
+                entry.modified,
+                entry.name.to_lowercase(),
+            )
+        }),
+        SortSetting::Type => entries.sort_by_cached_key(|entry| {
+            (directory_rank(entry), entry.kind, entry.name.to_lowercase())
+        }),
+        SortSetting::Permissions => entries.sort_by_cached_key(|entry| {
+            (directory_rank(entry), entry.mode, entry.name.to_lowercase())
+        }),
+    }
     if reverse {
         entries.reverse();
     }
     Ok(entries)
 }
 
-fn compare(left: &FileEntry, right: &FileEntry, sort: SortSetting, dirs_first: bool) -> Ordering {
-    if dirs_first {
-        match (
-            left.kind == EntryKind::Directory,
-            right.kind == EntryKind::Directory,
-        ) {
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            _ => {}
-        }
+pub fn contains_case_insensitive(haystack: &str, lowercase_needle: &str) -> bool {
+    if lowercase_needle.is_empty() {
+        return true;
     }
-    let order = match sort {
-        SortSetting::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-        SortSetting::Extension => left.path.extension().cmp(&right.path.extension()),
-        SortSetting::Size => left.size.cmp(&right.size),
-        SortSetting::Modified => left.modified.cmp(&right.modified),
-        SortSetting::Type => left.kind.cmp(&right.kind),
-        SortSetting::Permissions => left.mode.cmp(&right.mode),
-    };
-    order.then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    if haystack.contains(lowercase_needle) {
+        return true;
+    }
+    if haystack.is_ascii() && lowercase_needle.is_ascii() {
+        return haystack
+            .as_bytes()
+            .windows(lowercase_needle.len())
+            .any(|window| window.eq_ignore_ascii_case(lowercase_needle.as_bytes()));
+    }
+    haystack.to_lowercase().contains(lowercase_needle)
 }
 
 pub fn human_size(size: u64) -> String {
@@ -176,6 +200,8 @@ pub fn human_size(size: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::Instant;
 
     #[test]
     fn formats_permissions() {
@@ -189,5 +215,42 @@ mod tests {
             selected: false,
         };
         assert_eq!(entry.permissions(), "-rwxr-xr--");
+    }
+
+    #[test]
+    fn finds_ascii_and_unicode_case_insensitively() {
+        assert!(contains_case_insensitive("QuarterlyReport.TXT", "report"));
+        assert!(contains_case_insensitive("RÉSUMÉ.txt", "résumé"));
+        assert!(!contains_case_insensitive("notes.txt", "report"));
+    }
+
+    #[test]
+    fn directory_reader_does_not_follow_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, temp.path().join("link")).unwrap();
+
+        let entries = read_directory(temp.path(), true, SortSetting::Name, false, true).unwrap();
+        let link = entries.iter().find(|entry| entry.name == "link").unwrap();
+
+        assert_eq!(link.kind, EntryKind::Symlink);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_large_directory_read_and_sort() {
+        let path = std::env::var_os("MINFM_PERF_LARGE_DIR")
+            .map(PathBuf::from)
+            .expect("MINFM_PERF_LARGE_DIR is required");
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let started = Instant::now();
+            let entries = read_directory(&path, true, SortSetting::Name, false, true).unwrap();
+            assert_eq!(entries.len(), 20_000);
+            samples.push(started.elapsed());
+        }
+        samples.sort();
+        eprintln!("PERF directory_median_us={}", samples[4].as_micros());
     }
 }
