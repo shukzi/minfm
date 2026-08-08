@@ -628,7 +628,7 @@ impl App {
                     if failures.is_empty() {
                         self.set_notice(format!("Restored {restored} item(s)"));
                         self.refresh();
-                        return self.open_trash();
+                        return self.open_trash_manager(manager.clone());
                     }
                     return AppMode::Prompt(Prompt::Summary {
                         summary: OperationSummary {
