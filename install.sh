@@ -2,7 +2,11 @@
 set -eu
 
 repo="shukzi/minfm"
-release_base="https://github.com/${repo}/releases/latest/download"
+if [ -n "${MINFM_VERSION:-}" ]; then
+    release_base="https://github.com/${repo}/releases/download/${MINFM_VERSION}"
+else
+    release_base="https://github.com/${repo}/releases/latest/download"
+fi
 binary_name="minfm-linux-x86_64"
 binary_url="${release_base}/${binary_name}"
 checksum_url="${release_base}/${binary_name}.sha256"

@@ -42,6 +42,13 @@ x86-64 release binary:
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/shukzi/minfm/main/install.sh | sh
 ```
 
+For a reproducible install of a specific release, pin both the installer and
+the release assets:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/shukzi/minfm/v0.1.0/install.sh | MINFM_VERSION=v0.1.0 sh
+```
+
 The installer installs the binary to `~/.local/bin/minfm` and creates the user
 configuration directory at `~/.config/minfm`. It never replaces an existing
 configuration file. Add `~/.local/bin` to `PATH` if your shell does not already
