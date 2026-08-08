@@ -44,14 +44,15 @@ The simplest installation downloads the latest checksum-verified static Linux
 x86-64 release binary:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/shukzi/minfm/main/install.sh | sh
+curl -fsSL https://github.com/shukzi/minfm/raw/main/install.sh | sh
 ```
 
 For a reproducible install of a specific release, pin both the installer and
-the release assets:
+the release assets. This is optional; the command above always follows the
+latest release:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/shukzi/minfm/v0.1.0/install.sh | MINFM_VERSION=v0.1.0 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.0/install.sh | MINFM_VERSION=v0.1.0 sh
 ```
 
 The installer installs the binary to `~/.local/bin/minfm` and creates the user
