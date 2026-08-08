@@ -58,26 +58,20 @@ It creates a temporary directory while downloading and removes it when finished.
 It does not write to the source directory and does not replace an existing
 configuration file.
 
-The basic file manager needs only a Linux terminal and the installed binary.
-
-The device manager requires:
+The basic file manager needs only a Linux terminal and the installed binary. The
+device manager uses:
 
 ```text
-lsblk
-findmnt
-udisksctl
-cryptsetup
+Command          Package       Required service
+lsblk            util-linux    —
+findmnt          util-linux    —
+udisksctl        udisks2       UDisks2
+cryptsetup       cryptsetup    authorization agent
 ```
 
-It also requires a running UDisks2 service and the system's normal authorization
-agent. The installer checks all four tools. If any are missing, it asks whether
-they may be installed using the detected package manager:
-
-- Fedora: `util-linux`, `udisks2`, and `cryptsetup`
-- Debian or Ubuntu: `util-linux`, `udisks2`, and `cryptsetup`
-- Arch: `util-linux`, `udisks2`, and `cryptsetup`
-
-The installer itself requires `curl` and `sha256sum`. These are normally already
+The installer checks all four commands and asks before offering to install
+missing packages using Fedora's, Debian/Ubuntu's, or Arch's package manager.
+The installer itself requires `curl` and `sha256sum`, which are normally already
 available on Linux systems.
 
 ## Uninstall
