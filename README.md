@@ -1,5 +1,7 @@
 # minfm
 
+[![CI](https://github.com/shukzi/minfm/actions/workflows/ci.yml/badge.svg)](https://github.com/shukzi/minfm/actions/workflows/ci.yml)
+
 minfm is a minimal terminal file manager for Linux, written in Rust. It provides
 intuitive keyboard navigation and integrated disk management (including LUKS
 functionality).
@@ -35,6 +37,9 @@ lock, or eject actions.
 
 ## Install
 
+The first release must be published before the binary install command below can
+download a release asset. Until then, build from source with the manual steps.
+
 The simplest installation downloads the latest checksum-verified static Linux
 x86-64 release binary:
 
@@ -62,6 +67,9 @@ The static binary does not include Linux desktop services. For device management
 and LUKS operations, the installer detects missing `lsblk`, `udisksctl`, and
 `cryptsetup` tools and asks before offering the appropriate Fedora, Debian/Ubuntu,
 or Arch package command. File management works without those optional tools.
+
+The published static release currently targets x86-64 Linux. Other architectures
+can use the manual Rust build path.
 
 ## Manual build
 
