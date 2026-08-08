@@ -120,10 +120,12 @@ file interaction remains disabled until it is corrected and reloaded.
 
 ## Safety
 
-The default test suite creates all mutable fixtures inside temporary directories.
-It does not access real block devices, system directories, mounts, or the user's
-real trash. LUKS tests parse synthetic `lsblk` fixtures and never execute device
-commands. No privileged or destructive integration tests are included.
-
-Release qualification additionally uses an explicitly identified disposable USB
-device. Those manual tests are destructive and must never target a system disk.
+- Delete moves files to the trash.
+- Permanent deletion is only available from the trash view.
+- Important system paths are protected.
+- Overwrites require confirmation.
+- Copy operations verify the result when enabled.
+- Failed operations report what did not complete.
+- LUKS passphrases stay masked, and system/root volumes cannot be locked or
+  unmounted.
+- Keep backups of important files. No file manager can replace a backup.
