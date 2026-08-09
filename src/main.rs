@@ -1,4 +1,5 @@
 mod app;
+mod browser_loader;
 mod config;
 mod entry;
 mod error;
@@ -55,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut redraw = true;
     let mut last_animation = Instant::now();
     while app.running {
+        redraw |= app.poll_browser_load();
         redraw |= app.poll_operation();
         redraw |= app.poll_luks_operation();
         redraw |= app.poll_search();
@@ -70,7 +72,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             terminal.draw(|frame| ui::draw(frame, &app))?;
             redraw = false;
         }
-        if event::poll(Duration::from_millis(100))? {
+        let input_poll = if app.browser_loading || app.device_refreshing {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(input_poll)? {
             match event::read()? {
                 Event::Key(key) => {
                     app.handle_key(key);

@@ -31,7 +31,7 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    fn from_dir_entry(item: fs::DirEntry) -> std::io::Result<Self> {
+    pub(crate) fn from_dir_entry(item: fs::DirEntry) -> std::io::Result<Self> {
         let metadata = item.metadata()?;
         let path = item.path();
         let file_type = metadata.file_type();
@@ -199,6 +199,16 @@ pub fn read_directory(
             entries.push(entry);
         }
     }
+    sort_entries(&mut entries, sort, reverse, directories_first);
+    Ok(entries)
+}
+
+pub(crate) fn sort_entries(
+    entries: &mut [FileEntry],
+    sort: SortSetting,
+    reverse: bool,
+    directories_first: bool,
+) {
     let directory_rank = |entry: &FileEntry| {
         if directories_first && entry.kind != EntryKind::Directory {
             1_u8
@@ -237,7 +247,6 @@ pub fn read_directory(
     if reverse {
         entries.reverse();
     }
-    Ok(entries)
 }
 
 pub fn contains_case_insensitive(haystack: &str, lowercase_needle: &str) -> bool {

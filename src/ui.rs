@@ -8,8 +8,8 @@ use ratatui::{
 
 use crate::{
     app::{
-        format_elapsed, App, AppMode, ClipboardMode, DeviceView, Prompt, SearchScope, SearchView,
-        TrashView,
+        format_elapsed, App, AppMode, BrowserView, ClipboardMode, DeviceView, Prompt, SearchScope,
+        SearchView, TrashView,
     },
     entry::{human_size, EntryKind},
 };
@@ -24,7 +24,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(6),
             Constraint::Length(1),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(frame.area());
 
@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::SearchResults(view) => draw_search_results(frame, view),
         AppMode::UpdateProgress => draw_update_progress(frame),
         AppMode::Trash(view) => draw_trash(frame, view),
-        AppMode::Devices(view) => draw_devices(frame, view),
+        AppMode::Devices(view) => draw_devices(frame, app, view),
         AppMode::Help => draw_help(frame),
         AppMode::Info => draw_info(frame, app),
         AppMode::ConfigError { path, error } => draw_config_error(frame, path, error),
@@ -70,6 +70,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_browser(frame: &mut Frame, app: &App, area: Rect) {
+    match app.browser_view {
+        BrowserView::Tree => draw_tree_view(frame, app, area),
+        BrowserView::Table => draw_table_view(frame, app, area),
+    }
+}
+
+fn draw_table_view(frame: &mut Frame, app: &App, area: Rect) {
     if area.width < 86 {
         draw_file_table(frame, app, area);
         return;
@@ -80,6 +87,93 @@ fn draw_browser(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
     draw_file_table(frame, app, columns[0]);
     draw_details(frame, app, columns[1]);
+}
+
+fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
+    let search_query = app.search_filter.as_deref();
+    let visible_count = usize::from(area.height.saturating_sub(1)).max(1);
+    let start = viewport_start(app.cursor, app.entries.len(), visible_count);
+    let end = (start + visible_count).min(app.entries.len());
+    let rows = app.entries[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| {
+            let index = start + offset;
+            let depth = app.tree_depth(index);
+            let marker = if entry.selected { "●" } else { " " };
+            let branch = if entry.kind == EntryKind::Directory {
+                if app.is_tree_directory_expanded(&entry.path) {
+                    "▾ "
+                } else {
+                    "▸ "
+                }
+            } else {
+                "  "
+            };
+            let suffix = if entry.kind == EntryKind::Directory {
+                "/"
+            } else {
+                ""
+            };
+            let name = format!("{}{branch}{}{suffix}", "  ".repeat(depth), entry.name);
+            let name_cell = if search_query.is_some() {
+                Cell::from(Span::styled(
+                    name,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Cell::from(name)
+            };
+            Row::new(vec![
+                Cell::from(marker),
+                name_cell,
+                Cell::from(entry.size_text()),
+                Cell::from(entry.permissions()),
+                Cell::from(entry.modified_text()),
+            ])
+        });
+    let size_width = if app.config.ui.show_size { 10 } else { 0 };
+    let permission_width = if app.config.ui.show_permissions {
+        11
+    } else {
+        0
+    };
+    let modified_width = if app.config.ui.show_modified { 19 } else { 0 };
+    let widths = if area.width > 105 {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(18),
+            Constraint::Length(size_width),
+            Constraint::Length(permission_width),
+            Constraint::Length(modified_width),
+        ]
+    } else if area.width > 65 {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(18),
+            Constraint::Length(size_width),
+            Constraint::Length(permission_width),
+            Constraint::Length(0),
+        ]
+    } else {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(15),
+            Constraint::Length(10),
+            Constraint::Length(0),
+            Constraint::Length(0),
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(["", "Tree", "Size", "Permissions", "Modified"])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("> ");
+    let selected = (!app.entries.is_empty()).then_some(app.cursor.saturating_sub(start));
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
@@ -199,8 +293,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "↑"
     };
+    let loading = if app.browser_loading {
+        format!(" · loading: {}", app.browser_loaded_entries)
+    } else {
+        String::new()
+    };
     let base = format!(
-        " {} items · selected: {} · hidden: {} · sort: {} {}{}",
+        " {} items · selected: {} · hidden: {} · sort: {} {}{}{}",
         app.entries.len(),
         selected,
         if app.config.ui.show_hidden {
@@ -214,12 +313,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             .as_deref()
             .map(|query| format!(" · search: {query}"))
             .unwrap_or_default(),
+        loading,
     );
     let message = app.visible_status();
     let status = if message.is_empty() {
         base
     } else {
-        format!("{base}· {message}")
+        format!("{base} · {message}")
     };
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(MUTED)),
@@ -228,27 +328,64 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
-    let line = if matches!(app.mode, AppMode::Browser) {
-        let edit = if app
-            .selected_entry()
-            .is_some_and(|entry| entry.is_text_file())
-        {
-            " │ e Edit"
-        } else {
-            ""
-        };
-        format!(
-            " ↑/↓ j/k Move │ ←/h Parent │ →/l/Enter Open{edit} │ g Path │ / Search here │ F Search filesystem │ Space Select │ ? Help\n x Cut │ c Copy │ p Paste │ r Rename │ n New file │ a New directory │ d/D Trash │ T Bin │ . Hidden │ s Sort │ m Device manager "
-        )
+    if !matches!(app.mode, AppMode::Browser) {
+        frame.render_widget(
+            Paragraph::new(" A dialog owns input. File shortcuts are disabled until it closes. ")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
+    let edit = if app
+        .selected_entry()
+        .is_some_and(|entry| entry.is_text_file())
+    {
+        " · e Edit"
     } else {
-        " A dialog owns input. File shortcuts are disabled until it closes. ".into()
+        ""
     };
-    frame.render_widget(
-        Paragraph::new(line)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
-        area,
-    );
+    let open_controls = match app.browser_view {
+        BrowserView::Tree => "→l Expand · Enter Open",
+        BrowserView::Table => "→l/Enter Open",
+    };
+    let view = match app.browser_view {
+        BrowserView::Tree => "v Table",
+        BrowserView::Table => "v Tree",
+    };
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+    let groups = [
+        format!(
+            " NAVIGATION\n ↑↓/jk Move · ←h Parent\n {open_controls}{edit} · {view} · ? Help"
+        ),
+        " FILE OPERATIONS\n Space Mark · x Cut · c Copy · p Paste\n r Rename · n File · a Dir".into(),
+        " VIEW & DEVICES\n d/D Trash · T Bin · . Hidden · s Sort\n m Devices · g Path · / Search · F Search FS".into(),
+    ];
+
+    for (index, group) in groups.into_iter().enumerate() {
+        let block = if index < columns.len() - 1 {
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(Color::DarkGray))
+        } else {
+            Block::default()
+        };
+        frame.render_widget(
+            Paragraph::new(group)
+                .block(block)
+                .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+            columns[index],
+        );
+    }
 }
 
 fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
@@ -760,7 +897,7 @@ fn draw_trash(frame: &mut Frame, view: &TrashView) {
     );
 }
 
-fn draw_devices(frame: &mut Frame, view: &DeviceView) {
+fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
     let area = centered(frame.area(), 92, 80);
     frame.render_widget(Clear, area);
     let rows = view.devices.iter().map(|device| {
@@ -832,7 +969,13 @@ fn draw_devices(frame: &mut Frame, view: &DeviceView) {
             }
             action
         })
-        .unwrap_or_else(|| "No encrypted volumes found".into());
+        .unwrap_or_else(|| {
+            if app.device_refreshing {
+                "Refreshing devices…".into()
+            } else {
+                "No encrypted volumes found".into()
+            }
+        });
     frame.render_widget(
         Paragraph::new(format!("{action} · r refresh · Esc return"))
             .alignment(Alignment::Center)
@@ -842,7 +985,7 @@ fn draw_devices(frame: &mut Frame, view: &DeviceView) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter or →/l  open\n  ←/h            parent\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
+    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter          toggle directory or open file\n  →/l            expand/child in tree; open in table\n  ←/h            collapse/parent in tree; parent in table\n  v              toggle tree/table view\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
     let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
     message_modal(frame, &title, body, "Esc/Enter close", 70, 44);
 }
@@ -852,12 +995,13 @@ fn draw_info(frame: &mut Frame, app: &App) {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
     let body = format!(
-        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}",
+        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}",
         env!("CARGO_PKG_VERSION"),
         binary,
         app.config_path.display(),
         app.current_dir.display(),
         if app.config.behavior.read_only { "read only" } else { "normal" },
+        app.browser_view_label(),
         app.sort_label(),
         if app.config.ui.reverse_sort { "descending" } else { "ascending" },
         availability("lsblk"),

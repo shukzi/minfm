@@ -14,8 +14,9 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
+    browser_loader::{self, LoadRequest, LoadUpdate, RunningLoad},
     config::{self, Config, ConfigLoad, SortSetting},
-    entry::{self, FileEntry},
+    entry::{self, EntryKind, FileEntry},
     launcher::{self, LaunchError},
     luks::{self, LuksAction, LuksDevice, LuksOutcome, SecretInput},
     operation::{self, OperationRequest, OperationSummary, OperationUpdate, RunningOperation},
@@ -144,6 +145,11 @@ struct RunningUpdate {
     receiver: Receiver<Result<String, String>>,
 }
 
+struct RunningDeviceRefresh {
+    receiver: Receiver<Result<Vec<LuksDevice>, String>>,
+    selected_source: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrashView {
     pub manager: TrashManager,
@@ -170,6 +176,12 @@ pub enum AppMode {
     Help,
     Info,
     ConfigError { path: PathBuf, error: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserView {
+    Tree,
+    Table,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -235,7 +247,9 @@ const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(10);
 pub struct App {
     pub running: bool,
     pub current_dir: PathBuf,
+    pub browser_view: BrowserView,
     pub entries: Vec<FileEntry>,
+    pub tree_depths: Vec<usize>,
     pub cursor: usize,
     pub config: Config,
     pub config_path: PathBuf,
@@ -252,8 +266,19 @@ pub struct App {
     pending_launch_errors: VecDeque<LaunchError>,
     pending_terminal_editor: Option<PendingTerminalEditor>,
     last_device_refresh: Instant,
+    device_refresh: Option<RunningDeviceRefresh>,
+    pub device_refreshing: bool,
     selector_memory: HashMap<PathBuf, PathBuf>,
+    expanded_directories: HashSet<PathBuf>,
     loaded_dir: PathBuf,
+    browser_load: Option<RunningLoad>,
+    pending_browser_load: Option<LoadRequest>,
+    browser_generation: u64,
+    pub browser_loading: bool,
+    pub browser_loaded_entries: usize,
+    pub browser_load_elapsed: Option<Duration>,
+    browser_user_navigated: bool,
+    pending_directory_search: Option<String>,
     pub search_filter: Option<String>,
     search: Option<RunningSearch>,
     pub search_matches: usize,
@@ -279,7 +304,9 @@ impl App {
         let mut app = Self {
             running: true,
             current_dir: start.clone(),
+            browser_view: BrowserView::Tree,
             entries: Vec::new(),
+            tree_depths: Vec::new(),
             cursor: 0,
             config,
             config_path,
@@ -296,8 +323,19 @@ impl App {
             pending_launch_errors: VecDeque::new(),
             pending_terminal_editor: None,
             last_device_refresh: Instant::now(),
+            device_refresh: None,
+            device_refreshing: false,
             selector_memory: HashMap::new(),
+            expanded_directories: HashSet::new(),
             loaded_dir: start.clone(),
+            browser_load: None,
+            pending_browser_load: None,
+            browser_generation: 0,
+            browser_loading: false,
+            browser_loaded_entries: 0,
+            browser_load_elapsed: None,
+            browser_user_navigated: false,
+            pending_directory_search: None,
             search_filter: None,
             search: None,
             search_matches: 0,
@@ -323,6 +361,21 @@ impl App {
             }
             _ => &self.status,
         }
+    }
+
+    pub fn browser_view_label(&self) -> &'static str {
+        match self.browser_view {
+            BrowserView::Tree => "Tree",
+            BrowserView::Table => "Table",
+        }
+    }
+
+    pub fn tree_depth(&self, index: usize) -> usize {
+        self.tree_depths.get(index).copied().unwrap_or(0)
+    }
+
+    pub fn is_tree_directory_expanded(&self, path: &Path) -> bool {
+        self.expanded_directories.contains(path)
     }
 
     fn set_notice(&mut self, message: impl Into<String>) {
@@ -359,6 +412,128 @@ impl App {
             AppMode::Info => self.handle_readonly_popup(key, AppMode::Info),
             AppMode::ConfigError { path, error } => self.handle_config_error(path, error, key),
         };
+    }
+
+    pub fn poll_browser_load(&mut self) -> bool {
+        let Some(running) = &self.browser_load else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        let mut disconnected = false;
+        for _ in 0..64 {
+            match running.receiver.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if updates.is_empty() && !disconnected {
+            return false;
+        }
+
+        let active_generation = running.generation;
+        let mut finished = disconnected;
+        let mut received_finished = false;
+        let mut reload_without_filter = false;
+        for update in updates {
+            match update {
+                LoadUpdate::Batch {
+                    generation,
+                    entries,
+                    depths,
+                } if generation == self.browser_generation => {
+                    if self.browser_loaded_entries == 0 {
+                        self.entries.clear();
+                        self.tree_depths.clear();
+                        self.cursor = 0;
+                    }
+                    self.browser_loaded_entries += entries.len();
+                    self.entries.extend(entries);
+                    if self.browser_view == BrowserView::Tree {
+                        self.tree_depths.extend(depths);
+                    }
+                }
+                LoadUpdate::Finished { generation, result } => {
+                    finished = true;
+                    received_finished = true;
+                    if generation != self.browser_generation {
+                        continue;
+                    }
+                    self.browser_loading = false;
+                    match result {
+                        Ok(result)
+                            if result.root == self.current_dir
+                                && result.view == self.browser_view =>
+                        {
+                            let entry_count = result.entries.len();
+                            let live_preferred = self
+                                .browser_user_navigated
+                                .then(|| self.selected_entry().map(|entry| entry.path.clone()))
+                                .flatten();
+                            self.cursor = live_preferred
+                                .as_ref()
+                                .or(result.preferred.as_ref())
+                                .or_else(|| self.selector_memory.get(&result.root))
+                                .and_then(|path| {
+                                    result.entries.iter().position(|entry| &entry.path == path)
+                                })
+                                .unwrap_or_else(|| {
+                                    result
+                                        .fallback_cursor
+                                        .min(result.entries.len().saturating_sub(1))
+                                });
+                            self.browser_loaded_entries = result.entries.len();
+                            self.entries = result.entries;
+                            self.tree_depths = result.depths;
+                            self.loaded_dir = result.root;
+                            self.browser_load_elapsed = Some(result.elapsed);
+                            self.browser_user_navigated = false;
+                            if let Some(warning) = result.warning {
+                                self.status = warning;
+                            }
+                            if let Some(query) = self.pending_directory_search.take() {
+                                if entry_count == 0 {
+                                    self.search_filter = None;
+                                    self.status = format!("No match for {query}");
+                                    reload_without_filter = true;
+                                } else {
+                                    self.set_notice(format!("Search: {entry_count} match(es)"));
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) if error != "directory load cancelled" => {
+                            self.entries.clear();
+                            self.tree_depths.clear();
+                            self.cursor = 0;
+                            self.status = error;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                LoadUpdate::Batch { .. } => {}
+            }
+        }
+
+        if finished {
+            if disconnected && !received_finished && active_generation == self.browser_generation {
+                self.browser_loading = false;
+                self.status = "directory load worker stopped unexpectedly".into();
+            }
+            self.browser_load = None;
+            if reload_without_filter {
+                self.pending_browser_load = None;
+                self.refresh();
+            } else if let Some(request) = self.pending_browser_load.take() {
+                self.browser_loaded_entries = 0;
+                self.browser_loading = true;
+                self.browser_load = Some(browser_loader::spawn(request));
+            }
+        }
+        true
     }
 
     pub fn poll_operation(&mut self) -> bool {
@@ -607,29 +782,72 @@ impl App {
     }
 
     pub fn poll_devices(&mut self) -> bool {
-        if !matches!(self.mode, AppMode::Devices(_))
-            || self.last_device_refresh.elapsed() < Duration::from_secs(1)
-        {
-            return false;
-        }
-        self.last_device_refresh = Instant::now();
-        let selected_source = match &self.mode {
-            AppMode::Devices(view) => view
-                .devices
-                .get(view.selected)
-                .map(|device| device.source.clone()),
-            _ => None,
-        };
-        match luks::discover() {
-            Ok(devices) => {
-                let selected = selected_source
-                    .and_then(|source| devices.iter().position(|device| device.source == source))
-                    .unwrap_or(0);
-                self.mode = AppMode::Devices(DeviceView { devices, selected });
+        let result =
+            self.device_refresh
+                .as_ref()
+                .and_then(|refresh| match refresh.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("device refresh worker stopped unexpectedly".into()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        let mut changed = false;
+        if let Some(result) = result {
+            let selected_source = self
+                .device_refresh
+                .as_ref()
+                .and_then(|refresh| refresh.selected_source.clone());
+            self.device_refresh = None;
+            self.device_refreshing = false;
+            changed = true;
+            if matches!(self.mode, AppMode::Devices(_)) {
+                match result {
+                    Ok(devices) => {
+                        let selected = selected_source
+                            .and_then(|source| {
+                                devices.iter().position(|device| device.source == source)
+                            })
+                            .unwrap_or(0);
+                        self.mode = AppMode::Devices(DeviceView { devices, selected });
+                    }
+                    Err(error) => self.status = format!("Automatic disk refresh failed: {error}"),
+                }
             }
-            Err(error) => self.status = format!("Automatic disk refresh failed: {error}"),
         }
-        true
+
+        if self.device_refresh.is_none()
+            && matches!(self.mode, AppMode::Devices(_))
+            && self.last_device_refresh.elapsed() >= Duration::from_secs(1)
+        {
+            let selected_source = match &self.mode {
+                AppMode::Devices(view) => view
+                    .devices
+                    .get(view.selected)
+                    .map(|device| device.source.clone()),
+                _ => None,
+            };
+            self.start_device_refresh(selected_source);
+            changed = true;
+        }
+        changed
+    }
+
+    fn start_device_refresh(&mut self, selected_source: Option<PathBuf>) {
+        if self.device_refresh.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = luks::discover().map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        self.last_device_refresh = Instant::now();
+        self.device_refreshing = true;
+        self.device_refresh = Some(RunningDeviceRefresh {
+            receiver,
+            selected_source,
+        });
     }
 
     pub fn poll_status_expiry(&mut self) -> bool {
@@ -647,7 +865,8 @@ impl App {
     }
 
     pub fn needs_animation(&self) -> bool {
-        matches!(self.mode, AppMode::UpdateProgress)
+        self.browser_loading
+            || matches!(self.mode, AppMode::UpdateProgress)
             || (matches!(self.mode, AppMode::Progress)
                 && self.progress.total_items == 0
                 && self.progress.total_bytes == 0)
@@ -693,17 +912,10 @@ impl App {
                 let Some(snapshot) = &action.browser else {
                     return;
                 };
-                self.refresh();
                 for entry in &mut self.entries {
                     entry.selected = snapshot.selected_paths.contains(&entry.path);
                 }
-                if let Some(index) = self
-                    .entries
-                    .iter()
-                    .position(|entry| entry.path == snapshot.cursor_path)
-                {
-                    self.cursor = index;
-                }
+                self.refresh_browser(Some(snapshot.cursor_path.clone()));
             }
             Err(error) => {
                 let config_error = match &self.mode {
@@ -743,8 +955,23 @@ impl App {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => return self.open_selected(),
-            KeyCode::Left | KeyCode::Char('h') => self.go_parent(),
+            KeyCode::Enter => {
+                return match self.browser_view {
+                    BrowserView::Tree => self.activate_tree_entry(),
+                    BrowserView::Table => self.open_selected_table(),
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                return match self.browser_view {
+                    BrowserView::Tree => self.tree_right(),
+                    BrowserView::Table => self.open_selected_table(),
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => match self.browser_view {
+                BrowserView::Tree => self.tree_left(),
+                BrowserView::Table => self.go_parent(),
+            },
+            KeyCode::Char('v') => self.toggle_browser_view(),
             KeyCode::Char(' ') => self.toggle_selection(),
             KeyCode::Char('.') => {
                 self.config.ui.show_hidden = !self.config.ui.show_hidden;
@@ -1203,7 +1430,14 @@ impl App {
                 view.selected = view.selected.saturating_sub(1);
                 AppMode::Devices(view)
             }
-            KeyCode::Char('r') => self.open_devices(),
+            KeyCode::Char('r') => {
+                let selected_source = view
+                    .devices
+                    .get(view.selected)
+                    .map(|device| device.source.clone());
+                self.start_device_refresh(selected_source);
+                AppMode::Devices(view)
+            }
             KeyCode::Char('e') => {
                 let Some(device) = view.devices.get(view.selected) else {
                     return AppMode::Devices(view);
@@ -1346,9 +1580,70 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        if self.loaded_dir == self.current_dir {
+        let same_root = self.loaded_dir == self.current_dir;
+        let preferred = if same_root {
+            self.selected_entry().map(|entry| entry.path.clone())
+        } else {
+            self.selector_memory.get(&self.current_dir).cloned()
+        };
+        if same_root {
             self.remember_selection();
         }
+        self.refresh_browser(preferred);
+    }
+
+    fn refresh_browser(&mut self, preferred: Option<PathBuf>) {
+        if cfg!(test) {
+            match self.browser_view {
+                BrowserView::Tree => self.refresh_tree(preferred),
+                BrowserView::Table => self.refresh_table(preferred),
+            }
+        } else {
+            self.request_browser_load(preferred);
+        }
+    }
+
+    fn request_browser_load(&mut self, preferred: Option<PathBuf>) {
+        self.browser_generation = self.browser_generation.wrapping_add(1);
+        let marked = self
+            .entries
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.path.clone())
+            .collect();
+        let request = LoadRequest {
+            generation: self.browser_generation,
+            root: self.current_dir.clone(),
+            view: self.browser_view,
+            ui: self.config.ui.clone(),
+            expanded: self.expanded_directories.clone(),
+            query: self.search_filter.clone(),
+            marked,
+            preferred,
+            fallback_cursor: self.cursor,
+        };
+        self.entries.clear();
+        self.tree_depths.clear();
+        self.cursor = 0;
+        self.browser_loading = true;
+        self.browser_loaded_entries = 0;
+        self.browser_load_elapsed = None;
+        self.browser_user_navigated = false;
+        if let Some(running) = &self.browser_load {
+            running.cancel.store(true, Ordering::Relaxed);
+            self.pending_browser_load = Some(request);
+        } else {
+            self.browser_load = Some(browser_loader::spawn(request));
+        }
+    }
+
+    fn refresh_table(&mut self, preferred: Option<PathBuf>) {
+        let marked = self
+            .entries
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.path.clone())
+            .collect::<HashSet<_>>();
         match entry::read_directory(
             &self.current_dir,
             self.config.ui.show_hidden,
@@ -1358,22 +1653,157 @@ impl App {
         ) {
             Ok(entries) => {
                 let query = self.search_filter.as_deref();
-                self.entries = entries
+                let entries = entries
                     .into_iter()
                     .filter(|entry| {
                         query.is_none_or(|query| {
                             entry::contains_case_insensitive(&entry.name, query)
                         })
                     })
-                    .collect();
-                self.cursor = self
-                    .selector_memory
-                    .get(&self.current_dir)
-                    .and_then(|path| self.entries.iter().position(|entry| &entry.path == path))
-                    .unwrap_or_else(|| self.cursor.min(self.entries.len().saturating_sub(1)));
+                    .map(|mut entry| {
+                        entry.selected = marked.contains(&entry.path);
+                        entry
+                    })
+                    .collect::<Vec<_>>();
+                self.cursor = preferred
+                    .as_ref()
+                    .or_else(|| self.selector_memory.get(&self.current_dir))
+                    .and_then(|path| entries.iter().position(|entry| &entry.path == path))
+                    .unwrap_or_else(|| self.cursor.min(entries.len().saturating_sub(1)));
+                self.entries = entries;
+                self.tree_depths.clear();
                 self.loaded_dir = self.current_dir.clone();
             }
-            Err(error) => self.status = error.to_string(),
+            Err(error) => {
+                self.entries.clear();
+                self.tree_depths.clear();
+                self.cursor = 0;
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn refresh_tree(&mut self, preferred: Option<PathBuf>) {
+        let marked = self
+            .entries
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.path.clone())
+            .collect::<HashSet<_>>();
+        match self.read_expanded_tree() {
+            Ok((entries, depths, nested_error)) => {
+                let query = self.search_filter.as_deref();
+                let (entries, depths): (Vec<_>, Vec<_>) = entries
+                    .into_iter()
+                    .zip(depths)
+                    .filter(|(entry, _)| {
+                        query.is_none_or(|query| {
+                            entry::contains_case_insensitive(&entry.name, query)
+                        })
+                    })
+                    .map(|(mut entry, depth)| {
+                        entry.selected = marked.contains(&entry.path);
+                        (entry, if query.is_some() { 0 } else { depth })
+                    })
+                    .unzip();
+                self.cursor = preferred
+                    .as_ref()
+                    .or_else(|| self.selector_memory.get(&self.current_dir))
+                    .and_then(|path| entries.iter().position(|entry| &entry.path == path))
+                    .unwrap_or_else(|| self.cursor.min(entries.len().saturating_sub(1)));
+                self.entries = entries;
+                self.tree_depths = depths;
+                self.loaded_dir = self.current_dir.clone();
+                if let Some(error) = nested_error {
+                    self.status = error;
+                }
+            }
+            Err(error) => {
+                self.entries.clear();
+                self.tree_depths.clear();
+                self.cursor = 0;
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn read_expanded_tree(
+        &self,
+    ) -> crate::error::Result<(Vec<FileEntry>, Vec<usize>, Option<String>)> {
+        fn append_directory(
+            path: &Path,
+            depth: usize,
+            config: &Config,
+            expanded: &HashSet<PathBuf>,
+            entries: &mut Vec<FileEntry>,
+            depths: &mut Vec<usize>,
+            nested_error: &mut Option<String>,
+        ) -> crate::error::Result<()> {
+            let children = entry::read_directory(
+                path,
+                config.ui.show_hidden,
+                config.ui.sort,
+                config.ui.reverse_sort,
+                config.ui.directories_first,
+            )?;
+            for child in children {
+                let recurse = child.kind == EntryKind::Directory && expanded.contains(&child.path);
+                let child_path = child.path.clone();
+                entries.push(child);
+                depths.push(depth);
+                if recurse {
+                    if let Err(error) = append_directory(
+                        &child_path,
+                        depth + 1,
+                        config,
+                        expanded,
+                        entries,
+                        depths,
+                        nested_error,
+                    ) {
+                        nested_error.get_or_insert_with(|| error.to_string());
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let mut entries = Vec::new();
+        let mut depths = Vec::new();
+        let mut nested_error = None;
+        append_directory(
+            &self.current_dir,
+            0,
+            &self.config,
+            &self.expanded_directories,
+            &mut entries,
+            &mut depths,
+            &mut nested_error,
+        )?;
+        Ok((entries, depths, nested_error))
+    }
+
+    fn toggle_browser_view(&mut self) {
+        let selected = self.selected_entry().map(|entry| entry.path.clone());
+        self.remember_selection();
+        match self.browser_view {
+            BrowserView::Tree => {
+                if let Some(parent) = selected.as_deref().and_then(Path::parent) {
+                    self.current_dir = parent.to_path_buf();
+                }
+                self.browser_view = BrowserView::Table;
+                self.expanded_directories.clear();
+                self.cursor = 0;
+                self.refresh_browser(selected);
+                self.set_notice("Table view");
+            }
+            BrowserView::Table => {
+                self.browser_view = BrowserView::Tree;
+                self.expanded_directories.clear();
+                self.cursor = 0;
+                self.refresh_browser(selected);
+                self.set_notice("Tree view");
+            }
         }
     }
 
@@ -1391,9 +1821,12 @@ impl App {
         }
         self.cursor =
             (self.cursor as isize + delta).clamp(0, self.entries.len() as isize - 1) as usize;
+        if self.browser_loading {
+            self.browser_user_navigated = true;
+        }
     }
 
-    fn open_selected(&mut self) -> AppMode {
+    fn open_selected_table(&mut self) -> AppMode {
         let Some(entry) = self.selected_entry() else {
             return AppMode::Browser;
         };
@@ -1405,12 +1838,73 @@ impl App {
         }
     }
 
-    fn go_parent(&mut self) {
-        if let Some(parent) = self.current_dir.parent() {
-            self.current_dir = parent.to_path_buf();
-            self.cursor = 0;
-            self.refresh();
+    fn activate_tree_entry(&mut self) -> AppMode {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return AppMode::Browser;
+        };
+        if entry.kind == EntryKind::Directory {
+            if !self.expanded_directories.remove(&entry.path) {
+                self.expanded_directories.insert(entry.path.clone());
+            }
+            self.refresh_browser(Some(entry.path));
+            AppMode::Browser
+        } else {
+            self.open_external(false)
         }
+    }
+
+    fn tree_right(&mut self) -> AppMode {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return AppMode::Browser;
+        };
+        if entry.kind != EntryKind::Directory {
+            return self.open_external(false);
+        }
+        let depth = self.tree_depth(self.cursor);
+        if self.expanded_directories.insert(entry.path.clone()) {
+            self.refresh_browser(Some(entry.path));
+        } else if self
+            .tree_depths
+            .get(self.cursor + 1)
+            .is_some_and(|child_depth| *child_depth > depth)
+        {
+            self.cursor += 1;
+        }
+        AppMode::Browser
+    }
+
+    fn tree_left(&mut self) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            self.go_parent();
+            return;
+        };
+        if entry.kind == EntryKind::Directory && self.expanded_directories.remove(&entry.path) {
+            self.refresh_browser(Some(entry.path));
+            return;
+        }
+        let depth = self.tree_depth(self.cursor);
+        if depth > 0 {
+            if let Some(parent_index) = (0..self.cursor)
+                .rev()
+                .find(|index| self.tree_depth(*index) + 1 == depth)
+            {
+                self.cursor = parent_index;
+            }
+        } else {
+            self.go_parent();
+        }
+    }
+
+    fn go_parent(&mut self) {
+        let Some(parent) = self.current_dir.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let previous_root = self.current_dir.clone();
+        self.remember_selection();
+        self.current_dir = parent;
+        self.expanded_directories.clear();
+        self.cursor = 0;
+        self.refresh_browser(Some(previous_root));
     }
 
     fn go_to(&mut self, path: PathBuf) {
@@ -1422,8 +1916,9 @@ impl App {
         };
         if path.is_dir() {
             self.current_dir = path.canonicalize().unwrap_or(path);
+            self.expanded_directories.clear();
             self.cursor = 0;
-            self.refresh();
+            self.refresh_browser(None);
         } else {
             self.status = format!("Not a directory: {}", path.display());
         }
@@ -1431,13 +1926,18 @@ impl App {
 
     fn search_here(&mut self, query: &str) {
         self.search_filter = Some(query.to_lowercase());
-        self.refresh();
-        if self.entries.is_empty() {
-            self.search_filter = None;
+        if cfg!(test) {
             self.refresh();
-            self.status = format!("No match for {query}");
+            if self.entries.is_empty() {
+                self.search_filter = None;
+                self.refresh();
+                self.status = format!("No match for {query}");
+            } else {
+                self.set_notice(format!("Search: {} match(es)", self.entries.len()));
+            }
         } else {
-            self.set_notice(format!("Search: {} match(es)", self.entries.len()));
+            self.pending_directory_search = Some(query.into());
+            self.refresh();
         }
     }
 
@@ -1498,12 +1998,11 @@ impl App {
             self.status = format!("Cannot open {}", path.display());
             return;
         };
-        self.go_to(parent.to_path_buf());
-        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
-            self.cursor = index;
-        } else {
-            self.status = format!("Search result is no longer available: {}", path.display());
-        }
+        self.remember_selection();
+        self.current_dir = parent.to_path_buf();
+        self.expanded_directories.clear();
+        self.cursor = 0;
+        self.refresh_browser(Some(path.to_path_buf()));
     }
 
     fn toggle_selection(&mut self) {
@@ -1709,10 +2208,7 @@ impl App {
         {
             Ok(file) => {
                 drop(file);
-                self.refresh();
-                if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
-                    self.cursor = index;
-                }
+                self.refresh_browser(Some(path.clone()));
                 self.set_notice(format!("Created {}", path.display()));
                 AppMode::Browser
             }
@@ -1739,11 +2235,17 @@ impl App {
             self.status = format!("Destination exists: {}", destination.display());
             return;
         }
-        match std::fs::rename(source, &destination) {
-            Ok(()) => self.set_notice(format!("Renamed to {}", destination.display())),
-            Err(error) => self.status = format!("Rename failed: {error}"),
-        }
-        self.refresh();
+        let renamed = match std::fs::rename(source, &destination) {
+            Ok(()) => {
+                self.set_notice(format!("Renamed to {}", destination.display()));
+                true
+            }
+            Err(error) => {
+                self.status = format!("Rename failed: {error}");
+                false
+            }
+        };
+        self.refresh_browser(renamed.then_some(destination));
     }
 
     fn open_trash(&mut self) -> AppMode {
@@ -1772,17 +2274,24 @@ impl App {
     }
 
     fn open_devices(&mut self) -> AppMode {
-        self.last_device_refresh = Instant::now();
-        match luks::discover() {
-            Ok(devices) => AppMode::Devices(DeviceView {
-                devices,
-                selected: 0,
-            }),
-            Err(error) => AppMode::Prompt(Prompt::Message {
-                title: "Encrypted devices unavailable".into(),
-                body: error.to_string(),
-            }),
+        if cfg!(test) {
+            self.last_device_refresh = Instant::now();
+            return match luks::discover() {
+                Ok(devices) => AppMode::Devices(DeviceView {
+                    devices,
+                    selected: 0,
+                }),
+                Err(error) => AppMode::Prompt(Prompt::Message {
+                    title: "Encrypted devices unavailable".into(),
+                    body: error.to_string(),
+                }),
+            };
         }
+        self.start_device_refresh(None);
+        AppMode::Devices(DeviceView {
+            devices: Vec::new(),
+            selected: 0,
+        })
     }
 
     fn open_external(&mut self, editor: bool) -> AppMode {
@@ -2050,7 +2559,7 @@ mod tests {
             input: String::new(),
         });
 
-        for ch in ['d', 'D', 'x', 'c', 'p', 'r', 'm', 'q'] {
+        for ch in ['d', 'D', 'x', 'c', 'p', 'r', 'm', 'v', 'q'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
 
@@ -2684,25 +3193,114 @@ mod tests {
     }
 
     #[test]
-    fn parent_navigation_restores_the_previous_selector() {
+    fn tree_is_the_default_browser_view() {
         let temp = tempfile::tempdir().unwrap();
-        let first = temp.path().join("first");
-        let second = temp.path().join("second");
-        std::fs::create_dir(&first).unwrap();
-        std::fs::create_dir(&second).unwrap();
+        let app = test_app(temp.path());
+
+        assert_eq!(app.browser_view, BrowserView::Tree);
+        assert_eq!(app.browser_view_label(), "Tree");
+    }
+
+    #[test]
+    fn tree_navigation_expands_descends_collapses_and_returns_to_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        let grandchild = child.join("grandchild");
+        let nested_file = grandchild.join("nested.txt");
+        std::fs::create_dir_all(&grandchild).unwrap();
+        std::fs::write(&nested_file, b"nested").unwrap();
         let mut app = test_app(temp.path());
-        app.cursor = app
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.is_tree_directory_expanded(&child));
+        assert_eq!(app.selected_entry().unwrap().path, child);
+        assert_eq!(app.tree_depths, [0, 1]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.selected_entry().unwrap().path, grandchild);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.is_tree_directory_expanded(&grandchild));
+        assert_eq!(app.tree_depths, [0, 1, 2]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(!app.is_tree_directory_expanded(&grandchild));
+        assert_eq!(app.selected_entry().unwrap().path, grandchild);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.selected_entry().unwrap().path, child);
+    }
+
+    #[test]
+    fn view_toggle_preserves_a_nested_selector_and_table_navigation() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        let file = child.join("notes.txt");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(&file, b"notes").unwrap();
+        let mut app = test_app(temp.path());
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.selected_entry().unwrap().path, file);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.browser_view, BrowserView::Table);
+        assert_eq!(app.current_dir, child);
+        assert_eq!(app.selected_entry().unwrap().path, file);
+        assert!(app.tree_depths.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.browser_view, BrowserView::Tree);
+        assert_eq!(app.current_dir, child);
+        assert_eq!(app.selected_entry().unwrap().path, file);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.current_dir, temp.path());
+        assert_eq!(app.selected_entry().unwrap().path, child);
+    }
+
+    #[test]
+    fn terminal_editor_restores_nested_tree_selector_and_expansion() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        let file = child.join("notes.txt");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(&file, b"before").unwrap();
+        let mut app = test_app(temp.path());
+        app.config.open.editor = "nano".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        let action = app.take_terminal_editor().expect("terminal editor queued");
+        std::fs::write(&file, b"after").unwrap();
+        app.finish_terminal_editor(&action, Ok(()));
+
+        assert!(app.is_tree_directory_expanded(&child));
+        assert_eq!(app.selected_entry().unwrap().path, file);
+        assert_eq!(app.tree_depth(app.cursor), 1);
+    }
+
+    #[test]
+    fn tree_never_expands_a_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("secret.txt"), b"safe").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut app = test_app(temp.path());
+        app.expanded_directories.insert(link.clone());
+
+        app.refresh();
+
+        assert!(!app
             .entries
             .iter()
-            .position(|entry| entry.path == second)
-            .unwrap();
-
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.current_dir, second);
-        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-
-        assert_eq!(app.current_dir, temp.path());
-        assert_eq!(app.selected_entry().unwrap().path, second);
+            .any(|entry| entry.path == link.join("secret.txt")));
+        assert!(app.tree_depths.iter().all(|depth| *depth == 0));
     }
 
     #[test]
@@ -2725,6 +3323,102 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.search_filter.is_none());
         assert_eq!(app.entries.len(), 2);
+    }
+
+    #[test]
+    fn tree_search_restores_hierarchy_and_nested_selector() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        let file = child.join("notes.txt");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(&file, b"notes").unwrap();
+        let mut app = test_app(temp.path());
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "notes".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.selected_entry().unwrap().path, file);
+        assert_eq!(app.tree_depth(app.cursor), 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.is_tree_directory_expanded(&child));
+        assert_eq!(app.selected_entry().unwrap().path, file);
+        assert_eq!(app.tree_depth(app.cursor), 1);
+    }
+
+    #[test]
+    fn background_refresh_keeps_only_the_latest_request() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..2_000 {
+            std::fs::write(temp.path().join(format!("noise-{index:04}")), []).unwrap();
+        }
+        let target = temp.path().join("target.txt");
+        std::fs::write(&target, b"target").unwrap();
+        let mut app = test_app(temp.path());
+
+        app.request_browser_load(None);
+        app.search_filter = Some("target".into());
+        app.request_browser_load(Some(target.clone()));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.browser_loading && Instant::now() < deadline {
+            app.poll_browser_load();
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(!app.browser_loading);
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.selected_entry().unwrap().path, target);
+        assert!(app.pending_browser_load.is_none());
+    }
+
+    #[test]
+    fn background_refresh_preserves_navigation_during_streaming() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..2_000 {
+            std::fs::write(temp.path().join(format!("item-{index:04}")), []).unwrap();
+        }
+        let mut app = test_app(temp.path());
+        app.request_browser_load(None);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.entries.len() < 10 && Instant::now() < deadline {
+            app.poll_browser_load();
+            thread::sleep(Duration::from_millis(1));
+        }
+        app.move_cursor(5);
+        let selected_while_loading = app.selected_entry().unwrap().path.clone();
+        while app.browser_loading && Instant::now() < deadline {
+            app.poll_browser_load();
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(!app.browser_loading);
+        assert_eq!(app.selected_entry().unwrap().path, selected_while_loading);
+    }
+
+    #[test]
+    fn disconnected_browser_worker_clears_loading_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let (sender, receiver) = mpsc::sync_channel::<LoadUpdate>(1);
+        drop(sender);
+        app.browser_generation = 9;
+        app.browser_loading = true;
+        app.browser_load = Some(RunningLoad {
+            generation: 9,
+            receiver,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+
+        assert!(app.poll_browser_load());
+        assert!(!app.browser_loading);
+        assert_eq!(app.status, "directory load worker stopped unexpectedly");
     }
 
     #[test]
@@ -2751,6 +3445,55 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn filesystem_search_honors_cancellation_before_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("needle.txt"), b"needle").unwrap();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let cancel = AtomicBool::new(true);
+
+        search_filesystem(temp.path(), "needle", &sender, &cancel);
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            SearchUpdate::Finished {
+                cancelled: true,
+                limited: false
+            }
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_background_device_discovery() {
+        let mut synchronous_samples = Vec::new();
+        let mut enqueue_samples = Vec::new();
+        let mut background_samples = Vec::new();
+        for _ in 0..9 {
+            let synchronous_started = Instant::now();
+            let _ = luks::discover();
+            synchronous_samples.push(synchronous_started.elapsed());
+
+            let started = Instant::now();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let _ = sender.send(luks::discover());
+            });
+            enqueue_samples.push(started.elapsed());
+            let _ = receiver.recv().unwrap();
+            background_samples.push(started.elapsed());
+        }
+        synchronous_samples.sort();
+        enqueue_samples.sort();
+        background_samples.sort();
+        println!(
+            "PERF device_sync_median_us={} device_enqueue_median_us={} device_background_median_us={}",
+            synchronous_samples[4].as_micros(),
+            enqueue_samples[4].as_micros(),
+            background_samples[4].as_micros(),
+        );
     }
 
     #[test]

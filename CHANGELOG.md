@@ -1,5 +1,37 @@
 # minfm changelog
 
+## v0.2.0
+
+### Added
+
+- Browser loading: stream large directories into the interface from one bounded
+  background worker, then apply a final sorted snapshot.
+- Views: use a single-pane expandable tree as the default file browser and
+  toggle the existing table and details view with `v`.
+- Tree navigation: expand and descend with Right/`l`, collapse and return with
+  Left/`h`, and toggle directories or open files with Enter.
+
+### Changed
+
+- Responsiveness: move directory loading, metadata collection, sorting, and
+  automatic device discovery off the UI thread.
+- Navigation: cancel obsolete directory work, retain only the newest pending
+  request, reject stale worker results, and preserve selector movement made
+  while entries are still streaming.
+- Performance: on the 20,000-entry fixture, UI-thread directory dispatch takes
+  44 µs instead of 43.718 ms, with the first batch available in 741 µs and the
+  final sorted snapshot completed in 49.594 ms in the background.
+- Performance: UI-thread device-refresh dispatch takes 26 µs instead of 15.283
+  ms, with discovery completed in 15.797 ms in the background.
+- UI: replace the crowded shortcut footer with aligned navigation, file-operation,
+  and view/device groups.
+- Editors: restore the exact nested tree entry and expanded branches after a
+  terminal editor exits.
+- UI: document the active view toggle in the browser footer, Help popup, and
+  Application information popup.
+- Safety: identify expandable directories by entry type so tree traversal never
+  follows directory symlinks.
+
 ## v0.1.4
 
 ### Added

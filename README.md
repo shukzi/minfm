@@ -15,6 +15,7 @@ functionality.
 ## Features
 
 - **Navigation:** File and directory navigation with arrow-key and Vim-style controls
+- **Views:** Tree view by default with a toggleable table and details view
 - **Search:** Search the current directory or across the filesystem
 - **Files:** Create, rename, cut, copy, paste, and open files with a preferred text editor or default application
 - **Selection:** Multi-entry selection
@@ -97,7 +98,7 @@ For a reproducible installation, pin the installer and release assets to the
 same published version:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.4/install.sh | MINFM_VERSION=v0.1.4 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.2.0/install.sh | MINFM_VERSION=v0.2.0 sh
 minfm
 ```
 
