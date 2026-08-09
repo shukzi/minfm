@@ -2,7 +2,7 @@
 name = "minfm"
 version = "0.1.4"
 edition = "2021"
-description = "A small, safety-first terminal file manager for Linux"
+description = "minfm is a minimal terminal file manager for Linux, written in Rust. It provides intuitive keyboard navigation and integrated disk management (including LUKS functionality)."
 license = "MIT"
 
 [dependencies]
