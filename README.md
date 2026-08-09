@@ -53,9 +53,10 @@ The installer writes to:
 ~/.config/minfm/          user configuration directory
 ```
 
-It creates a temporary directory while downloading and removes it when finished.
-It does not write to the source directory and does not replace an existing
-configuration file.
+The installer downloads into a temporary directory, verifies the checksum,
+installs the binary to `~/.local/bin/minfm`, and creates `~/.config/minfm/` if
+needed. It does not modify the source directory or overwrite an existing
+`~/.config/minfm/config.toml` file.
 
 The basic file manager needs only a Linux terminal and the installed binary. The
 device manager uses:
