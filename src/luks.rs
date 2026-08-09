@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt,
     io::Write,
     path::{Path, PathBuf},
@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use crate::error::{MinfmError, Result};
+use crate::{
+    block::{parse_pairs, system_mount_sources},
+    error::{MinfmError, Result},
+};
 
 #[derive(Debug, Clone)]
 pub struct LuksDevice {
@@ -73,7 +76,7 @@ impl SecretInput {
             .unwrap_or(0)
     }
 
-    fn expose(&self) -> &[u8] {
+    pub(crate) fn expose(&self) -> &[u8] {
         &self.0
     }
 }
@@ -297,23 +300,6 @@ fn ensure_action_allowed(action: &LuksAction) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn system_mount_sources() -> Vec<PathBuf> {
-    ["/", "/boot", "/boot/efi", "/usr", "/var"]
-        .iter()
-        .filter_map(|target| {
-            Command::new("findmnt")
-                .args(["-n", "-o", "SOURCE", "--target", target])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| {
-                    let source = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                    (!source.is_empty() && source.starts_with('/')).then(|| PathBuf::from(source))
-                })
-        })
-        .collect()
 }
 
 fn ensure_udisksctl() -> Result<()> {
@@ -569,52 +555,6 @@ fn parse_record(line: &str) -> Result<BlockRecord> {
         removable: get("RM") == "1",
         transport: get("TRAN"),
     })
-}
-
-fn parse_pairs(line: &str) -> Result<HashMap<String, String>> {
-    let bytes = line.as_bytes();
-    let mut fields = HashMap::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        let key_start = index;
-        while index < bytes.len() && bytes[index] != b'=' {
-            index += 1;
-        }
-        if index >= bytes.len() || index + 1 >= bytes.len() || bytes[index + 1] != b'"' {
-            return Err(MinfmError::Message(format!(
-                "could not parse lsblk output: {line}"
-            )));
-        }
-        let key = String::from_utf8_lossy(&bytes[key_start..index]).into_owned();
-        index += 2;
-        let mut value = Vec::new();
-        while index < bytes.len() && bytes[index] != b'"' {
-            if bytes[index] == b'\\' && index + 3 < bytes.len() && bytes[index + 1] == b'x' {
-                let hex = &line[index + 2..index + 4];
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    value.push(byte);
-                    index += 4;
-                    continue;
-                }
-            }
-            if bytes[index] == b'\\' && index + 1 < bytes.len() {
-                index += 1;
-            }
-            value.push(bytes[index]);
-            index += 1;
-        }
-        if index >= bytes.len() {
-            return Err(MinfmError::Message(format!(
-                "unterminated lsblk value: {line}"
-            )));
-        }
-        index += 1;
-        fields.insert(key, String::from_utf8_lossy(&value).into_owned());
-    }
-    Ok(fields)
 }
 
 #[cfg(test)]

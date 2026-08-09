@@ -12,6 +12,23 @@
   Secret Service support is unavailable.
 - Remembered shares: forget a saved share and its associated Secret Service
   credential from the network manager.
+- Apps: open a built-in app launcher with `M` while preserving the existing
+  direct `m` shortcut for encrypted devices.
+- Partition manager: inspect physical disks, partitions, mapped devices,
+  filesystems, labels, identifiers, mountpoints, partition tables, flags, and
+  protected/read-only state from a background-refreshed TUI.
+- Partition actions: format common filesystems, create GPT or MBR tables, and
+  create partitions in available space through a focused initial action menu.
+- Partition resizing: safely grow or shrink unmounted ext4 partitions by final
+  size, with filesystem-first shrinking and partition-first growth.
+- Free-space selection: choose any aligned free region on an existing
+  partitioned disk before accepting the default maximum or a custom size.
+- Partition tools: delete partitions, edit filesystem labels, run read-only
+  checks, rename GPT partitions, change exact partition type IDs, set common
+  flags, and save non-overwriting `sfdisk` table backups.
+- Media-aware erasure: offer 1/3/7-pass overwrite plus a final zero pass only
+  for rotational HDDs, and controller-native NVMe Sanitize preferring an
+  advertised Block Erase, Crypto Erase, or Overwrite capability in that order.
 
 ### Changed
 
@@ -21,6 +38,34 @@
   actions in the Help popup and contextual manager footer.
 - Installer: detect distribution-specific Samba and Secret Service packages on
   Fedora, Debian/Ubuntu, and Arch, then ask before installing anything.
+- Device discovery: share strict `lsblk` pair parsing and system-storage
+  protection between the encrypted-device and partition managers.
+- Partition UI: use responsive columns and dialogs, concise action wording,
+  neutral confirmation buttons, and a customizable `max` default partition
+  size.
+- Partition details: show a compact device summary with UUID and a concise
+  status instead of low-level identifiers and repeated metadata.
+- Context shortcuts: keep Apps and partition-manager controls visible in the
+  global bottom shortcut bar, including while their panels are open.
+- Apps launcher: expand its popup and table columns with the terminal width up
+  to a readable maximum.
+- Formatting: replace free-form filesystem syntax with a chooser for common
+  formats followed by an optional label screen, and clear old signatures before
+  writing the chosen filesystem so stale LUKS metadata is removed.
+- Disk layout: replace free-form table input with explicit Empty, GPT, and MBR
+  choices; Empty removes partition/filesystem signatures without creating a
+  new table.
+- Whole-disk workflow: distinguish **Create partitions** from **Use whole
+  disk**, prioritize the partitioned layout, and guide users to partition
+  creation after GPT/MBR initialization.
+- Disk actions: keep partition creation and partition-table reset on whole-disk
+  rows while keeping filesystem formatting on partition rows.
+- Action visibility: render selected and blocked action text with sufficient
+  contrast and show an explicit blocked reason for protected storage.
+- Error reporting: show partition-operation failures in a prominent wrapping
+  dialog with the action, target, elapsed time, complete reason, and an explicit
+  return to the partition manager instead of truncating the error in the status
+  bar.
 
 ### Security
 
@@ -31,6 +76,26 @@
   and terminate stalled command process groups without blocking the TUI.
 - Saved-share metadata: write only the non-secret address and account fields
   atomically with mode `0600`.
+- Partition safety: use an explicit **No**/**Yes** confirmation that defaults to
+  **No**, revalidate path and kernel major/minor identity before execution, and
+  reject protected, read-only, mounted, changed, overlapping, unaligned, or
+  mismatched-parent targets.
+- Partition authentication: collect the administrator password in a masked TUI
+  prompt, validate it through trusted `sudo` standard input, revalidate the
+  target afterward, pass it through standard input to every privileged helper
+  instead of relying on host-specific timestamp reuse, and invalidate the
+  temporary sudo timestamp on completion.
+- Table replacement: erase signatures from each old partition and the whole
+  disk before creating the new table so stale LUKS/filesystem metadata cannot
+  reappear in a newly created partition.
+- Disk reset synchronization: explicitly reload the kernel partition map, wait
+  for udev, and reject completion if an old partition row is still present.
+- Result verification: confirm the requested table, empty-disk state, or
+  filesystem through a fresh block-device inventory before reporting success.
+- Whole-disk erasure: reject active mapped descendants and NVMe controllers
+  with another unselected namespace; never pass `--force` to NVMe Sanitize.
+- Privileged helpers: invoke commands without a shell and allow elevation only
+  for canonical root-owned executables that are not group- or world-writable.
 
 ## v0.2.0
 

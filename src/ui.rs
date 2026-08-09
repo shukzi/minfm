@@ -2,16 +2,19 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap,
+    },
     Frame,
 };
 
 use crate::{
     app::{
-        format_elapsed, App, AppMode, BrowserView, ClipboardMode, DeviceView, NetworkView, Prompt,
-        SearchScope, SearchView, TrashView,
+        format_elapsed, App, AppMode, AppsView, BrowserView, BuiltinApp, ClipboardMode, DeviceView,
+        NetworkView, PartitionOverlay, PartitionView, Prompt, SearchScope, SearchView, TrashView,
     },
     entry::{human_size, EntryKind},
+    partition::Filesystem,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -30,11 +33,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_header(frame, app, rows[0]);
     draw_browser(frame, app, rows[1]);
-    draw_status(frame, app, rows[2]);
-    draw_shortcuts(frame, app, rows[3]);
 
     match &app.mode {
         AppMode::Browser => {}
+        AppMode::Apps(view) => draw_apps(frame, app, view),
         AppMode::Prompt(prompt) => draw_prompt(frame, prompt),
         AppMode::Progress => draw_progress_modal(frame, app),
         AppMode::SearchProgress => draw_search_progress(frame, app),
@@ -44,10 +46,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::Devices(view) => draw_devices(frame, app, view),
         AppMode::Network(view) => draw_network(frame, app, view),
         AppMode::NetworkProgress => draw_network_progress(frame),
+        AppMode::Partitions(view) => draw_partitions(frame, app, view),
         AppMode::Help => draw_help(frame),
         AppMode::Info => draw_info(frame, app),
         AppMode::ConfigError { path, error } => draw_config_error(frame, path, error),
     }
+
+    // Keep these bars above app panels so the active context's shortcuts are
+    // always visible, including when a panel uses most of the terminal.
+    draw_status(frame, app, rows[2]);
+    draw_shortcuts(frame, app, rows[3]);
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -330,9 +338,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
-    if !matches!(app.mode, AppMode::Browser) {
+    let context = match &app.mode {
+        AppMode::Browser => None,
+        AppMode::Apps(_) => Some(" ↑↓/jk Move · Enter Open · M/Esc Close ".to_string()),
+        AppMode::Partitions(view) => Some(partition_shortcuts(view)),
+        AppMode::Prompt(Prompt::PartitionAuthentication { .. }) => {
+            Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into())
+        }
+        _ => Some(" A dialog owns input · File shortcuts are disabled until it closes. ".into()),
+    };
+    if let Some(context) = context {
         frame.render_widget(
-            Paragraph::new(" A dialog owns input. File shortcuts are disabled until it closes. ")
+            Paragraph::new(context)
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
             area,
@@ -370,7 +387,7 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
             " NAVIGATION\n ↑↓/jk Move · ←h Parent\n {open_controls}{edit} · {view} · ? Help"
         ),
         " FILE OPERATIONS\n Space Mark · x Cut · c Copy · p Paste\n r Rename · n File · a Dir".into(),
-        " VIEW & DEVICES\n d/D Trash · T Bin · . Hidden · s Sort\n m Devices · N Shares · g Path · / Search · F Search FS".into(),
+        " VIEW & APPS\n d/D Trash · T Bin · . Hidden · s Sort\n M Apps · m Devices · N Shares · g Path · / Search · F Search FS".into(),
     ];
 
     for (index, group) in groups.into_iter().enumerate() {
@@ -388,6 +405,35 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
             columns[index],
         );
     }
+}
+
+fn partition_shortcuts(view: &crate::app::PartitionView) -> String {
+    let hint = match &view.overlay {
+        None => " ↑↓/jk Move · Enter/a Actions · r Refresh · Esc Apps ",
+        Some(crate::app::PartitionOverlay::Actions { .. }) => {
+            " ↑↓/jk Move · Enter Continue · a/Esc Back "
+        }
+        Some(crate::app::PartitionOverlay::FormatOptions { .. }) => {
+            " ↑↓/jk Choose filesystem · Enter Continue · Esc Back "
+        }
+        Some(crate::app::PartitionOverlay::DiskLayoutOptions { .. }) => {
+            " ↑↓/jk Choose layout · Enter Review · Esc Back "
+        }
+        Some(crate::app::PartitionOverlay::FreeRegionOptions { .. }) => {
+            " ↑↓/jk Choose free space · Enter Continue · Esc Back "
+        }
+        Some(crate::app::PartitionOverlay::PartitionSize { .. }) => {
+            " Type size or max · Enter Review · Esc Regions "
+        }
+        Some(crate::app::PartitionOverlay::FormatLabel { .. }) => {
+            " Type optional label · Enter Review · Esc Filesystems "
+        }
+        Some(crate::app::PartitionOverlay::Input { .. }) => " Enter Review · Esc Back ",
+        Some(crate::app::PartitionOverlay::Confirm { .. }) => {
+            " ←/→ Choose · Enter Apply · Esc Cancel "
+        }
+    };
+    hint.into()
 }
 
 fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
@@ -556,6 +602,65 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                     .style(Style::default().fg(ACCENT)),
                 rows[3],
             );
+        }
+        Prompt::PartitionAuthentication {
+            action,
+            input,
+            error,
+            ..
+        } => {
+            let area = responsive_centered(frame.area(), 72, 56, 90, 13);
+            frame.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Administrator authentication ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Action: {}\nDevice: {}\n\nEnter your administrator password to continue.",
+                    action.title(),
+                    action.target().path.display()
+                )),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(format!("> {}", "•".repeat(input.character_count())))
+                    .block(Block::default().borders(Borders::ALL).title(" Password "))
+                    .style(Style::default().fg(ACCENT)),
+                rows[1],
+            );
+            frame.render_widget(
+                Paragraph::new(
+                    error.as_deref().unwrap_or(
+                        "The password is passed directly to sudo and is never displayed.",
+                    ),
+                )
+                .style(Style::default().fg(if error.is_some() {
+                    Color::Red
+                } else {
+                    MUTED
+                })),
+                rows[2],
+            );
+            frame.render_widget(
+                Paragraph::new("Enter authenticate · Esc cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(ACCENT)),
+                rows[3],
+            );
+        }
+        Prompt::PartitionError { body, .. } => {
+            partition_error_modal(frame, body);
         }
         Prompt::Mounted { path } => message_modal(
             frame,
@@ -1013,6 +1118,749 @@ fn draw_trash(frame: &mut Frame, view: &TrashView) {
     );
 }
 
+fn draw_apps(frame: &mut Frame, app: &App, view: &AppsView) {
+    let area = apps_area(frame.area());
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(3)])
+        .split(area);
+    let rows = BuiltinApp::ALL.into_iter().map(|builtin| {
+        let status = match builtin {
+            BuiltinApp::DeviceManager if app.config.behavior.read_only => {
+                "Unavailable in read-only mode"
+            }
+            _ => "Available",
+        };
+        Row::new([builtin.name(), builtin.description(), status])
+    });
+    let table = Table::new(rows, apps_table_widths(area.width))
+        .header(Row::new(["App", "Purpose", "State"]).style(Style::default().fg(MUTED)))
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ")
+        .block(Block::default().borders(Borders::ALL).title(" Apps "));
+    let mut state = TableState::default().with_selected(Some(view.selected));
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new("↑/k ↓/j move · Enter open · M/Esc close")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT))
+            .block(Block::default().borders(Borders::ALL)),
+        sections[1],
+    );
+}
+
+fn apps_area(area: Rect) -> Rect {
+    responsive_centered(area, 88, 68, 150, 12)
+}
+
+fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView) {
+    let area = responsive_centered(frame.area(), 96, 72, 150, 92);
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let visible_count = usize::from(sections[0].height.saturating_sub(3)).max(1);
+    let start = viewport_start(view.selected, view.entries.len(), visible_count);
+    let end = (start + visible_count).min(view.entries.len());
+    let rows = view.entries[start..end].iter().map(|entry| {
+        let device = &entry.device;
+        let branch = if entry.depth == 0 { "" } else { "└─ " };
+        let name = format!(
+            "{}{}{}",
+            "  ".repeat(entry.depth.saturating_sub(1)),
+            branch,
+            device.name()
+        );
+        let filesystem = device.filesystem.as_deref().unwrap_or("—");
+        let label = device
+            .label
+            .as_deref()
+            .or(device.partition_label.as_deref())
+            .unwrap_or("—");
+        let mountpoints = if device.mountpoints.is_empty() {
+            "—".into()
+        } else {
+            device
+                .mountpoints
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let style = if entry.protected {
+            Style::default().fg(Color::Yellow)
+        } else if device.is_disk() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Row::new(vec![
+            Cell::from(name),
+            Cell::from(device.kind.clone()),
+            Cell::from(human_size(device.size)),
+            Cell::from(filesystem.to_owned()),
+            Cell::from(label.to_owned()),
+            Cell::from(entry.state_text()),
+            Cell::from(mountpoints),
+        ])
+        .style(style)
+    });
+    let title = if app.partition_refreshing {
+        format!(
+            " Partition manager · refreshing · {} device(s) ",
+            view.entries.len()
+        )
+    } else {
+        format!(" Partition manager · {} device(s) ", view.entries.len())
+    };
+    let table = Table::new(rows, partition_table_widths(area.width))
+        .header(
+            Row::new([
+                "Device",
+                "Type",
+                "Size",
+                "Filesystem",
+                "Label",
+                "State",
+                "Mountpoint",
+            ])
+            .style(Style::default().fg(MUTED)),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ")
+        .block(Block::default().borders(Borders::ALL).title(title));
+    let selected = (!view.entries.is_empty()).then_some(view.selected.saturating_sub(start));
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, sections[0], &mut state);
+
+    let details = view
+        .entries
+        .get(view.selected)
+        .map(|entry| partition_details(entry, view))
+        .unwrap_or_else(|| {
+            if app.partition_refreshing {
+                "Discovering block devices…".into()
+            } else {
+                "No block devices were discovered.".into()
+            }
+        });
+    frame.render_widget(
+        Paragraph::new(details).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Selected device "),
+        ),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter/a actions · r refresh · ↑/k ↓/j move · Esc apps · q browser")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT))
+            .block(Block::default().borders(Borders::ALL)),
+        sections[2],
+    );
+    if let Some(overlay) = &view.overlay {
+        draw_partition_overlay(frame, app, view, overlay);
+    }
+}
+
+fn draw_partition_overlay(
+    frame: &mut Frame,
+    app: &App,
+    view: &PartitionView,
+    overlay: &PartitionOverlay,
+) {
+    match overlay {
+        PartitionOverlay::Actions { selected } => {
+            let tasks = app.partition_tasks_for_view(view);
+            let height = (tasks.len() as u16 + 7).clamp(10, 18);
+            let area = responsive_centered(frame.area(), 92, 64, 150, height);
+            frame.render_widget(Clear, area);
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(3)])
+                .split(area);
+            let rows = tasks.into_iter().map(|task| {
+                let (state, style) = match app.partition_task_unavailable(view, task) {
+                    Some(reason) => (
+                        format!("Blocked · {reason}"),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    None => ("Ready".into(), Style::default().fg(Color::White)),
+                };
+                let risk_style = match task.risk() {
+                    "Erases data" => Style::default().fg(Color::Red),
+                    "Changes layout" => Style::default().fg(Color::Yellow),
+                    _ => Style::default().fg(ACCENT),
+                };
+                Row::new(vec![
+                    Cell::from(app.partition_task_name(view, task)),
+                    Cell::from(app.partition_task_description(view, task)),
+                    Cell::from(Span::styled(task.risk(), risk_style)),
+                    Cell::from(state),
+                ])
+                .style(style)
+            });
+            let selected_device = view
+                .entries
+                .get(view.selected)
+                .map(|entry| entry.device.path.display().to_string())
+                .unwrap_or_else(|| "none".into());
+            let table = Table::new(rows, partition_action_widths(area.width))
+                .header(
+                    Row::new(["Action", "What it does", "Risk", "Status"])
+                        .style(Style::default().fg(MUTED)),
+                )
+                .row_highlight_style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("> ")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" Choose what to do with {selected_device} ")),
+                );
+            let mut state = TableState::default().with_selected(Some(*selected));
+            frame.render_stateful_widget(table, sections[0], &mut state);
+            frame.render_widget(
+                Paragraph::new("Enter continue · a/Esc back")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(ACCENT))
+                    .block(Block::default().borders(Borders::ALL)),
+                sections[1],
+            );
+        }
+        PartitionOverlay::FormatOptions { selected } => {
+            let target = view
+                .entries
+                .get(view.selected)
+                .map(|entry| entry.device.path.display().to_string())
+                .unwrap_or_else(|| "selected device".into());
+            draw_format_options(frame, &target, *selected);
+        }
+        PartitionOverlay::DiskLayoutOptions { selected } => {
+            let target = view
+                .entries
+                .get(view.selected)
+                .map(|entry| entry.device.path.display().to_string())
+                .unwrap_or_else(|| "selected disk".into());
+            draw_disk_layout_options(frame, &target, *selected);
+        }
+        PartitionOverlay::FreeRegionOptions { selected } => {
+            let (target, regions) = view
+                .entries
+                .get(view.selected)
+                .map(|disk| {
+                    (
+                        disk.device.path.display().to_string(),
+                        crate::partition::free_regions(disk, &view.entries),
+                    )
+                })
+                .unwrap_or_else(|| ("selected disk".into(), Vec::new()));
+            draw_free_region_options(frame, &target, &regions, *selected);
+        }
+        PartitionOverlay::PartitionSize {
+            start_bytes,
+            maximum_end,
+            input,
+            cursor,
+            error,
+        } => draw_partition_input(
+            frame,
+            "Partition size",
+            &format!(
+                "Available here: {}. Use max or enter a smaller size",
+                crate::partition::size_input(maximum_end.saturating_sub(*start_bytes))
+            ),
+            input,
+            *cursor,
+            error.as_deref(),
+            "Enter review · Esc free regions",
+        ),
+        PartitionOverlay::FormatLabel {
+            filesystem,
+            input,
+            cursor,
+            error,
+        } => draw_partition_input(
+            frame,
+            "Optional label",
+            &format!(
+                "Formatting as {}. Leave blank if you do not want a label",
+                filesystem.name()
+            ),
+            input,
+            *cursor,
+            error.as_deref(),
+            "Enter review · Esc filesystems",
+        ),
+        PartitionOverlay::Input {
+            task,
+            input,
+            cursor,
+            hint,
+            error,
+        } => draw_partition_input(
+            frame,
+            app.partition_task_name(view, *task),
+            hint,
+            input,
+            *cursor,
+            error.as_deref(),
+            "Enter review · Esc actions",
+        ),
+        PartitionOverlay::Confirm {
+            action,
+            yes_selected,
+        } => draw_partition_confirmation(frame, action, *yes_selected),
+    }
+}
+
+fn draw_format_options(frame: &mut Frame, target: &str, selected: usize) {
+    let area = responsive_centered(frame.area(), 80, 60, 110, 14);
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .split(area);
+    let rows = Filesystem::ALL
+        .into_iter()
+        .map(|filesystem| Row::new([filesystem.name(), filesystem.description()]));
+    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(30)])
+        .header(Row::new(["Filesystem", "Best for"]).style(Style::default().fg(MUTED)))
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ")
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Format {target} ")),
+        );
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new("Choose a filesystem · Enter continue · Esc back")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT))
+            .block(Block::default().borders(Borders::ALL)),
+        sections[1],
+    );
+}
+
+fn draw_disk_layout_options(frame: &mut Frame, target: &str, selected: usize) {
+    let area = responsive_centered(frame.area(), 80, 58, 110, 12);
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(area);
+    let rows = [
+        (
+            "Empty",
+            "Remove partitions and leave the disk without a table",
+        ),
+        ("GPT", "Modern default for most computers and large disks"),
+        ("MBR", "Legacy format for compatibility with older systems"),
+    ]
+    .into_iter()
+    .map(|(layout, description)| Row::new([layout, description]));
+    let table = Table::new(rows, [Constraint::Length(14), Constraint::Min(30)])
+        .header(Row::new(["Layout", "Result"]).style(Style::default().fg(MUTED)))
+        .row_highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ")
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Disk layout for {target} ")),
+        );
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new("Choose the resulting disk layout · Enter review · Esc back")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT))
+            .block(Block::default().borders(Borders::ALL)),
+        sections[1],
+    );
+}
+
+fn draw_free_region_options(
+    frame: &mut Frame,
+    target: &str,
+    regions: &[(u64, u64)],
+    selected: usize,
+) {
+    let height = (regions.len() as u16 + 7).clamp(10, 16);
+    let area = responsive_centered(frame.area(), 82, 60, 115, height);
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(3)])
+        .split(area);
+    let rows = regions.iter().enumerate().map(|(index, (start, end))| {
+        Row::new([
+            format!("Region {}", index + 1),
+            crate::partition::size_input(end.saturating_sub(*start)),
+            format!(
+                "{} – {}",
+                crate::partition::size_input(*start),
+                crate::partition::size_input(*end)
+            ),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(14),
+            Constraint::Length(16),
+            Constraint::Min(28),
+        ],
+    )
+    .header(Row::new(["Free space", "Size", "Position"]).style(Style::default().fg(MUTED)))
+    .row_highlight_style(
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ")
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Create partition on {target} ")),
+    );
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new("Choose free space · Enter continue · Esc back")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT))
+            .block(Block::default().borders(Borders::ALL)),
+        sections[1],
+    );
+}
+
+fn draw_partition_input(
+    frame: &mut Frame,
+    title: &str,
+    hint: &str,
+    input: &str,
+    cursor: usize,
+    error: Option<&str>,
+    footer: &str,
+) {
+    let area = responsive_centered(frame.area(), 80, 56, 100, 12);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), rows[0]);
+    draw_partition_edit_field(frame, rows[1], input, cursor);
+    frame.render_widget(
+        Paragraph::new(error.unwrap_or("Review the exact values before continuing."))
+            .style(Style::default().fg(if error.is_some() { Color::Red } else { MUTED })),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[3],
+    );
+}
+
+fn draw_partition_confirmation(
+    frame: &mut Frame,
+    action: &crate::partition::PartitionAction,
+    yes_selected: bool,
+) {
+    let destructive = action.is_destructive();
+    let erases_data = action.erases_data();
+    let area = responsive_centered(frame.area(), 76, 52, 110, 12);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if erases_data {
+            Color::Red
+        } else if destructive {
+            Color::Yellow
+        } else {
+            ACCENT
+        }))
+        .title(format!(" Review · {} ", action.title()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(action.confirmation_text()).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(action.warning_text())
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(if erases_data {
+                Color::Red
+            } else if destructive {
+                Color::Yellow
+            } else {
+                MUTED
+            })),
+        rows[1],
+    );
+    // Keep a little breathing room between the warning and the decisions.
+    let buttons = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(partition_button_width(rows[3].width)),
+            Constraint::Length(2),
+            Constraint::Length(partition_button_width(rows[3].width)),
+            Constraint::Min(0),
+        ])
+        .split(rows[3]);
+    let button = |label, selected| {
+        let (text, style) = if selected {
+            (
+                format!("● {label}"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (format!("  {label}"), Style::default().fg(Color::DarkGray))
+        };
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .style(style)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(if selected {
+                        BorderType::Double
+                    } else {
+                        BorderType::Plain
+                    })
+                    .border_style(Style::default().fg(if selected {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    })),
+            )
+    };
+    frame.render_widget(button("No", !yes_selected), buttons[1]);
+    frame.render_widget(button("Yes", yes_selected), buttons[3]);
+    frame.render_widget(
+        Paragraph::new("←/→ choose · Enter apply · Esc cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[4],
+    );
+}
+
+fn partition_button_width(area_width: u16) -> u16 {
+    area_width.saturating_sub(6).saturating_div(2).clamp(8, 16)
+}
+
+fn apps_table_widths(width: u16) -> Vec<Constraint> {
+    if width < 90 {
+        vec![
+            Constraint::Length(20),
+            Constraint::Min(28),
+            Constraint::Length(0),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(22),
+            Constraint::Min(36),
+            Constraint::Percentage(26),
+        ]
+    }
+}
+
+fn partition_table_widths(width: u16) -> Vec<Constraint> {
+    if width >= 120 {
+        vec![
+            Constraint::Percentage(20),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Percentage(14),
+            Constraint::Length(11),
+            Constraint::Min(15),
+        ]
+    } else if width >= 90 {
+        vec![
+            Constraint::Percentage(24),
+            Constraint::Length(7),
+            Constraint::Length(10),
+            Constraint::Length(11),
+            Constraint::Length(0),
+            Constraint::Length(11),
+            Constraint::Min(15),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(45),
+            Constraint::Length(7),
+            Constraint::Length(10),
+            Constraint::Length(11),
+            Constraint::Length(0),
+            Constraint::Length(10),
+            Constraint::Length(0),
+        ]
+    }
+}
+
+fn partition_action_widths(width: u16) -> Vec<Constraint> {
+    if width < 90 {
+        vec![
+            Constraint::Length(20),
+            Constraint::Min(28),
+            Constraint::Length(0),
+            Constraint::Length(0),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(22),
+            Constraint::Percentage(38),
+            Constraint::Length(14),
+            Constraint::Min(18),
+        ]
+    }
+}
+
+fn draw_partition_edit_field(frame: &mut Frame, area: Rect, input: &str, cursor: usize) {
+    let characters = input.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(characters.len());
+    let visible_width = area.width.saturating_sub(6) as usize;
+    let start = cursor.saturating_sub(visible_width);
+    let end = (start + visible_width).min(characters.len());
+    let visible = characters[start..end].iter().collect::<String>();
+    frame.render_widget(
+        Paragraph::new(format!("> {visible}"))
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(ACCENT)),
+        area,
+    );
+    let cursor_x = area.x + 3 + cursor.saturating_sub(start).min(visible_width) as u16;
+    frame.set_cursor_position((cursor_x, area.y + 1));
+}
+
+fn partition_details(entry: &crate::partition::PartitionEntry, view: &PartitionView) -> String {
+    let device = &entry.device;
+    let kind = if device.is_disk() {
+        "Disk"
+    } else if device.kind == "part" {
+        "Partition"
+    } else {
+        "Device"
+    };
+    let mut lines = vec![format!(
+        "{} · {} · {}",
+        device.path.display(),
+        kind,
+        human_size(device.size)
+    )];
+
+    if device.is_disk() {
+        let partition_count = view
+            .entries
+            .iter()
+            .filter(|candidate| {
+                candidate.device.kind == "part"
+                    && candidate.device.parent.as_ref() == Some(&device.path)
+            })
+            .count();
+        let table = device.table_type.as_ref().map_or_else(
+            || "No partition table".to_string(),
+            |table| table.to_ascii_uppercase(),
+        );
+        let free = crate::partition::largest_free_region(entry, &view.entries)
+            .map(|(start, end)| format!("{} free", human_size(end.saturating_sub(start))))
+            .unwrap_or_else(|| "No usable free space".into());
+        lines.push(format!("{table} · {partition_count} partition(s) · {free}"));
+        if let Some(model) = device.model.as_deref().filter(|model| !model.is_empty()) {
+            lines.push(format!(
+                "Model: {model} · Removable: {}",
+                if device.removable { "yes" } else { "no" }
+            ));
+        }
+    } else {
+        let filesystem = display_or_dash(device.filesystem.as_deref());
+        let label = device
+            .label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .map(|label| format!(" · {label}"))
+            .unwrap_or_default();
+        lines.push(format!("{filesystem}{label}"));
+        let mountpoint = device
+            .mountpoints
+            .first()
+            .map(|path| format!("Mounted at {}", path.display()))
+            .unwrap_or_else(|| "Not mounted".into());
+        lines.push(mountpoint);
+        if let Some(parent) = device.parent.as_ref() {
+            lines.push(format!("Parent disk: {}", parent.display()));
+        }
+    }
+
+    lines.push(format!("UUID: {}", display_or_dash(device.uuid.as_deref())));
+    lines.push(format!("Status: {}", partition_status(entry)));
+    lines.join("\n")
+}
+
+fn partition_status(entry: &crate::partition::PartitionEntry) -> &'static str {
+    if entry.protected {
+        "Protected system storage · changes disabled"
+    } else if entry.device.read_only {
+        "Read-only device · changes disabled"
+    } else if entry.device.is_mounted() {
+        "Mounted · unmount before changing"
+    } else if entry.mounted_descendants {
+        "Contains mounted storage · changes disabled"
+    } else {
+        "Ready"
+    }
+}
+
+fn display_or_dash(value: Option<&str>) -> &str {
+    value.filter(|value| !value.is_empty()).unwrap_or("—")
+}
+
 fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
     let area = centered(frame.area(), 92, 80);
     frame.render_widget(Clear, area);
@@ -1204,7 +2052,7 @@ fn draw_network_progress(frame: &mut Frame) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter          toggle directory or open file\n  →/l            expand/child in tree; open in table\n  ←/h            collapse/parent in tree; parent in table\n  v              toggle tree/table view\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nNetwork shares\n  N              network shares\n  a              add share\n  Enter          open or connect\n  u              disconnect\n  d              forget saved share\n  r              refresh\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
+    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter          toggle directory or open file\n  →/l            expand/child in tree; open in table\n  ←/h            collapse/parent in tree; parent in table\n  v              toggle tree/table view\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nApps and devices\n  M              built-in apps\n  m              encrypted device manager\n  e              safely eject selected removable device\n\nNetwork shares\n  N              network shares\n  a              add share\n  Enter          open or connect\n  u              disconnect\n  d              forget saved share\n  r              refresh\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
     let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
     message_modal(frame, &title, body, "Esc/Enter close", 70, 94);
 }
@@ -1214,7 +2062,7 @@ fn draw_info(frame: &mut Frame, app: &App) {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
     let body = format!(
-        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}\n  gio: {}\n  secret-tool: {}",
+        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}\n  gio: {}\n  secret-tool: {}\n  parted: {}\n  wipefs: {}\n  sfdisk: {}\n  shred: {}\n  nvme: {}\n  sudo: {}",
         env!("CARGO_PKG_VERSION"),
         binary,
         app.config_path.display(),
@@ -1228,6 +2076,12 @@ fn draw_info(frame: &mut Frame, app: &App) {
         availability("cryptsetup"),
         availability("gio"),
         availability("secret-tool"),
+        availability("parted"),
+        availability("wipefs"),
+        availability("sfdisk"),
+        availability("shred"),
+        availability("nvme"),
+        availability("sudo"),
     );
     message_modal(
         frame,
@@ -1477,6 +2331,37 @@ fn message_modal(
     );
 }
 
+fn partition_error_modal(frame: &mut Frame, body: &str) {
+    let area = responsive_centered(frame.area(), 82, 58, 100, 20);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Red))
+        .title(
+            Line::from(" Partition operation failed ")
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter/Esc return to partition manager")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(2)).max(1);
     let height = if height > 50 {
@@ -1493,6 +2378,22 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+fn responsive_centered(
+    area: Rect,
+    width_percent: u16,
+    minimum_width: u16,
+    maximum_width: u16,
+    height: u16,
+) -> Rect {
+    let responsive_width = area
+        .width
+        .saturating_mul(width_percent)
+        .saturating_div(100)
+        .max(minimum_width)
+        .min(maximum_width);
+    centered(area, responsive_width, height)
+}
+
 fn viewport_start(selected: usize, item_count: usize, visible_count: usize) -> usize {
     if item_count <= visible_count || selected < visible_count {
         0
@@ -1504,8 +2405,12 @@ fn viewport_start(selected: usize, item_count: usize, visible_count: usize) -> u
 #[cfg(test)]
 mod performance_tests {
     use super::*;
-    use crate::config::{Config, ConfigLoad};
-    use crate::network::{NetworkSecret, ShareAddress};
+    use crate::{
+        app::PartitionView,
+        config::{Config, ConfigLoad},
+        network::{NetworkSecret, ShareAddress},
+        partition,
+    };
     use ratatui::{backend::TestBackend, Terminal};
     use std::{path::PathBuf, time::Instant};
 
@@ -1578,6 +2483,223 @@ mod performance_tests {
         let text = rendered_text(&terminal);
         assert!(!text.contains("never-render-this"));
         assert!(text.contains("•••••••••••••••••"));
+    }
+
+    #[test]
+    fn partition_modals_expand_with_the_terminal_up_to_a_readable_limit() {
+        let small = responsive_centered(Rect::new(0, 0, 80, 30), 92, 64, 150, 12);
+        let medium = responsive_centered(Rect::new(0, 0, 120, 30), 92, 64, 150, 12);
+        let large = responsive_centered(Rect::new(0, 0, 240, 30), 92, 64, 150, 12);
+        assert!(small.width < medium.width);
+        assert!(medium.width < large.width);
+        assert_eq!(large.width, 150);
+    }
+
+    #[test]
+    fn apps_window_expands_with_the_terminal() {
+        let small = apps_area(Rect::new(0, 0, 90, 30));
+        let medium = apps_area(Rect::new(0, 0, 140, 30));
+        let large = apps_area(Rect::new(0, 0, 220, 30));
+        assert!(small.width < medium.width);
+        assert!(medium.width < large.width);
+        assert_eq!(large.width, 150);
+    }
+
+    #[test]
+    fn partition_manager_renders_topology_details_and_safety_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            true,
+        );
+        let fixture = concat!(
+            "PATH=\"/dev/sda\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" PTTYPE=\"gpt\" PARTN=\"\" START=\"0\" LOG-SEC=\"512\" MODEL=\"Test Disk\" RO=\"0\" RM=\"0\" MAJ:MIN=\"8:0\"\n",
+            "PATH=\"/dev/sda1\" TYPE=\"part\" SIZE=\"104857600\" FSTYPE=\"ext4\" LABEL=\"System\" UUID=\"test-uuid\" MOUNTPOINTS=\"/\" PKNAME=\"sda\" PARTN=\"1\" START=\"2048\" LOG-SEC=\"512\" RO=\"0\" RM=\"0\" MAJ:MIN=\"8:1\"\n",
+        );
+        app.mode = AppMode::Partitions(PartitionView {
+            entries: partition::from_lsblk_fixture(
+                fixture,
+                &[std::path::PathBuf::from("/dev/sda1")],
+            )
+            .unwrap()
+            .entries,
+            selected: 1,
+            overlay: None,
+        });
+        let backend = TestBackend::new(140, 45);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Partition manager"));
+        assert!(rendered.contains("sda1"));
+        assert!(rendered.contains("Protected system storage"));
+        assert!(rendered.contains("UUID: test-uuid"));
+        assert!(rendered.contains("Enter/a Actions"));
+
+        if let AppMode::Partitions(view) = &mut app.mode {
+            view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
+        }
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Choose what to do with /dev/sda1"));
+        assert!(rendered.contains("Format"));
+        assert!(rendered.contains("What it does"));
+        assert!(rendered.contains("Erases data"));
+        assert!(rendered.contains("Blocked"));
+        assert!(rendered.contains("Enter Continue"));
+
+        if let AppMode::Partitions(view) = &mut app.mode {
+            view.selected = 0;
+            view.overlay = Some(PartitionOverlay::Actions { selected: 1 });
+        }
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Create partition"));
+        assert!(rendered.contains("Reset disk"));
+
+        if let AppMode::Partitions(view) = &mut app.mode {
+            view.overlay = Some(PartitionOverlay::FreeRegionOptions { selected: 0 });
+        }
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Free space"));
+        assert!(rendered.contains("Region 1"));
+        assert!(rendered.contains("Choose free space"));
+
+        if let AppMode::Partitions(view) = &mut app.mode {
+            view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected: 0 });
+        }
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Empty"));
+        assert!(rendered.contains("GPT"));
+        assert!(rendered.contains("MBR"));
+        assert!(rendered.contains("Choose layout"));
+
+        if let AppMode::Partitions(view) = &mut app.mode {
+            view.selected = 1;
+            view.overlay = Some(PartitionOverlay::FormatOptions { selected: 0 });
+        }
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Recommended Linux default"));
+        assert!(rendered.contains("exFAT"));
+        assert!(rendered.contains("Choose filesystem"));
+
+        if let AppMode::Partitions(view) = &mut app.mode {
+            let action = partition::PartitionAction::Format {
+                target: partition::DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
+                filesystem: partition::Filesystem::Ext4,
+                label: None,
+            };
+            view.overlay = Some(PartitionOverlay::Confirm {
+                action,
+                yes_selected: false,
+            });
+        }
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("permanently erases data on the selected device"));
+        assert!(rendered.contains("● No"));
+        assert!(rendered.contains('═'));
+
+        let view = match &app.mode {
+            AppMode::Partitions(view) => view.clone(),
+            _ => unreachable!(),
+        };
+        let action = match &view.overlay {
+            Some(PartitionOverlay::Confirm { action, .. }) => action.clone(),
+            _ => unreachable!(),
+        };
+        let mut input = crate::luks::SecretInput::default();
+        for character in "not-a-real-password".chars() {
+            input.push(character);
+        }
+        app.mode = AppMode::Prompt(Prompt::PartitionAuthentication {
+            action,
+            view,
+            input,
+            error: None,
+        });
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Administrator authentication"));
+        assert!(rendered.contains("••••"));
+        assert!(!rendered.contains("not-a-real-password"));
+
+        let view = match &app.mode {
+            AppMode::Prompt(Prompt::PartitionAuthentication { view, .. }) => view.clone(),
+            _ => unreachable!(),
+        };
+        app.mode = AppMode::Prompt(Prompt::PartitionError {
+            body: "Action: Erase NVMe\nDevice: /dev/nvme0n1\n\nReason:\nThis controller does not support NVMe Sanitize. No erase command was started."
+                .into(),
+            view,
+        });
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Partition operation failed"));
+        assert!(rendered.contains("Erase NVMe"));
+        assert!(rendered.contains("No erase command was started"));
+        assert!(rendered.contains("return to partition manager"));
     }
 
     #[test]

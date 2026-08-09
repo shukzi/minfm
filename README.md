@@ -24,6 +24,9 @@ functionality.
 - **Trash:** Recoverable trash, second-precise timestamps, and permanent deletion from the trash
 - **Devices:** Integrated in-TUI disk manager with LUKS unlock, mount, unmount, lock, and safe eject
 - **Network:** Discover, add, open, remember, and safely disconnect Samba shares
+- **Apps:** Open built-in tools with `M`, including the device and partition managers
+- **Partitions:** Inspect block topology, format common filesystems, create GPT or
+  MBR partition tables, and create partitions in available space
 - **Updates:** Background startup checks with checksum-verified installation
 - **Configuration:** Invalid-configuration detection with safe-operation blocking
 
@@ -69,10 +72,86 @@ Device manager   util-linux, udisks2,   util-linux, udisks2,   util-linux, udisk
                  cryptsetup             cryptsetup             cryptsetup
 Samba shares     gvfs-smb, libsecret    gvfs-backends,         gvfs-smb, libsecret
                                         libsecret-tools
+Partitions       parted, util-linux,    parted, util-linux,    parted, util-linux,
+                 sudo                   sudo                   sudo
+NVMe erase       nvme-cli               nvme-cli               nvme-cli
+Filesystems      e2fsprogs, xfsprogs,   e2fsprogs, xfsprogs,   e2fsprogs, xfsprogs,
+                 btrfs-progs,           btrfs-progs,           btrfs-progs,
+                 dosfstools, exfatprogs dosfstools, exfatprogs dosfstools, exfatprogs
 ```
 
 The installer checks these tools and asks before offering to install missing
 packages using Fedora's, Debian/Ubuntu's, or Arch's package manager.
+
+The partition manager always supports inspection through `lsblk`. Write actions
+use trusted root-owned system tools. When minfm is not already running as root,
+the administrator password is requested through a masked TUI prompt and passed
+directly to `sudo` through standard input. Install only the helpers needed for
+the filesystems you use:
+
+```text
+Action                    Commands/packages
+Partition tables/layout   parted, util-linux (wipefs, sfdisk)
+Rotational HDD wiping     coreutils (shred)
+NVMe controller erasure   nvme-cli
+Authorization             sudo
+ext4                      e2fsprogs
+XFS                       xfsprogs
+Btrfs                     btrfs-progs
+FAT32                     dosfstools
+exFAT                     exfatprogs
+Swap                      util-linux
+```
+
+Press `M`, choose **Partition manager**, select a device, and press `Enter` or
+`a` for context-sensitive actions. Unavailable actions explain which safety
+condition or target type prevents them. Confirmation defaults to **No**; choose
+**Yes** explicitly before an operation can begin. New partitions use the
+largest available free region by default; replace `max` with a size such as
+`20GiB` or `50%` to create a smaller partition.
+
+When a disk contains more than one free area, creation first shows every free
+region in disk order. Choose a region, then keep `max` or enter a smaller size.
+Existing unmounted ext4 partitions also offer **Resize**: enter the desired
+final size or `max`. Growing consumes adjacent free space; shrinking reduces
+the filesystem before moving the partition boundary. Filesystems without a
+safe offline resize path, including XFS and LUKS containers, remain blocked.
+
+Formatting uses a filesystem chooser for ext4, XFS, Btrfs, FAT32, exFAT, and
+swap, with a short compatibility description for each choice. A filesystem
+label can be entered on the following screen or left blank. Formatting first
+removes old filesystem and encryption signatures, then writes the selected
+filesystem so stale LUKS information does not remain visible.
+
+The selected-device panel shows a compact summary of the path, type, size,
+filesystem, label, mount state, UUID, free space, and safety status. The
+technical shortcut hints remain visible in the global bar at the bottom while
+Apps and partition views are open.
+
+Disk rows own layout operations: create a partition in free space or reset the
+disk to Empty, GPT, or MBR. Empty leaves the disk without a partition table;
+GPT is the modern default, while MBR is available for legacy compatibility.
+Partition rows own resizing, deletion, filesystem formatting and checks,
+filesystem labels, GPT names, partition type IDs, and common flags. Disk rows
+also allow a partition-table backup to a new file that minfm will never
+overwrite.
+
+Media-specific erasure is deliberately separate from ordinary formatting.
+**Wipe HDD** appears only when Linux reports a rotational disk and offers 1, 3,
+or 7 overwrite passes followed by zeros. It is hidden for SSD, flash, and NVMe
+media. **Erase NVMe** asks the controller for its Sanitize capabilities and
+prefers Block Erase, then Crypto Erase, then Overwrite, and monitors the raw
+Sanitize status log until the controller reports completion. It never bypasses
+the tool's busy-device check, and it is blocked when the controller exposes
+another namespace that was not selected.
+Replacing a table erases signatures from the old partitions before creating the
+new GPT or MBR table, preventing stale filesystem or LUKS signatures from
+reappearing when a partition is recreated at the same offset. Protected system
+storage displays its actions as blocked with an explicit reason.
+After a disk reset, minfm explicitly asks the kernel to reload its partition
+map, waits for udev, and verifies that old partition rows are gone before it
+reports success.
+
 The installer and in-app updater require `curl` and `sha256sum`, which are
 normally already available on Linux systems. Update checks run in the
 background. minfm asks before downloading and installing a newer release.
@@ -171,6 +250,14 @@ cargo build --release --locked
 - Failed operations report what did not complete.
 - LUKS passphrases remain masked.
 - System and root volumes cannot be locked or unmounted.
+- Partition actions revalidate the device path and kernel major/minor identity
+  immediately before execution.
+- Protected system storage, read-only devices, mounted descendants, overlapping
+  boundaries, and mismatched parent disks are rejected.
+- ext4 resizing is check-first, uses only contiguous free space for growth, and
+  reduces the filesystem before the partition when shrinking.
+- Whole-disk erasure is blocked for mounted storage, active mapped descendants,
+  protected system disks, read-only devices, and changed device identities.
 - Keep backups of important files.
 
 ## License
