@@ -23,7 +23,7 @@ functionality.
 - Sorting by name, extension, size, type, permissions, and modification time
 - File size, permissions, and modification-time display
 - Multi-selection
-- Cut, copy, paste, rename, and directory creation
+- Cut, copy, paste, rename, and file or directory creation
 - Copy verification
 - Operation progress
 - Clear errors and failed-operation summaries
@@ -109,7 +109,7 @@ For a reproducible installation, pin the installer and release assets to the
 same published version:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.3/install.sh | MINFM_VERSION=v0.1.3 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.1.4/install.sh | MINFM_VERSION=v0.1.4 sh
 minfm
 ```
 
@@ -131,6 +131,19 @@ An example configuration is included in:
 ```text
 config.example.toml
 ```
+
+Files open with the Linux default application. To use another editor, set it in
+the configuration:
+
+```toml
+[open]
+opener = "xdg-open"
+editor = "nvim"
+```
+
+Select a text file and press `e` to use the configured editor. Terminal editors
+such as Nano and Vim use the current terminal, then return to the same position
+in minfm when closed.
 
 ## Build from source
 

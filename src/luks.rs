@@ -152,19 +152,28 @@ pub fn discover() -> Result<Vec<LuksDevice>> {
     parse_lsblk_with_protected(&String::from_utf8_lossy(&output.stdout), &protected_sources)
 }
 
-pub fn execute(action: &LuksAction) -> Result<LuksOutcome> {
+pub fn execute_with_progress(
+    action: &LuksAction,
+    mut report_phase: impl FnMut(&'static str),
+) -> Result<LuksOutcome> {
+    report_phase("Checking device safety");
     ensure_action_allowed(action)?;
+    report_phase("Checking device tools");
     ensure_udisksctl()?;
     match action {
         LuksAction::UnlockAndMount { source, passphrase } => {
+            report_phase("Unlocking encrypted volume");
             run_udisks_unlock(source, passphrase)?;
+            report_phase("Waiting for unlocked volume");
             let mapping =
                 wait_for_device(source, |device| device.mapping.clone()).ok_or_else(|| {
                     MinfmError::Message(
                         "volume unlocked, but its mapping was not discovered".into(),
                     )
                 })?;
+            report_phase("Mounting volume");
             run_udisks(["mount", "--block-device"], &mapping)?;
+            report_phase("Confirming mount");
             let mountpoint = wait_for_device(source, |device| device.mountpoints.first().cloned());
             Ok(LuksOutcome {
                 message: format!("Unlocked and mounted {}", source.display()),
@@ -172,7 +181,9 @@ pub fn execute(action: &LuksAction) -> Result<LuksOutcome> {
             })
         }
         LuksAction::Mount { mapping } => {
+            report_phase("Mounting volume");
             run_udisks(["mount", "--block-device"], mapping)?;
+            report_phase("Confirming mount");
             let mountpoint = discover()
                 .ok()
                 .and_then(|devices| {
@@ -187,7 +198,9 @@ pub fn execute(action: &LuksAction) -> Result<LuksOutcome> {
             })
         }
         LuksAction::UnmountAndLock { source, mapping } => {
+            report_phase("Unmounting volume");
             run_udisks(["unmount", "--block-device"], mapping)?;
+            report_phase("Locking encrypted volume");
             run_udisks(["lock", "--block-device"], source)?;
             Ok(LuksOutcome {
                 message: format!("Unmounted and locked {}", source.display()),
@@ -195,6 +208,7 @@ pub fn execute(action: &LuksAction) -> Result<LuksOutcome> {
             })
         }
         LuksAction::Eject { source, drive } => {
+            report_phase("Checking drive state");
             let device = discover()?
                 .into_iter()
                 .find(|device| device.source == *source)
@@ -218,10 +232,13 @@ pub fn execute(action: &LuksAction) -> Result<LuksOutcome> {
             }
             if let Some(mapping) = device.mapping.as_ref() {
                 if device.is_mounted() {
+                    report_phase("Unmounting volume");
                     run_udisks(["unmount", "--block-device"], mapping)?;
                 }
+                report_phase("Locking encrypted volume");
                 run_udisks(["lock", "--block-device"], &device.source)?;
             }
+            report_phase("Confirming drive state");
             let refreshed = discover()?
                 .into_iter()
                 .find(|candidate| candidate.source == *source)
@@ -237,6 +254,7 @@ pub fn execute(action: &LuksAction) -> Result<LuksOutcome> {
                     "the drive state changed; eject was cancelled".into(),
                 ));
             }
+            report_phase("Ejecting device");
             run_udisks(["power-off", "--block-device"], drive)?;
             Ok(LuksOutcome {
                 message: format!("Safely ejected {}", drive.display()),

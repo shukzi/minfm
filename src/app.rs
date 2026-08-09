@@ -1,8 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
@@ -17,6 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::{
     config::{self, Config, ConfigLoad, SortSetting},
     entry::{self, FileEntry},
+    launcher::{self, LaunchError},
     luks::{self, LuksAction, LuksDevice, LuksOutcome, SecretInput},
     operation::{self, OperationRequest, OperationSummary, OperationUpdate, RunningOperation},
     trash::{TrashEntry, TrashManager},
@@ -51,6 +51,10 @@ pub enum Prompt {
     },
     CreateDirectory {
         input: String,
+    },
+    CreateFile {
+        input: String,
+        cursor: usize,
     },
     ConfirmTrash {
         paths: Vec<PathBuf>,
@@ -91,6 +95,10 @@ pub enum Prompt {
     Message {
         title: String,
         body: String,
+    },
+    OpenError {
+        body: String,
+        config_error: Option<(PathBuf, String)>,
     },
     Summary {
         summary: OperationSummary,
@@ -167,6 +175,7 @@ pub enum AppMode {
 #[derive(Debug, Clone, Default)]
 pub struct ProgressState {
     pub label: String,
+    pub phase: Option<String>,
     pub current: Option<PathBuf>,
     pub total_items: usize,
     pub completed_items: usize,
@@ -174,34 +183,51 @@ pub struct ProgressState {
     pub completed_bytes: u64,
     pub cancelling: bool,
     pub cancellable: bool,
+    pub started_at: Option<Instant>,
+    pub phase_started_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone)]
-pub enum PendingSystemAction {
-    Editor {
-        program: String,
-        path: PathBuf,
-        reload_config: bool,
+enum LuksUpdate {
+    Phase {
+        label: &'static str,
+        started_at: Instant,
     },
-}
-
-#[derive(Debug)]
-pub enum SystemActionOutcome {
-    EditorFinished {
-        reload_config: bool,
-        message: String,
-    },
+    Finished(crate::error::Result<LuksOutcome>),
 }
 
 struct RunningLuks {
-    receiver: Receiver<crate::error::Result<LuksOutcome>>,
+    receiver: Receiver<LuksUpdate>,
     retry: Option<LuksRetry>,
+    started_at: Instant,
 }
 
 struct LuksRetry {
     source: PathBuf,
     label: Option<String>,
     size: u64,
+}
+
+#[derive(Debug)]
+struct BrowserSnapshot {
+    cursor_path: PathBuf,
+    selected_paths: HashSet<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct PendingTerminalEditor {
+    program: String,
+    path: PathBuf,
+    browser: Option<BrowserSnapshot>,
+}
+
+impl PendingTerminalEditor {
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(10);
@@ -221,7 +247,10 @@ pub struct App {
     operation: Option<RunningOperation>,
     operation_trash_manager: Option<TrashManager>,
     luks_operation: Option<RunningLuks>,
-    pending_system_action: Option<PendingSystemAction>,
+    launch_sender: SyncSender<LaunchError>,
+    launch_receiver: Receiver<LaunchError>,
+    pending_launch_errors: VecDeque<LaunchError>,
+    pending_terminal_editor: Option<PendingTerminalEditor>,
     last_device_refresh: Instant,
     selector_memory: HashMap<PathBuf, PathBuf>,
     loaded_dir: PathBuf,
@@ -246,6 +275,7 @@ impl App {
             ),
         };
         config.behavior.read_only |= force_read_only;
+        let (launch_sender, launch_receiver) = mpsc::sync_channel(16);
         let mut app = Self {
             running: true,
             current_dir: start.clone(),
@@ -261,7 +291,10 @@ impl App {
             operation: None,
             operation_trash_manager: None,
             luks_operation: None,
-            pending_system_action: None,
+            launch_sender,
+            launch_receiver,
+            pending_launch_errors: VecDeque::new(),
+            pending_terminal_editor: None,
             last_device_refresh: Instant::now(),
             selector_memory: HashMap::new(),
             loaded_dir: start.clone(),
@@ -397,20 +430,41 @@ impl App {
                 size: retry.size,
             })
         });
-        let result = match self
-            .luks_operation
-            .as_ref()
-            .map(|running| running.receiver.try_recv())
-        {
-            Some(Ok(result)) => result,
-            Some(Err(TryRecvError::Empty)) | None => return false,
-            Some(Err(TryRecvError::Disconnected)) => Err(crate::error::MinfmError::Message(
-                "encrypted-volume worker stopped unexpectedly".into(),
-            )),
+        let mut result = None;
+        let mut changed = false;
+        if let Some(running) = &self.luks_operation {
+            loop {
+                match running.receiver.try_recv() {
+                    Ok(LuksUpdate::Phase { label, started_at }) => {
+                        self.progress.phase = Some(label.into());
+                        self.progress.phase_started_at = Some(started_at);
+                        changed = true;
+                    }
+                    Ok(LuksUpdate::Finished(finished)) => {
+                        result = Some(finished);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        result = Some(Err(crate::error::MinfmError::Message(
+                            "encrypted-volume worker stopped unexpectedly".into(),
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(result) = result else {
+            return changed;
         };
-        self.luks_operation = None;
+        let elapsed = self
+            .luks_operation
+            .take()
+            .map(|running| running.started_at.elapsed())
+            .unwrap_or_default();
         match result {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                outcome.message = format!("{} · took {}", outcome.message, format_elapsed(elapsed));
                 self.set_notice(outcome.message);
                 if let Some(mountpoint) = outcome.mountpoint.filter(|path| path.is_dir()) {
                     self.mode = AppMode::Prompt(Prompt::Mounted { path: mountpoint });
@@ -435,7 +489,10 @@ impl App {
                 }
             }
             Err(error) => {
-                self.status = format!("Encrypted-volume operation failed: {error}");
+                self.status = format!(
+                    "Encrypted-volume operation failed after {}: {error}",
+                    format_elapsed(elapsed)
+                );
                 self.mode = self.open_devices();
             }
         }
@@ -470,7 +527,9 @@ impl App {
         let Some((cancelled, limited)) = finished else {
             return changed;
         };
-        let search = self.search.take().expect("search exists while polling");
+        let Some(search) = self.search.take() else {
+            return changed;
+        };
         self.search_cancelling = false;
         if cancelled {
             self.mode = AppMode::Browser;
@@ -539,7 +598,7 @@ impl App {
             if let Some(latest) = self.pending_update.take() {
                 changed = true;
                 self.mode = AppMode::Prompt(Prompt::UpdateAvailable {
-                    current: env!("CARGO_PKG_VERSION").into(),
+                    current: format!("v{}", env!("CARGO_PKG_VERSION")),
                     latest,
                 });
             }
@@ -598,54 +657,63 @@ impl App {
         self.entries.get(self.cursor)
     }
 
-    pub fn take_system_action(&mut self) -> Option<PendingSystemAction> {
-        self.pending_system_action.take()
+    pub fn poll_file_launch(&mut self) -> bool {
+        while let Ok(error) = self.launch_receiver.try_recv() {
+            self.pending_launch_errors.push_back(error);
+        }
+        let config_error = match &self.mode {
+            AppMode::Browser => Some(None),
+            AppMode::ConfigError { path, error } => Some(Some((path.clone(), error.clone()))),
+            _ => None,
+        };
+        let Some(config_error) = config_error else {
+            return false;
+        };
+        let Some(error) = self.pending_launch_errors.pop_front() else {
+            return false;
+        };
+        self.mode = AppMode::Prompt(Prompt::OpenError {
+            body: error.to_string(),
+            config_error,
+        });
+        true
     }
 
-    pub fn finish_system_action(
+    pub fn take_terminal_editor(&mut self) -> Option<PendingTerminalEditor> {
+        self.pending_terminal_editor.take()
+    }
+
+    pub fn finish_terminal_editor(
         &mut self,
-        action: &PendingSystemAction,
-        result: crate::error::Result<SystemActionOutcome>,
+        action: &PendingTerminalEditor,
+        result: Result<(), LaunchError>,
     ) {
         match result {
-            Ok(SystemActionOutcome::EditorFinished {
-                reload_config,
-                message,
-            }) => {
-                self.set_notice(message);
-                if reload_config {
-                    self.mode = match config::load_from(self.config_path.clone()) {
-                        ConfigLoad::Valid { config, path } => {
-                            self.config = config;
-                            self.config_path = path;
-                            self.refresh();
-                            self.set_notice("Configuration reloaded");
-                            AppMode::Browser
-                        }
-                        ConfigLoad::Invalid { path, error } => AppMode::ConfigError { path, error },
-                    };
-                } else {
-                    self.refresh();
-                    self.mode = AppMode::Browser;
+            Ok(()) => {
+                let Some(snapshot) = &action.browser else {
+                    return;
+                };
+                self.refresh();
+                for entry in &mut self.entries {
+                    entry.selected = snapshot.selected_paths.contains(&entry.path);
+                }
+                if let Some(index) = self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.path == snapshot.cursor_path)
+                {
+                    self.cursor = index;
                 }
             }
             Err(error) => {
-                self.status = format!("System operation failed: {error}");
-                self.mode = match action {
-                    PendingSystemAction::Editor {
-                        reload_config: true,
-                        ..
-                    } => match config::load_from(self.config_path.clone()) {
-                        ConfigLoad::Valid { config, path } => {
-                            self.config = config;
-                            self.config_path = path;
-                            self.refresh();
-                            AppMode::Browser
-                        }
-                        ConfigLoad::Invalid { path, error } => AppMode::ConfigError { path, error },
-                    },
-                    PendingSystemAction::Editor { .. } => AppMode::Browser,
+                let config_error = match &self.mode {
+                    AppMode::ConfigError { path, error } => Some((path.clone(), error.clone())),
+                    _ => None,
                 };
+                self.mode = AppMode::Prompt(Prompt::OpenError {
+                    body: error.to_string(),
+                    config_error,
+                });
             }
         }
     }
@@ -675,7 +743,7 @@ impl App {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected(),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => return self.open_selected(),
             KeyCode::Left | KeyCode::Char('h') => self.go_parent(),
             KeyCode::Char(' ') => self.toggle_selection(),
             KeyCode::Char('.') => {
@@ -722,6 +790,12 @@ impl App {
                     input: String::new(),
                 })
             }
+            KeyCode::Char('n') => {
+                return AppMode::Prompt(Prompt::CreateFile {
+                    input: String::new(),
+                    cursor: 0,
+                })
+            }
             KeyCode::Char('c') => self.set_clipboard(ClipboardMode::Copy),
             KeyCode::Char('x') => self.set_clipboard(ClipboardMode::Cut),
             KeyCode::Char('p') => return self.prepare_paste(),
@@ -740,7 +814,7 @@ impl App {
             KeyCode::Char('I') => return AppMode::Info,
             KeyCode::Char('?') => return AppMode::Help,
             KeyCode::Char('o') | KeyCode::Char('e') => {
-                self.open_external(key.code == KeyCode::Char('e'))
+                return self.open_external(key.code == KeyCode::Char('e'))
             }
             KeyCode::Char('m') => {
                 if self.config.behavior.read_only {
@@ -794,6 +868,15 @@ impl App {
                 if key.code == KeyCode::Enter {
                     self.create_directory(input);
                     return AppMode::Browser;
+                }
+            }
+            Prompt::CreateFile { input, cursor } => {
+                if edit_cursor_input(input, cursor, key) {
+                    return AppMode::Browser;
+                }
+                if key.code == KeyCode::Enter {
+                    let input = input.clone();
+                    return self.create_file(&input);
                 }
             }
             Prompt::Rename {
@@ -952,6 +1035,15 @@ impl App {
             Prompt::Message { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     return AppMode::Browser;
+                }
+            }
+            Prompt::OpenError { config_error, .. } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    return if let Some((path, error)) = config_error.take() {
+                        AppMode::ConfigError { path, error }
+                    } else {
+                        AppMode::Browser
+                    };
                 }
             }
             Prompt::Summary {
@@ -1160,10 +1252,17 @@ impl App {
                         error: None,
                     })
                 } else if device.is_mounted() {
+                    let Some(mapping) = device.mapping.clone() else {
+                        self.status = format!(
+                            "{} changed state; refresh the device list and try again",
+                            device.source.display()
+                        );
+                        return AppMode::Devices(view);
+                    };
                     AppMode::Prompt(Prompt::ConfirmLuks {
                         action: LuksAction::UnmountAndLock {
                             source: device.source.clone(),
-                            mapping: device.mapping.clone().expect("unlocked device has mapping"),
+                            mapping,
                         },
                         title: "Unmount and lock LUKS volume".into(),
                         body: format!(
@@ -1174,10 +1273,15 @@ impl App {
                         ),
                     })
                 } else {
+                    let Some(mapping) = device.mapping.clone() else {
+                        self.status = format!(
+                            "{} changed state; refresh the device list and try again",
+                            device.source.display()
+                        );
+                        return AppMode::Devices(view);
+                    };
                     AppMode::Prompt(Prompt::ConfirmLuks {
-                        action: LuksAction::Mount {
-                            mapping: device.mapping.clone().expect("unlocked device has mapping"),
-                        },
+                        action: LuksAction::Mount { mapping },
                         title: "Mount unlocked LUKS volume".into(),
                         body: format!(
                             "Device: {}\nMapping: {}",
@@ -1220,13 +1324,22 @@ impl App {
                 ConfigLoad::Invalid { path, error } => AppMode::ConfigError { path, error },
             },
             KeyCode::Char('e') => {
-                let editor = resolve_editor(&self.config.open.editor);
-                self.pending_system_action = Some(PendingSystemAction::Editor {
-                    program: editor,
-                    path,
-                    reload_config: true,
-                });
-                AppMode::Progress
+                let program = launcher::resolve_editor(&self.config.open.editor);
+                if launcher::is_terminal_editor(&program) {
+                    self.pending_terminal_editor = Some(PendingTerminalEditor {
+                        program,
+                        path: path.clone(),
+                        browser: None,
+                    });
+                    return AppMode::ConfigError { path, error };
+                }
+                match launcher::launch(program, path.clone(), self.launch_sender.clone()) {
+                    Ok(()) => AppMode::ConfigError { path, error },
+                    Err(launch_error) => AppMode::Prompt(Prompt::OpenError {
+                        body: launch_error.to_string(),
+                        config_error: Some((path, error)),
+                    }),
+                }
             }
             _ => AppMode::ConfigError { path, error },
         }
@@ -1280,14 +1393,15 @@ impl App {
             (self.cursor as isize + delta).clamp(0, self.entries.len() as isize - 1) as usize;
     }
 
-    fn open_selected(&mut self) {
+    fn open_selected(&mut self) -> AppMode {
         let Some(entry) = self.selected_entry() else {
-            return;
+            return AppMode::Browser;
         };
         if entry.path.is_dir() {
             self.go_to(entry.path.clone());
+            AppMode::Browser
         } else {
-            self.open_external(false);
+            self.open_external(false)
         }
     }
 
@@ -1536,17 +1650,31 @@ impl App {
             }
             LuksAction::Eject { drive, .. } => ("Safely ejecting device", drive.clone()),
         };
+        let started_at = Instant::now();
         self.progress = ProgressState {
             label: label.into(),
+            phase: Some("Preparing device operation".into()),
             current: Some(current),
             cancellable: false,
+            started_at: Some(started_at),
+            phase_started_at: Some(started_at),
             ..ProgressState::default()
         };
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let _ = sender.send(luks::execute(&action));
+            let result = luks::execute_with_progress(&action, |label| {
+                let _ = sender.send(LuksUpdate::Phase {
+                    label,
+                    started_at: Instant::now(),
+                });
+            });
+            let _ = sender.send(LuksUpdate::Finished(result));
         });
-        self.luks_operation = Some(RunningLuks { receiver, retry });
+        self.luks_operation = Some(RunningLuks {
+            receiver,
+            retry,
+            started_at,
+        });
     }
 
     fn create_directory(&mut self, name: &str) {
@@ -1560,6 +1688,45 @@ impl App {
             Err(error) => self.status = format!("Could not create {}: {error}", path.display()),
         }
         self.refresh();
+    }
+
+    fn create_file(&mut self, name: &str) -> AppMode {
+        if self.config.behavior.read_only {
+            self.status = "Read-only mode: file creation is disabled".into();
+            return AppMode::Browser;
+        }
+        if name.trim().is_empty() || name == "." || name == ".." || name.contains('/') {
+            return AppMode::Prompt(Prompt::Message {
+                title: "Invalid file name".into(),
+                body: "Enter a single non-empty file name.".into(),
+            });
+        }
+        let path = self.current_dir.join(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                drop(file);
+                self.refresh();
+                if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+                    self.cursor = index;
+                }
+                self.set_notice(format!("Created {}", path.display()));
+                AppMode::Browser
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                AppMode::Prompt(Prompt::Message {
+                    title: "File already exists".into(),
+                    body: format!("Nothing was changed.\n\n{}", path.display()),
+                })
+            }
+            Err(error) => AppMode::Prompt(Prompt::Message {
+                title: "Could not create file".into(),
+                body: format!("{}\n\n{error}", path.display()),
+            }),
+        }
     }
 
     fn rename(&mut self, source: &Path, name: &str) {
@@ -1618,27 +1785,58 @@ impl App {
         }
     }
 
-    fn open_external(&mut self, editor: bool) {
+    fn open_external(&mut self, editor: bool) -> AppMode {
         if self.config.behavior.read_only {
             self.status = "Read-only mode: external opening is disabled".into();
-            return;
+            return AppMode::Browser;
         }
         let Some(entry) = self.selected_entry() else {
-            return;
+            return AppMode::Browser;
         };
-        let path = entry.path.clone();
-        if editor {
-            self.pending_system_action = Some(PendingSystemAction::Editor {
-                program: resolve_editor(&self.config.open.editor),
-                path,
-                reload_config: false,
-            });
-        } else {
-            match Command::new(&self.config.open.opener).arg(&path).spawn() {
-                Ok(_) => self.set_notice(format!("Opened {}", path.display())),
-                Err(error) => self.status = format!("Could not open {}: {error}", path.display()),
-            }
+        if editor && !entry.is_text_file() {
+            return AppMode::Browser;
         }
+        let path = entry.path.clone();
+        let program = if editor {
+            launcher::resolve_editor(&self.config.open.editor)
+        } else {
+            self.config.open.opener.clone()
+        };
+        if editor && launcher::is_terminal_editor(&program) {
+            let selected_paths = self
+                .entries
+                .iter()
+                .filter(|entry| entry.selected)
+                .map(|entry| entry.path.clone())
+                .collect();
+            self.pending_terminal_editor = Some(PendingTerminalEditor {
+                program,
+                path: path.clone(),
+                browser: Some(BrowserSnapshot {
+                    cursor_path: path,
+                    selected_paths,
+                }),
+            });
+            return AppMode::Browser;
+        }
+        if let Err(error) = launcher::launch(program, path, self.launch_sender.clone()) {
+            return AppMode::Prompt(Prompt::OpenError {
+                body: error.to_string(),
+                config_error: None,
+            });
+        }
+        AppMode::Browser
+    }
+}
+
+pub(crate) fn format_elapsed(duration: Duration) -> String {
+    let total_tenths = duration.as_millis() / 100;
+    let minutes = total_tenths / 600;
+    let seconds = total_tenths % 600;
+    if minutes > 0 {
+        format!("{minutes}m {}.{:01}s", seconds / 10, seconds % 10)
+    } else {
+        format!("{}.{:01}s", seconds / 10, seconds % 10)
     }
 }
 
@@ -1737,14 +1935,6 @@ fn expand_home(input: &str) -> String {
         }
     }
     input.into()
-}
-
-fn resolve_editor(configured: &str) -> String {
-    if configured == "$EDITOR" {
-        env::var("EDITOR").unwrap_or_else(|_| "vi".into())
-    } else {
-        configured.into()
-    }
 }
 
 fn search_filesystem(
@@ -1894,6 +2084,22 @@ mod tests {
     }
 
     #[test]
+    fn update_prompt_prefixes_both_versions_with_v() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        app.pending_update = Some("v9.9.9".into());
+
+        assert!(app.poll_update());
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::UpdateAvailable {
+                current,
+                latest,
+            }) if current == format!("v{}", env!("CARGO_PKG_VERSION")) && latest == "v9.9.9"
+        ));
+    }
+
+    #[test]
     fn invalid_config_only_accepts_config_actions() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("untouched.txt");
@@ -1911,6 +2117,188 @@ mod tests {
         }
         assert!(file.exists());
         assert!(matches!(app.mode, AppMode::ConfigError { .. }));
+    }
+
+    #[test]
+    fn asynchronous_open_errors_use_a_modal() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        app.launch_sender
+            .try_send(LaunchError {
+                program: "missing-opener".into(),
+                path: temp.path().join("example.txt"),
+                detail: "application not found".into(),
+            })
+            .unwrap();
+
+        assert!(app.poll_file_launch());
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::OpenError {
+                config_error: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn immediate_open_failure_is_not_overwritten_by_browser_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("example.txt"), b"example").unwrap();
+        let mut app = test_app(temp.path());
+        app.config.open.opener = "/minfm-test/missing-opener".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::OpenError {
+                config_error: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn editor_shortcut_is_contextual_to_text_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = temp.path().join("notes.txt");
+        let image = temp.path().join("image.png");
+        std::fs::write(&text, b"notes").unwrap();
+        std::fs::write(&image, b"not a real image").unwrap();
+        let mut app = test_app(temp.path());
+        app.config.open.editor = "/minfm-test/missing-editor".into();
+
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == image)
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Browser));
+
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == text)
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::OpenError { .. })
+        ));
+    }
+
+    #[test]
+    fn terminal_editor_restores_selector_and_multi_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let mut app = test_app(temp.path());
+        app.config.open.editor = "nano".into();
+        app.entries
+            .iter_mut()
+            .find(|entry| entry.path == first)
+            .unwrap()
+            .selected = true;
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == second)
+            .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        let action = app.take_terminal_editor().expect("terminal editor queued");
+        assert_eq!(action.program(), "nano");
+        assert_eq!(action.path(), second);
+        assert!(matches!(app.mode, AppMode::Browser));
+
+        std::fs::write(&second, b"edited contents").unwrap();
+        std::fs::write(temp.path().join("new.txt"), b"new").unwrap();
+        app.finish_terminal_editor(&action, Ok(()));
+
+        assert_eq!(app.selected_entry().map(|entry| &entry.path), Some(&second));
+        assert!(
+            app.entries
+                .iter()
+                .find(|entry| entry.path == first)
+                .unwrap()
+                .selected
+        );
+        assert_eq!(
+            app.entries
+                .iter()
+                .find(|entry| entry.path == second)
+                .unwrap()
+                .size,
+            b"edited contents".len() as u64
+        );
+    }
+
+    #[test]
+    fn terminal_editor_failure_returns_to_an_error_modal() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = temp.path().join("notes.txt");
+        std::fs::write(&text, b"notes").unwrap();
+        let mut app = test_app(temp.path());
+        app.config.open.editor = "vim".into();
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == text)
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        let action = app.take_terminal_editor().unwrap();
+
+        app.finish_terminal_editor(
+            &action,
+            Err(LaunchError {
+                program: "vim".into(),
+                path: text,
+                detail: "editor failed".into(),
+            }),
+        );
+
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::OpenError {
+                config_error: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn open_error_returns_to_invalid_configuration_screen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bad.toml");
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Invalid {
+                path: path.clone(),
+                error: "invalid value".into(),
+            },
+            false,
+        );
+        app.launch_sender
+            .try_send(LaunchError {
+                program: "missing-editor".into(),
+                path: path.clone(),
+                detail: "application not found".into(),
+            })
+            .unwrap();
+
+        assert!(app.poll_file_launch());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            AppMode::ConfigError {
+                path: returned_path,
+                ..
+            } if returned_path == path
+        ));
     }
 
     #[test]
@@ -1984,6 +2372,55 @@ mod tests {
                 && body.contains("safely ejected")
                 && !body.contains("unmounted")
         ));
+    }
+
+    #[test]
+    fn device_progress_tracks_phase_and_total_duration() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let (sender, receiver) = mpsc::channel();
+        let started_at = Instant::now() - Duration::from_millis(1_250);
+        app.mode = AppMode::Progress;
+        app.progress = ProgressState {
+            label: "Safely ejecting device".into(),
+            phase: Some("Preparing device operation".into()),
+            started_at: Some(started_at),
+            phase_started_at: Some(started_at),
+            ..ProgressState::default()
+        };
+        app.luks_operation = Some(RunningLuks {
+            receiver,
+            retry: None,
+            started_at,
+        });
+
+        let phase_started_at = Instant::now() - Duration::from_millis(250);
+        sender
+            .send(LuksUpdate::Phase {
+                label: "Ejecting device",
+                started_at: phase_started_at,
+            })
+            .unwrap();
+        assert!(app.poll_luks_operation());
+        assert_eq!(app.progress.phase.as_deref(), Some("Ejecting device"));
+        assert_eq!(app.progress.phase_started_at, Some(phase_started_at));
+
+        sender
+            .send(LuksUpdate::Finished(Ok(LuksOutcome {
+                message: "Safely ejected /dev/test".into(),
+                mountpoint: Some(temp.path().to_path_buf()),
+            })))
+            .unwrap();
+        assert!(app.poll_luks_operation());
+        assert!(app.status.contains("Safely ejected /dev/test · took 1.2s"));
+        assert!(matches!(app.mode, AppMode::Prompt(Prompt::Mounted { .. })));
+    }
+
+    #[test]
+    fn elapsed_duration_has_stable_tenths_and_minutes() {
+        assert_eq!(format_elapsed(Duration::from_millis(80)), "0.0s");
+        assert_eq!(format_elapsed(Duration::from_millis(1_290)), "1.2s");
+        assert_eq!(format_elapsed(Duration::from_millis(64_320)), "1m 4.3s");
     }
 
     #[test]
@@ -2160,6 +2597,74 @@ mod tests {
 
         assert!(temp.path().join("new-file").is_file());
         assert!(temp.path().join("new-directory").is_dir());
+    }
+
+    #[test]
+    fn create_file_uses_the_prompt_and_selects_the_new_empty_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        for character in "notes.txt".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let created = temp.path().join("notes.txt");
+        assert_eq!(std::fs::metadata(&created).unwrap().len(), 0);
+        assert_eq!(
+            app.selected_entry().map(|entry| &entry.path),
+            Some(&created)
+        );
+        assert!(matches!(app.mode, AppMode::Browser));
+    }
+
+    #[test]
+    fn create_file_never_overwrites_an_existing_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing.txt");
+        std::fs::write(&existing, b"keep these bytes").unwrap();
+        let mut app = test_app(temp.path());
+
+        let mode = app.create_file("existing.txt");
+
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep these bytes");
+        assert!(matches!(
+            mode,
+            AppMode::Prompt(Prompt::Message { title, .. }) if title == "File already exists"
+        ));
+    }
+
+    #[test]
+    fn create_file_rejects_nested_or_special_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+
+        for name in ["", ".", "..", "nested/file"] {
+            assert!(matches!(
+                app.create_file(name),
+                AppMode::Prompt(Prompt::Message { title, .. }) if title == "Invalid file name"
+            ));
+        }
+        assert!(!temp.path().join("nested").exists());
+    }
+
+    #[test]
+    fn create_file_refuses_an_existing_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("link.txt");
+        std::fs::write(&target, b"safe target").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut app = test_app(temp.path());
+
+        let mode = app.create_file("link.txt");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"safe target");
+        assert!(matches!(
+            mode,
+            AppMode::Prompt(Prompt::Message { title, .. }) if title == "File already exists"
+        ));
     }
 
     #[test]

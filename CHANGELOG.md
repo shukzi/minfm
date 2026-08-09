@@ -1,5 +1,38 @@
 # minfm changelog
 
+## v0.1.4
+
+### Added
+
+- File creation: create a new empty file with `n` using cursor-aware filename
+  editing, exclusive creation, normal Linux umask permissions, and no overwrite.
+
+### Changed
+
+- Device manager: show the active device-operation phase together with total
+  and phase elapsed time, measured with monotonic clocks.
+- Device manager: include the total duration in successful completion notices
+  and failed-operation messages, and show a non-cancelling warning after 30
+  seconds without forcing or interrupting the operation.
+- Updater: display both installed and latest versions with the same `v` prefix.
+- File opening: launch default applications asynchronously and keep successful
+  opens silent so the browser remains responsive and unchanged.
+- File opening: show `e Edit` only for recognized text files and ignore the
+  editor shortcut for directories, images, and other non-text entries.
+- Editors: run Nano, Vim, Neovim, Helix, Micro, Kakoune, and similar configured
+  terminal editors in minfm's current terminal, then restore the same directory,
+  selector, and multi-selection state after the editor exits.
+- Error reporting: show application launch failures in a consistent in-TUI
+  popup, including while correcting an invalid configuration.
+- Paths: pass filenames to external applications without lossy text conversion,
+  preserving valid Linux filenames that contain non-UTF-8 bytes.
+- Configuration: use `xdg-open` as the default opener and editor, while keeping
+  `$EDITOR` compatible for existing configurations.
+- Runtime: keep graphical file opening asynchronous while using a controlled
+  same-terminal handoff for terminal editors, with no new dependencies.
+- Release workflow: validate tags against both current and older Cargo package
+  identifier formats before publishing assets.
+
 ## v0.1.3
 
 ### Changed

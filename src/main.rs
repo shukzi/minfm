@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod entry;
 mod error;
+mod launcher;
 mod luks;
 mod operation;
 mod safety;
@@ -16,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use app::{App, PendingSystemAction, SystemActionOutcome};
+use app::App;
 use crossterm::{
     event::{self, Event},
     execute,
@@ -59,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         redraw |= app.poll_search();
         redraw |= app.poll_update();
         redraw |= app.poll_devices();
+        redraw |= app.poll_file_launch();
         redraw |= app.poll_status_expiry();
         if app.needs_animation() && last_animation.elapsed() >= Duration::from_millis(180) {
             redraw = true;
@@ -78,44 +80,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             }
         }
-        if let Some(action) = app.take_system_action() {
+        if let Some(action) = app.take_terminal_editor() {
             terminal.show_cursor()?;
             disable_raw_mode()?;
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-            let result = execute_system_action(&action);
+            let result = launcher::run_terminal_editor(action.program(), action.path());
             enable_raw_mode()?;
             execute!(terminal.backend_mut(), EnterAlternateScreen)?;
             terminal.clear()?;
             terminal.hide_cursor()?;
-            app.finish_system_action(&action, result);
+            app.finish_terminal_editor(&action, result);
             redraw = true;
         }
     }
     Ok(())
-}
-
-fn execute_system_action(action: &PendingSystemAction) -> error::Result<SystemActionOutcome> {
-    match action {
-        PendingSystemAction::Editor {
-            program,
-            path,
-            reload_config,
-        } => {
-            let status = std::process::Command::new(program)
-                .arg(path)
-                .status()
-                .map_err(|source| error::io_error(format!("could not run {program}"), source))?;
-            if !status.success() {
-                return Err(error::MinfmError::Message(format!(
-                    "{program} exited with status {status}"
-                )));
-            }
-            Ok(SystemActionOutcome::EditorFinished {
-                reload_config: *reload_config,
-                message: format!("Editor closed: {}", path.display()),
-            })
-        }
-    }
 }
 
 fn parse_args() -> Result<(bool, PathBuf), Box<dyn std::error::Error>> {

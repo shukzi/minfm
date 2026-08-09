@@ -103,6 +103,80 @@ impl FileEntry {
             human_size(self.size)
         }
     }
+
+    pub fn is_text_file(&self) -> bool {
+        if self.kind != EntryKind::File {
+            return false;
+        }
+        let name = self.name.to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "readme"
+                | "license"
+                | "copying"
+                | "makefile"
+                | "dockerfile"
+                | "cargo.lock"
+                | ".gitignore"
+                | ".gitattributes"
+                | ".editorconfig"
+        ) {
+            return true;
+        }
+        self.path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "txt"
+                        | "md"
+                        | "markdown"
+                        | "rst"
+                        | "log"
+                        | "csv"
+                        | "tsv"
+                        | "json"
+                        | "jsonc"
+                        | "toml"
+                        | "yaml"
+                        | "yml"
+                        | "xml"
+                        | "html"
+                        | "htm"
+                        | "css"
+                        | "js"
+                        | "jsx"
+                        | "ts"
+                        | "tsx"
+                        | "rs"
+                        | "c"
+                        | "h"
+                        | "cc"
+                        | "cpp"
+                        | "hpp"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                        | "fish"
+                        | "py"
+                        | "rb"
+                        | "go"
+                        | "java"
+                        | "kt"
+                        | "kts"
+                        | "php"
+                        | "lua"
+                        | "sql"
+                        | "ini"
+                        | "cfg"
+                        | "conf"
+                        | "env"
+                        | "desktop"
+                        | "service"
+                )
+            })
+    }
 }
 
 pub fn read_directory(
@@ -222,6 +296,24 @@ mod tests {
         assert!(contains_case_insensitive("QuarterlyReport.TXT", "report"));
         assert!(contains_case_insensitive("RÉSUMÉ.txt", "résumé"));
         assert!(!contains_case_insensitive("notes.txt", "report"));
+    }
+
+    #[test]
+    fn recognizes_text_files_for_contextual_editing() {
+        let entry = |name: &str, kind| FileEntry {
+            path: PathBuf::from(name),
+            name: name.into(),
+            kind,
+            size: 0,
+            mode: 0,
+            modified: None,
+            selected: false,
+        };
+        assert!(entry("notes.txt", EntryKind::File).is_text_file());
+        assert!(entry("README", EntryKind::File).is_text_file());
+        assert!(entry("main.rs", EntryKind::File).is_text_file());
+        assert!(!entry("image.png", EntryKind::File).is_text_file());
+        assert!(!entry("notes.txt", EntryKind::Directory).is_text_file());
     }
 
     #[test]

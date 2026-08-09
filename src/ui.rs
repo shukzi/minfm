@@ -7,7 +7,10 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, AppMode, ClipboardMode, DeviceView, Prompt, SearchScope, SearchView, TrashView},
+    app::{
+        format_elapsed, App, AppMode, ClipboardMode, DeviceView, Prompt, SearchScope, SearchView,
+        TrashView,
+    },
     entry::{human_size, EntryKind},
 };
 
@@ -226,9 +229,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     let line = if matches!(app.mode, AppMode::Browser) {
-        " ↑/↓ j/k Move │ ←/h Parent │ →/l/Enter Open │ g Path │ / Search here │ F Search filesystem │ Space Select │ ? Help\n x Cut │ c Copy │ p Paste │ r Rename │ a New directory │ d/D Trash │ T Bin │ . Hidden │ s Sort │ m Device manager "
+        let edit = if app
+            .selected_entry()
+            .is_some_and(|entry| entry.is_text_file())
+        {
+            " │ e Edit"
+        } else {
+            ""
+        };
+        format!(
+            " ↑/↓ j/k Move │ ←/h Parent │ →/l/Enter Open{edit} │ g Path │ / Search here │ F Search filesystem │ Space Select │ ? Help\n x Cut │ c Copy │ p Paste │ r Rename │ n New file │ a New directory │ d/D Trash │ T Bin │ . Hidden │ s Sort │ m Device manager "
+        )
     } else {
-        " A dialog owns input. File shortcuts are disabled until it closes. "
+        " A dialog owns input. File shortcuts are disabled until it closes. ".into()
     };
     frame.render_widget(
         Paragraph::new(line)
@@ -250,12 +263,27 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
             input,
             "Enter search · Esc cancel",
         ),
-        Prompt::Rename { input, cursor, .. } => rename_modal(frame, input, *cursor),
+        Prompt::Rename { input, cursor, .. } => cursor_input_modal(
+            frame,
+            "Rename",
+            "Enter a new name:",
+            input,
+            *cursor,
+            "rename",
+        ),
         Prompt::CreateDirectory { input } => input_modal(
             frame,
             "Create directory",
             input,
             "Enter create · Esc cancel",
+        ),
+        Prompt::CreateFile { input, cursor } => cursor_input_modal(
+            frame,
+            "Create file",
+            "Enter a file name:",
+            input,
+            *cursor,
+            "create",
         ),
         Prompt::ConfirmTrash { paths } => {
             let mut body = format!("Move {} item(s) to trash?\n\n", paths.len());
@@ -409,6 +437,14 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
         Prompt::Message { title, body } => {
             message_modal(frame, title, body, "Enter/Esc close", 72, 12)
         }
+        Prompt::OpenError { body, .. } => message_modal(
+            frame,
+            "Unable to open file",
+            body,
+            "Enter/Esc close",
+            72,
+            12,
+        ),
         Prompt::Summary { summary, .. } => {
             let mut body = format!(
                 "Completed: {}\nFailed: {}\nWarnings: {}\nCancelled: {}",
@@ -486,30 +522,66 @@ fn draw_progress_modal(frame: &mut Frame, app: &App) {
             rows[0],
         );
     }
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{} / {}",
-            human_size(app.progress.completed_bytes),
-            human_size(app.progress.total_bytes)
-        )),
-        rows[1],
-    );
-    frame.render_widget(
-        Paragraph::new(
-            app.progress
-                .current
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "Preparing…".into()),
-        )
-        .wrap(Wrap { trim: false }),
-        rows[2],
-    );
+    let now = std::time::Instant::now();
+    if let Some(started_at) = app.progress.started_at {
+        let phase_started_at = app.progress.phase_started_at.unwrap_or(started_at);
+        frame.render_widget(
+            Paragraph::new(
+                app.progress
+                    .phase
+                    .as_deref()
+                    .unwrap_or("Preparing device operation"),
+            )
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+            rows[1],
+        );
+        let current = app
+            .progress
+            .current
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Preparing…".into());
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{current}\nElapsed: {} · phase: {}",
+                format_elapsed(now.saturating_duration_since(started_at)),
+                format_elapsed(now.saturating_duration_since(phase_started_at)),
+            ))
+            .wrap(Wrap { trim: false }),
+            rows[2],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} / {}",
+                human_size(app.progress.completed_bytes),
+                human_size(app.progress.total_bytes)
+            )),
+            rows[1],
+        );
+        frame.render_widget(
+            Paragraph::new(
+                app.progress
+                    .current
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "Preparing…".into()),
+            )
+            .wrap(Wrap { trim: false }),
+            rows[2],
+        );
+    }
+    let device_slow = app.progress.started_at.is_some_and(|started| {
+        now.saturating_duration_since(started) >= std::time::Duration::from_secs(30)
+    });
     frame.render_widget(
         Paragraph::new(if app.progress.cancelling {
             "Cancellation requested…"
         } else if app.progress.cancellable {
             "Esc requests cancellation"
+        } else if device_slow {
+            "Still working · some devices take longer · do not disconnect"
         } else {
             "Please wait · this disk operation cannot be interrupted safely"
         })
@@ -770,7 +842,7 @@ fn draw_devices(frame: &mut Frame, view: &DeviceView) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter or →/l  open\n  ←/h            parent\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
+    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter or →/l  open\n  ←/h            parent\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
     let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
     message_modal(frame, &title, body, "Esc/Enter close", 70, 44);
 }
@@ -858,10 +930,19 @@ fn input_modal(frame: &mut Frame, title: &str, input: &str, footer: &str) {
     );
 }
 
-fn rename_modal(frame: &mut Frame, input: &str, cursor: usize) {
+fn cursor_input_modal(
+    frame: &mut Frame,
+    title: &str,
+    prompt: &str,
+    input: &str,
+    cursor: usize,
+    action: &str,
+) {
     let area = centered(frame.area(), 72, 9);
     frame.render_widget(Clear, area);
-    let block = Block::default().borders(Borders::ALL).title(" Rename ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = Layout::default()
@@ -872,7 +953,7 @@ fn rename_modal(frame: &mut Frame, input: &str, cursor: usize) {
             Constraint::Length(1),
         ])
         .split(inner);
-    frame.render_widget(Paragraph::new("Enter a new name:"), rows[0]);
+    frame.render_widget(Paragraph::new(prompt), rows[0]);
 
     let characters = input.chars().collect::<Vec<_>>();
     let cursor = cursor.min(characters.len());
@@ -889,9 +970,11 @@ fn rename_modal(frame: &mut Frame, input: &str, cursor: usize) {
     let cursor_x = rows[1].x + 3 + cursor.saturating_sub(start).min(visible_width) as u16;
     frame.set_cursor_position((cursor_x, rows[1].y + 1));
     frame.render_widget(
-        Paragraph::new("←/→ move · Home/End jump · Enter rename · Esc cancel")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(MUTED)),
+        Paragraph::new(format!(
+            "←/→ move · Home/End jump · Enter {action} · Esc cancel"
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(MUTED)),
         rows[2],
     );
 }

@@ -73,7 +73,7 @@ impl Default for BehaviorConfig {
 impl Default for OpenConfig {
     fn default() -> Self {
         Self {
-            editor: "$EDITOR".into(),
+            editor: "xdg-open".into(),
             opener: "xdg-open".into(),
         }
     }
@@ -128,7 +128,11 @@ mod tests {
     fn missing_config_uses_safe_defaults() {
         let temp = tempfile::tempdir().unwrap();
         let result = load_from(temp.path().join("missing.toml"));
-        assert!(matches!(result, ConfigLoad::Valid { .. }));
+        let ConfigLoad::Valid { config, .. } = result else {
+            panic!("missing configuration must use defaults");
+        };
+        assert_eq!(config.open.opener, "xdg-open");
+        assert_eq!(config.open.editor, "xdg-open");
     }
 
     #[test]
@@ -146,5 +150,13 @@ mod tests {
             parsed.is_ok(),
             "example config must remain loadable: {parsed:?}"
         );
+    }
+
+    #[test]
+    fn partial_config_preserves_values_and_fills_missing_defaults() {
+        let config = toml::from_str::<Config>("[open]\neditor = 'nano'\n").unwrap();
+        assert_eq!(config.open.editor, "nano");
+        assert_eq!(config.open.opener, "xdg-open");
+        assert!(config.behavior.verify_copies);
     }
 }
