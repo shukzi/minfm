@@ -5,6 +5,7 @@ mod entry;
 mod error;
 mod launcher;
 mod luks;
+mod network;
 mod operation;
 mod safety;
 mod trash;
@@ -62,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         redraw |= app.poll_search();
         redraw |= app.poll_update();
         redraw |= app.poll_devices();
+        redraw |= app.poll_network();
         redraw |= app.poll_file_launch();
         redraw |= app.poll_status_expiry();
         if app.needs_animation() && last_animation.elapsed() >= Duration::from_millis(180) {
@@ -72,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             terminal.draw(|frame| ui::draw(frame, &app))?;
             redraw = false;
         }
-        let input_poll = if app.browser_loading || app.device_refreshing {
+        let input_poll = if app.browser_loading || app.device_refreshing || app.network_refreshing {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(100)

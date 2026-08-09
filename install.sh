@@ -61,32 +61,87 @@ for tool in lsblk findmnt udisksctl cryptsetup; do
     fi
 done
 
-if [ -z "$missing" ]; then
-    exit 0
+has_tty() {
+    [ -r /dev/tty ] && (: </dev/tty) 2>/dev/null
+}
+
+if [ -n "$missing" ]; then
+    echo "Optional LUKS device-management tools are missing:$missing"
+    if has_tty; then
+        printf "Install the missing LUKS tools now? [y/N] " > /dev/tty
+        read answer < /dev/tty || answer=""
+        case "$answer" in
+            y|Y|yes|YES)
+                if command -v dnf >/dev/null 2>&1; then
+                    sudo dnf install -y util-linux udisks2 cryptsetup
+                elif command -v apt-get >/dev/null 2>&1; then
+                    sudo apt-get update
+                    sudo apt-get install -y util-linux udisks2 cryptsetup
+                elif command -v pacman >/dev/null 2>&1; then
+                    sudo pacman -S --needed util-linux udisks2 cryptsetup
+                else
+                    echo "No supported package manager found; install:$missing manually."
+                fi
+                ;;
+            *)
+                echo "Skipped optional LUKS tools. File management remains available."
+                ;;
+        esac
+    else
+        echo "Run your distribution's package manager to install them if needed."
+    fi
 fi
 
-echo "Optional LUKS device-management tools are missing:$missing"
-if [ ! -r /dev/tty ]; then
-    echo "Run your distribution's package manager to install them if needed."
-    exit 0
+add_samba_package() {
+    case " $samba_packages " in
+        *" $1 "*) ;;
+        *) samba_packages="$samba_packages $1" ;;
+    esac
+}
+
+samba_packages=""
+if command -v dnf >/dev/null 2>&1; then
+    command -v gio >/dev/null 2>&1 || add_samba_package glib2
+    rpm -q gvfs-smb >/dev/null 2>&1 || add_samba_package gvfs-smb
+    command -v secret-tool >/dev/null 2>&1 || add_samba_package libsecret
+elif command -v apt-get >/dev/null 2>&1; then
+    command -v gio >/dev/null 2>&1 || add_samba_package libglib2.0-bin
+    dpkg-query -W -f='${Status}' gvfs-backends 2>/dev/null | grep -q 'install ok installed' || add_samba_package gvfs-backends
+    command -v secret-tool >/dev/null 2>&1 || add_samba_package libsecret-tools
+elif command -v pacman >/dev/null 2>&1; then
+    command -v gio >/dev/null 2>&1 || add_samba_package glib2
+    pacman -Q gvfs-smb >/dev/null 2>&1 || add_samba_package gvfs-smb
+    command -v secret-tool >/dev/null 2>&1 || add_samba_package libsecret
+else
+    command -v gio >/dev/null 2>&1 || add_samba_package gio
+    command -v secret-tool >/dev/null 2>&1 || add_samba_package secret-tool
 fi
 
-printf "Install the missing LUKS tools now? [y/N] " > /dev/tty
-read answer < /dev/tty || answer=""
-case "$answer" in
-    y|Y|yes|YES)
-        if command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y util-linux udisks2 cryptsetup
-        elif command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y util-linux udisks2 cryptsetup
-        elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -S --needed util-linux udisks2 cryptsetup
-        else
-            echo "No supported package manager found; install:$missing manually."
-        fi
-        ;;
-    *)
-        echo "Skipped optional LUKS tools. File management remains available."
-        ;;
-esac
+if [ -n "$samba_packages" ]; then
+    for package in $samba_packages; do
+        echo "$package is missing."
+    done
+    if has_tty; then
+        printf "Install the required packages for Samba functionality? [y/N] " > /dev/tty
+        read answer < /dev/tty || answer=""
+        case "$answer" in
+            y|Y|yes|YES)
+                if command -v dnf >/dev/null 2>&1; then
+                    sudo dnf install -y $samba_packages
+                elif command -v apt-get >/dev/null 2>&1; then
+                    sudo apt-get update
+                    sudo apt-get install -y $samba_packages
+                elif command -v pacman >/dev/null 2>&1; then
+                    sudo pacman -S --needed $samba_packages
+                else
+                    echo "No supported package manager found; install:$samba_packages manually."
+                fi
+                ;;
+            *)
+                echo "Skipped Samba packages. Local file management remains available."
+                ;;
+        esac
+    else
+        echo "Run your distribution's package manager to install them if needed."
+    fi
+fi

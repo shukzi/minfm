@@ -23,6 +23,7 @@ functionality.
 - **Sorting:** Sort by name, extension, size, type, permissions, or modification time
 - **Trash:** Recoverable trash, second-precise timestamps, and permanent deletion from the trash
 - **Devices:** Integrated in-TUI disk manager with LUKS unlock, mount, unmount, lock, and safe eject
+- **Network:** Discover, add, open, remember, and safely disconnect Samba shares
 - **Updates:** Background startup checks with checksum-verified installation
 - **Configuration:** Invalid-configuration detection with safe-operation blocking
 
@@ -59,19 +60,19 @@ installs the binary to `~/.local/bin/minfm`, and creates `~/.config/minfm/` if
 needed. It does not modify the source directory or overwrite an existing
 `~/.config/minfm/config.toml` file.
 
-The basic file manager needs only a Linux terminal and the installed binary. The
-device manager uses:
+The basic file manager needs only a Linux terminal and the installed binary.
+Additional features use:
 
 ```text
-Command          Package       Required service
-lsblk            util-linux    —
-findmnt          util-linux    —
-udisksctl        udisks2       UDisks2
-cryptsetup       cryptsetup    authorization agent
+Function         Fedora                 Debian/Ubuntu          Arch
+Device manager   util-linux, udisks2,   util-linux, udisks2,   util-linux, udisks2,
+                 cryptsetup             cryptsetup             cryptsetup
+Samba shares     gvfs-smb, libsecret    gvfs-backends,         gvfs-smb, libsecret
+                                        libsecret-tools
 ```
 
-The installer checks all four commands and asks before offering to install
-missing packages using Fedora's, Debian/Ubuntu's, or Arch's package manager.
+The installer checks these tools and asks before offering to install missing
+packages using Fedora's, Debian/Ubuntu's, or Arch's package manager.
 The installer and in-app updater require `curl` and `sha256sum`, which are
 normally already available on Linux systems. Update checks run in the
 background. minfm asks before downloading and installing a newer release.
@@ -84,10 +85,10 @@ Remove the installed binary:
 rm -f ~/.local/bin/minfm
 ```
 
-To also remove minfm's configuration:
+To also remove minfm's configuration and remembered Samba credentials:
 
 ```sh
-rm -f ~/.config/minfm/config.toml
+secret-tool clear application minfm 2>/dev/null || true; rm -f ~/.config/minfm/config.toml ~/.config/minfm/network-shares.toml
 ```
 
 The trash is not removed by uninstalling minfm.
@@ -133,6 +134,14 @@ editor = "nvim"
 Select a text file and press `e` to use the configured editor. Terminal editors
 such as Nano and Vim use the current terminal, then return to the same position
 in minfm when closed.
+
+Press `N` to open Network Shares. Remembered passwords use the desktop's Secret
+Service; passwords are never written to minfm's configuration. Remembered share
+addresses and account names are stored in:
+
+```text
+~/.config/minfm/network-shares.toml
+```
 
 ## Build from source
 

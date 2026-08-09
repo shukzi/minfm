@@ -19,6 +19,10 @@ use crate::{
     entry::{self, EntryKind, FileEntry},
     launcher::{self, LaunchError},
     luks::{self, LuksAction, LuksDevice, LuksOutcome, SecretInput},
+    network::{
+        self, ConnectRequest, NetworkAction, NetworkAuth, NetworkEnvironment, NetworkOutcome,
+        NetworkSecret, NetworkShare, ShareAddress,
+    },
     operation::{self, OperationRequest, OperationSummary, OperationUpdate, RunningOperation},
     trash::{TrashEntry, TrashManager},
     updater,
@@ -89,6 +93,49 @@ pub enum Prompt {
     Mounted {
         path: PathBuf,
     },
+    SmbAddress {
+        input: String,
+        cursor: usize,
+        error: Option<String>,
+    },
+    SmbUsername {
+        address: ShareAddress,
+        input: String,
+        cursor: usize,
+        error: Option<String>,
+    },
+    SmbDomain {
+        address: ShareAddress,
+        username: String,
+        input: String,
+        cursor: usize,
+    },
+    SmbPassword {
+        address: ShareAddress,
+        username: String,
+        domain: String,
+        input: NetworkSecret,
+        error: Option<String>,
+    },
+    SmbRemember {
+        request: ConnectRequest,
+        available: bool,
+    },
+    ConfirmSmbDisconnect {
+        share: NetworkShare,
+    },
+    ConfirmSmbForget {
+        share: NetworkShare,
+    },
+    SmbMounted {
+        address: ShareAddress,
+        path: PathBuf,
+    },
+    SmbMessage {
+        title: String,
+        body: String,
+        return_to_network: bool,
+    },
     UpdateAvailable {
         current: String,
         latest: String,
@@ -150,6 +197,23 @@ struct RunningDeviceRefresh {
     selected_source: Option<PathBuf>,
 }
 
+struct RunningNetworkRefresh {
+    receiver: Receiver<NetworkRefreshUpdate>,
+    selected_uri: Option<String>,
+}
+
+enum NetworkRefreshUpdate {
+    Snapshot {
+        result: Result<Vec<NetworkShare>, String>,
+        finished: bool,
+        secret_storage: Option<bool>,
+    },
+}
+
+struct RunningNetworkOperation {
+    receiver: Receiver<Result<NetworkOutcome, String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrashView {
     pub manager: TrashManager,
@@ -164,6 +228,12 @@ pub struct DeviceView {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct NetworkView {
+    pub shares: Vec<NetworkShare>,
+    pub selected: usize,
+}
+
 pub enum AppMode {
     Browser,
     Prompt(Prompt),
@@ -173,6 +243,8 @@ pub enum AppMode {
     UpdateProgress,
     Trash(TrashView),
     Devices(DeviceView),
+    Network(NetworkView),
+    NetworkProgress,
     Help,
     Info,
     ConfigError { path: PathBuf, error: String },
@@ -268,6 +340,11 @@ pub struct App {
     last_device_refresh: Instant,
     device_refresh: Option<RunningDeviceRefresh>,
     pub device_refreshing: bool,
+    network_environment: NetworkEnvironment,
+    network_refresh: Option<RunningNetworkRefresh>,
+    network_operation: Option<RunningNetworkOperation>,
+    pub network_refreshing: bool,
+    network_secret_storage_available: bool,
     selector_memory: HashMap<PathBuf, PathBuf>,
     expanded_directories: HashSet<PathBuf>,
     loaded_dir: PathBuf,
@@ -300,6 +377,7 @@ impl App {
             ),
         };
         config.behavior.read_only |= force_read_only;
+        let network_environment = NetworkEnvironment::detect(&config_path);
         let (launch_sender, launch_receiver) = mpsc::sync_channel(16);
         let mut app = Self {
             running: true,
@@ -325,6 +403,11 @@ impl App {
             last_device_refresh: Instant::now(),
             device_refresh: None,
             device_refreshing: false,
+            network_environment,
+            network_refresh: None,
+            network_operation: None,
+            network_refreshing: false,
+            network_secret_storage_available: false,
             selector_memory: HashMap::new(),
             expanded_directories: HashSet::new(),
             loaded_dir: start.clone(),
@@ -408,6 +491,8 @@ impl App {
             AppMode::UpdateProgress => AppMode::UpdateProgress,
             AppMode::Trash(view) => self.handle_trash_key(view, key),
             AppMode::Devices(view) => self.handle_device_key(view, key),
+            AppMode::Network(view) => self.handle_network_key(view, key),
+            AppMode::NetworkProgress => AppMode::NetworkProgress,
             AppMode::Help => self.handle_readonly_popup(key, AppMode::Help),
             AppMode::Info => self.handle_readonly_popup(key, AppMode::Info),
             AppMode::ConfigError { path, error } => self.handle_config_error(path, error, key),
@@ -833,6 +918,140 @@ impl App {
         changed
     }
 
+    pub fn poll_network(&mut self) -> bool {
+        let refresh_update =
+            self.network_refresh
+                .as_ref()
+                .and_then(|refresh| match refresh.receiver.try_recv() {
+                    Ok(update) => Some(update),
+                    Err(TryRecvError::Disconnected) => Some(NetworkRefreshUpdate::Snapshot {
+                        result: Err("network refresh worker stopped unexpectedly".into()),
+                        finished: true,
+                        secret_storage: None,
+                    }),
+                    Err(TryRecvError::Empty) => None,
+                });
+        let mut changed = false;
+        if let Some(NetworkRefreshUpdate::Snapshot {
+            result,
+            finished,
+            secret_storage,
+        }) = refresh_update
+        {
+            if let Some(available) = secret_storage {
+                self.network_secret_storage_available = available;
+            }
+            let selected_uri = match &self.mode {
+                AppMode::Network(view) => view
+                    .shares
+                    .get(view.selected)
+                    .map(|share| share.address.uri.clone()),
+                _ => None,
+            }
+            .or_else(|| {
+                self.network_refresh
+                    .as_ref()
+                    .and_then(|refresh| refresh.selected_uri.clone())
+            });
+            if finished {
+                self.network_refresh = None;
+                self.network_refreshing = false;
+            }
+            changed = true;
+            if matches!(self.mode, AppMode::Network(_)) {
+                match result {
+                    Ok(shares) => {
+                        let selected = selected_uri
+                            .and_then(|uri| {
+                                shares.iter().position(|share| share.address.uri == uri)
+                            })
+                            .unwrap_or(0);
+                        self.mode = AppMode::Network(NetworkView { shares, selected });
+                    }
+                    Err(error) => {
+                        self.mode = AppMode::Prompt(Prompt::SmbMessage {
+                            title: "Network shares unavailable".into(),
+                            body: error,
+                            return_to_network: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        let operation_result =
+            self.network_operation.as_ref().and_then(|operation| {
+                match operation.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("network operation worker stopped unexpectedly".into()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                }
+            });
+        if let Some(result) = operation_result {
+            self.network_operation = None;
+            changed = true;
+            match result {
+                Ok(NetworkOutcome::Connected {
+                    address,
+                    mount_path: Some(path),
+                    remembered,
+                }) => {
+                    if remembered {
+                        self.set_notice("Share connected and remembered");
+                    }
+                    self.mode = AppMode::Prompt(Prompt::SmbMounted { address, path });
+                }
+                Ok(NetworkOutcome::Connected {
+                    address,
+                    mount_path: None,
+                    remembered,
+                }) => {
+                    let remembered = if remembered {
+                        " The credentials were remembered."
+                    } else {
+                        ""
+                    };
+                    self.mode = AppMode::Prompt(Prompt::SmbMessage {
+                        title: "Share connected".into(),
+                        body: format!(
+                            "{} connected, but its local GVFS path is not available yet.{}\n\nRefresh Network Shares to open it.",
+                            address.uri, remembered
+                        ),
+                        return_to_network: true,
+                    });
+                }
+                Ok(NetworkOutcome::Disconnected(message) | NetworkOutcome::Forgotten(message)) => {
+                    self.set_notice(message);
+                    self.mode = self.open_network();
+                }
+                Ok(NetworkOutcome::CredentialsRequired {
+                    address,
+                    username,
+                    domain,
+                    reason,
+                }) => {
+                    self.mode = AppMode::Prompt(Prompt::SmbPassword {
+                        address,
+                        username,
+                        domain,
+                        input: NetworkSecret::default(),
+                        error: Some(reason),
+                    });
+                }
+                Err(error) => {
+                    self.mode = AppMode::Prompt(Prompt::SmbMessage {
+                        title: "Network operation failed".into(),
+                        body: error,
+                        return_to_network: true,
+                    });
+                }
+            }
+        }
+        changed
+    }
+
     fn start_device_refresh(&mut self, selected_source: Option<PathBuf>) {
         if self.device_refresh.is_some() {
             return;
@@ -867,6 +1086,7 @@ impl App {
     pub fn needs_animation(&self) -> bool {
         self.browser_loading
             || matches!(self.mode, AppMode::UpdateProgress)
+            || matches!(self.mode, AppMode::NetworkProgress)
             || (matches!(self.mode, AppMode::Progress)
                 && self.progress.total_items == 0
                 && self.progress.total_bytes == 0)
@@ -1050,6 +1270,7 @@ impl App {
                     return self.open_devices();
                 }
             }
+            KeyCode::Char('N') => return self.open_network(),
             _ => {}
         }
         AppMode::Browser
@@ -1244,6 +1465,172 @@ impl App {
                 KeyCode::Esc => return AppMode::Browser,
                 _ => {}
             },
+            Prompt::SmbAddress {
+                input,
+                cursor,
+                error,
+            } => {
+                if edit_cursor_input(input, cursor, key) {
+                    return self.open_network();
+                }
+                if key.code == KeyCode::Enter {
+                    match ShareAddress::parse(input) {
+                        Ok(address) => {
+                            return AppMode::Prompt(Prompt::SmbUsername {
+                                address,
+                                input: String::new(),
+                                cursor: 0,
+                                error: None,
+                            })
+                        }
+                        Err(message) => *error = Some(message),
+                    }
+                } else if matches!(
+                    key.code,
+                    KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+                ) {
+                    error.take();
+                }
+            }
+            Prompt::SmbUsername {
+                address,
+                input,
+                cursor,
+                error,
+            } => {
+                if edit_cursor_input(input, cursor, key) {
+                    return self.open_network();
+                }
+                if key.code == KeyCode::Enter {
+                    let username = input.trim().to_owned();
+                    if username.is_empty() {
+                        self.start_network_action(NetworkAction::Connect(ConnectRequest {
+                            address: address.clone(),
+                            auth: NetworkAuth::Anonymous,
+                        }));
+                        return AppMode::NetworkProgress;
+                    }
+                    if username.chars().any(char::is_control) {
+                        *error = Some("The username contains invalid characters".into());
+                    } else {
+                        return AppMode::Prompt(Prompt::SmbDomain {
+                            address: address.clone(),
+                            username,
+                            input: String::new(),
+                            cursor: 0,
+                        });
+                    }
+                }
+            }
+            Prompt::SmbDomain {
+                address,
+                username,
+                input,
+                cursor,
+            } => {
+                if edit_cursor_input(input, cursor, key) {
+                    return self.open_network();
+                }
+                if key.code == KeyCode::Enter {
+                    return AppMode::Prompt(Prompt::SmbPassword {
+                        address: address.clone(),
+                        username: username.clone(),
+                        domain: input.trim().to_owned(),
+                        input: NetworkSecret::default(),
+                        error: None,
+                    });
+                }
+            }
+            Prompt::SmbPassword {
+                address,
+                username,
+                domain,
+                input,
+                error,
+            } => match key.code {
+                KeyCode::Esc => return self.open_network(),
+                KeyCode::Enter if !input.is_empty() => {
+                    let request = ConnectRequest {
+                        address: address.clone(),
+                        auth: NetworkAuth::Password {
+                            username: username.clone(),
+                            domain: domain.clone(),
+                            password: std::mem::take(input),
+                            remember: false,
+                        },
+                    };
+                    *error = None;
+                    if self.network_secret_storage_available {
+                        return AppMode::Prompt(Prompt::SmbRemember {
+                            request,
+                            available: true,
+                        });
+                    }
+                    self.set_notice("Secret storage unavailable · using this session only");
+                    self.start_network_action(NetworkAction::Connect(request));
+                    return AppMode::NetworkProgress;
+                }
+                KeyCode::Backspace => {
+                    error.take();
+                    input.pop();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    error.take();
+                    input.push(character);
+                }
+                _ => {}
+            },
+            Prompt::SmbRemember { request, .. } => match key.code {
+                KeyCode::Char('y') => {
+                    if let NetworkAuth::Password { remember, .. } = &mut request.auth {
+                        *remember = true;
+                    }
+                    self.start_network_action(NetworkAction::Connect(request.clone()));
+                    return AppMode::NetworkProgress;
+                }
+                KeyCode::Enter | KeyCode::Char('n') => {
+                    self.start_network_action(NetworkAction::Connect(request.clone()));
+                    return AppMode::NetworkProgress;
+                }
+                KeyCode::Esc => return self.open_network(),
+                _ => {}
+            },
+            Prompt::ConfirmSmbDisconnect { share } => match key.code {
+                KeyCode::Enter | KeyCode::Char('u') => {
+                    self.start_network_action(NetworkAction::Disconnect(share.clone()));
+                    return AppMode::NetworkProgress;
+                }
+                KeyCode::Esc => return self.open_network(),
+                _ => {}
+            },
+            Prompt::ConfirmSmbForget { share } => match key.code {
+                KeyCode::Enter | KeyCode::Char('d') => {
+                    self.start_network_action(NetworkAction::Forget(share.clone()));
+                    return AppMode::NetworkProgress;
+                }
+                KeyCode::Esc => return self.open_network(),
+                _ => {}
+            },
+            Prompt::SmbMounted { path, .. } => match key.code {
+                KeyCode::Enter => {
+                    let path = path.clone();
+                    self.go_to(path);
+                    return AppMode::Browser;
+                }
+                KeyCode::Esc => return self.open_network(),
+                _ => {}
+            },
+            Prompt::SmbMessage {
+                return_to_network, ..
+            } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    return if *return_to_network {
+                        self.open_network()
+                    } else {
+                        AppMode::Browser
+                    };
+                }
+            }
             Prompt::UpdateAvailable { latest, .. } => match key.code {
                 KeyCode::Enter => {
                     let latest = latest.clone();
@@ -1530,6 +1917,104 @@ impl App {
                 }
             }
             _ => AppMode::Devices(view),
+        }
+    }
+
+    fn handle_network_key(&mut self, mut view: NetworkView, key: KeyEvent) -> AppMode {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('N') => AppMode::Browser,
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !view.shares.is_empty() {
+                    view.selected = (view.selected + 1).min(view.shares.len() - 1);
+                }
+                AppMode::Network(view)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                view.selected = view.selected.saturating_sub(1);
+                AppMode::Network(view)
+            }
+            KeyCode::Char('r') => {
+                let selected_uri = view
+                    .shares
+                    .get(view.selected)
+                    .map(|share| share.address.uri.clone());
+                self.start_network_refresh(selected_uri);
+                AppMode::Network(view)
+            }
+            KeyCode::Char('a') => {
+                if self.config.behavior.read_only {
+                    self.set_notice("Read-only mode: network connections are disabled");
+                    return AppMode::Network(view);
+                }
+                AppMode::Prompt(Prompt::SmbAddress {
+                    input: "smb://".into(),
+                    cursor: 6,
+                    error: None,
+                })
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let Some(share) = view.shares.get(view.selected).cloned() else {
+                    return AppMode::Network(view);
+                };
+                if let Some(path) = share.mount_path.filter(|path| path.is_dir()) {
+                    self.go_to(path);
+                    return AppMode::Browser;
+                }
+                if self.config.behavior.read_only {
+                    self.set_notice("Read-only mode: network connections are disabled");
+                    return AppMode::Network(view);
+                }
+                if share.saved {
+                    let Some(username) = share.username.clone() else {
+                        return AppMode::Prompt(Prompt::SmbUsername {
+                            address: share.address,
+                            input: String::new(),
+                            cursor: 0,
+                            error: None,
+                        });
+                    };
+                    self.start_network_action(NetworkAction::Connect(ConnectRequest {
+                        address: share.address,
+                        auth: NetworkAuth::Saved {
+                            username,
+                            domain: share.domain.unwrap_or_default(),
+                        },
+                    }));
+                    AppMode::NetworkProgress
+                } else {
+                    AppMode::Prompt(Prompt::SmbUsername {
+                        address: share.address,
+                        input: String::new(),
+                        cursor: 0,
+                        error: None,
+                    })
+                }
+            }
+            KeyCode::Char('u') => {
+                if self.config.behavior.read_only {
+                    self.set_notice("Read-only mode: network disconnection is disabled");
+                    return AppMode::Network(view);
+                }
+                match view.shares.get(view.selected).cloned() {
+                    Some(share) if share.mount_path.is_some() => {
+                        AppMode::Prompt(Prompt::ConfirmSmbDisconnect { share })
+                    }
+                    _ => AppMode::Network(view),
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.config.behavior.read_only {
+                    self.set_notice("Read-only mode: remembered shares cannot be changed");
+                    return AppMode::Network(view);
+                }
+                match view.shares.get(view.selected).cloned() {
+                    Some(share) if share.saved => {
+                        AppMode::Prompt(Prompt::ConfirmSmbForget { share })
+                    }
+                    _ => AppMode::Network(view),
+                }
+            }
+            _ => AppMode::Network(view),
         }
     }
 
@@ -2294,6 +2779,83 @@ impl App {
         })
     }
 
+    fn open_network(&mut self) -> AppMode {
+        if !self.network_environment.samba_tools_available() {
+            return AppMode::Prompt(Prompt::SmbMessage {
+                title: "Network shares unavailable".into(),
+                body: "Samba support requires gio and the GVFS Samba backend.".into(),
+                return_to_network: false,
+            });
+        }
+        self.start_network_refresh(None);
+        AppMode::Network(NetworkView {
+            shares: Vec::new(),
+            selected: 0,
+        })
+    }
+
+    fn start_network_refresh(&mut self, selected_uri: Option<String>) {
+        if self.network_refresh.is_some() {
+            return;
+        }
+        let environment = self.network_environment.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || match network::discover_local(&environment) {
+            Ok(shares) => {
+                if sender
+                    .send(NetworkRefreshUpdate::Snapshot {
+                        result: Ok(shares),
+                        finished: false,
+                        secret_storage: None,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                let secret_storage = network::secret_service_available(&environment);
+                if sender
+                    .send(NetworkRefreshUpdate::Snapshot {
+                        result: network::discover_local(&environment),
+                        finished: false,
+                        secret_storage: Some(secret_storage),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = sender.send(NetworkRefreshUpdate::Snapshot {
+                    result: network::discover(&environment),
+                    finished: true,
+                    secret_storage: None,
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(NetworkRefreshUpdate::Snapshot {
+                    result: Err(error),
+                    finished: true,
+                    secret_storage: None,
+                });
+            }
+        });
+        self.network_refreshing = true;
+        self.network_refresh = Some(RunningNetworkRefresh {
+            receiver,
+            selected_uri,
+        });
+    }
+
+    fn start_network_action(&mut self, action: NetworkAction) {
+        if self.network_operation.is_some() {
+            return;
+        }
+        let environment = self.network_environment.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(network::perform(action, &environment));
+        });
+        self.network_operation = Some(RunningNetworkOperation { receiver });
+    }
+
     fn open_external(&mut self, editor: bool) -> AppMode {
         if self.config.behavior.read_only {
             self.status = "Read-only mode: external opening is disabled".into();
@@ -2536,6 +3098,7 @@ fn is_virtual_search_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_app(root: &Path) -> App {
         let config = Config::default();
@@ -2547,6 +3110,24 @@ mod tests {
             },
             false,
         )
+    }
+
+    fn test_network_environment(root: &Path) -> NetworkEnvironment {
+        let gio = root.join("gio");
+        std::fs::write(
+            &gio,
+            "#!/bin/sh\nif [ \"$1\" = list ]; then exit 0; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&gio).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&gio, permissions).unwrap();
+        NetworkEnvironment {
+            gio,
+            secret_tool: None,
+            runtime_dir: root.join("runtime"),
+            shares_file: root.join("network-shares.toml"),
+        }
     }
 
     #[test]
@@ -3526,5 +4107,80 @@ mod tests {
         let mut app = test_app(temp.path());
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
         assert!(matches!(app.mode, AppMode::Browser));
+    }
+
+    #[test]
+    fn uppercase_n_opens_the_separate_network_share_manager() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        app.network_environment = test_network_environment(temp.path());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE));
+
+        assert!(matches!(app.mode, AppMode::Network(_)));
+        assert!(app.network_refreshing);
+        for _ in 0..100 {
+            app.poll_network();
+            if !app.network_refreshing {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(app.mode, AppMode::Network(_)));
+        assert!(!app.network_refreshing);
+    }
+
+    #[test]
+    fn network_share_prompt_owns_input_and_supports_cursor_editing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        app.network_environment = test_network_environment(temp.path());
+        app.mode = AppMode::Network(NetworkView {
+            shares: Vec::new(),
+            selected: 0,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        for character in "nas/share".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::SmbUsername { ref address, .. })
+                if address.uri == "smb://nas/share"
+        ));
+        assert!(app.operation.is_none());
+    }
+
+    #[test]
+    fn read_only_network_manager_can_open_connected_share_but_not_change_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("mounted");
+        std::fs::create_dir(&mount).unwrap();
+        let mut app = test_app(temp.path());
+        app.config.behavior.read_only = true;
+        let share = NetworkShare {
+            address: ShareAddress::parse("smb://nas/public").unwrap(),
+            mount_path: Some(mount.clone()),
+            username: None,
+            domain: None,
+            saved: false,
+            discovered: true,
+        };
+        app.mode = AppMode::Network(NetworkView {
+            shares: vec![share],
+            selected: 0,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Network(_)));
+        assert!(app.network_operation.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Browser));
+        assert_eq!(app.current_dir, mount);
     }
 }

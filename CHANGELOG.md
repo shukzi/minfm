@@ -1,5 +1,37 @@
 # minfm changelog
 
+## Unreleased
+
+### Added
+
+- Network shares: open the dedicated Samba manager with `N`, discover available
+  and already-mounted shares, add a share address manually, open connected
+  shares, and safely disconnect them.
+- Samba credentials: connect anonymously or with an account, use remembered
+  credentials when available, and fall back to a session-only connection when
+  Secret Service support is unavailable.
+- Remembered shares: forget a saved share and its associated Secret Service
+  credential from the network manager.
+
+### Changed
+
+- Responsiveness: show mounted and remembered shares immediately while remote
+  Samba discovery continues in a background worker.
+- UI: show `N Shares` in the browser footer and document all network-manager
+  actions in the Help popup and contextual manager footer.
+- Installer: detect distribution-specific Samba and Secret Service packages on
+  Fedora, Debian/Ubuntu, and Arch, then ask before installing anything.
+
+### Security
+
+- Credentials: keep passwords out of command arguments, URIs, logs, and TOML;
+  send them through private process input, redact debug output, and wipe owned
+  password buffers when dropped.
+- Process handling: bound network command output, enforce operation timeouts,
+  and terminate stalled command process groups without blocking the TUI.
+- Saved-share metadata: write only the non-secret address and account fields
+  atomically with mode `0600`.
+
 ## v0.2.0
 
 ### Added

@@ -8,8 +8,8 @@ use ratatui::{
 
 use crate::{
     app::{
-        format_elapsed, App, AppMode, BrowserView, ClipboardMode, DeviceView, Prompt, SearchScope,
-        SearchView, TrashView,
+        format_elapsed, App, AppMode, BrowserView, ClipboardMode, DeviceView, NetworkView, Prompt,
+        SearchScope, SearchView, TrashView,
     },
     entry::{human_size, EntryKind},
 };
@@ -42,6 +42,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::UpdateProgress => draw_update_progress(frame),
         AppMode::Trash(view) => draw_trash(frame, view),
         AppMode::Devices(view) => draw_devices(frame, app, view),
+        AppMode::Network(view) => draw_network(frame, app, view),
+        AppMode::NetworkProgress => draw_network_progress(frame),
         AppMode::Help => draw_help(frame),
         AppMode::Info => draw_info(frame, app),
         AppMode::ConfigError { path, error } => draw_config_error(frame, path, error),
@@ -368,7 +370,7 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
             " NAVIGATION\n ↑↓/jk Move · ←h Parent\n {open_controls}{edit} · {view} · ? Help"
         ),
         " FILE OPERATIONS\n Space Mark · x Cut · c Copy · p Paste\n r Rename · n File · a Dir".into(),
-        " VIEW & DEVICES\n d/D Trash · T Bin · . Hidden · s Sort\n m Devices · g Path · / Search · F Search FS".into(),
+        " VIEW & DEVICES\n d/D Trash · T Bin · . Hidden · s Sort\n m Devices · N Shares · g Path · / Search · F Search FS".into(),
     ];
 
     for (index, group) in groups.into_iter().enumerate() {
@@ -563,6 +565,120 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
             78,
             12,
         ),
+        Prompt::SmbAddress {
+            input,
+            cursor,
+            error,
+        } => cursor_input_modal_with_error(
+            frame,
+            "Add Samba share",
+            "Share address (smb://server/share):",
+            input,
+            *cursor,
+            error.as_deref(),
+            "continue",
+        ),
+        Prompt::SmbUsername {
+            address,
+            input,
+            cursor,
+            error,
+        } => cursor_input_modal_with_error(
+            frame,
+            "Samba account",
+            &format!(
+                "{}\nUsername (leave empty for anonymous):",
+                address.uri
+            ),
+            input,
+            *cursor,
+            error.as_deref(),
+            "continue",
+        ),
+        Prompt::SmbDomain {
+            address,
+            input,
+            cursor,
+            ..
+        } => cursor_input_modal_with_error(
+            frame,
+            "Samba domain",
+            &format!("{}\nDomain or workgroup (optional):", address.uri),
+            input,
+            *cursor,
+            None,
+            "continue",
+        ),
+        Prompt::SmbPassword {
+            address,
+            username,
+            domain,
+            input,
+            error,
+        } => {
+            let account = if domain.is_empty() {
+                username.clone()
+            } else {
+                format!("{domain}\\{username}")
+            };
+            let body = error
+                .as_deref()
+                .map(|error| format!("{error}\nEnter the password again."))
+                .unwrap_or_else(|| format!("Share: {}\nAccount: {account}", address.uri));
+            secret_input_modal(
+                frame,
+                "Samba password",
+                &body,
+                input.character_count(),
+                "Enter continue · Esc cancel",
+            );
+        }
+        Prompt::SmbRemember { available, .. } => message_modal(
+            frame,
+            "Remember this share?",
+            if *available {
+                "Save the password in your desktop's secure credential service?\n\nThe share address and account name will be saved in minfm's configuration directory."
+            } else {
+                "Secure credential storage is unavailable.\n\nThe connection will only last for this login session."
+            },
+            if *available {
+                "y remember · n/Enter this session only · Esc cancel"
+            } else {
+                "Enter this session only · Esc cancel"
+            },
+            76,
+            14,
+        ),
+        Prompt::ConfirmSmbDisconnect { share } => message_modal(
+            frame,
+            "Disconnect network share",
+            &format!("Disconnect {}?\n\nOpen files on this share may prevent disconnection.", share.address.uri),
+            "u/Enter disconnect · Esc cancel",
+            76,
+            13,
+        ),
+        Prompt::ConfirmSmbForget { share } => message_modal(
+            frame,
+            "Forget network share",
+            &format!(
+                "Forget {} and remove its saved password?\n\nAn active connection will remain connected.",
+                share.address.uri
+            ),
+            "d/Enter forget · Esc cancel",
+            76,
+            13,
+        ),
+        Prompt::SmbMounted { address, path } => message_modal(
+            frame,
+            "Network share connected",
+            &format!("{}\n\n{}", address.uri, path.display()),
+            "[Enter] Open share   [Esc] Stay in current directory",
+            78,
+            13,
+        ),
+        Prompt::SmbMessage { title, body, .. } => {
+            message_modal(frame, title, body, "Enter/Esc close", 76, 14)
+        }
         Prompt::UpdateAvailable { current, latest } => message_modal(
             frame,
             "Update available",
@@ -984,10 +1100,113 @@ fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
     );
 }
 
+fn draw_network(frame: &mut Frame, app: &App, view: &NetworkView) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(4)])
+        .split(area);
+    let visible_count = usize::from(sections[0].height.saturating_sub(3)).max(1);
+    let start = viewport_start(view.selected, view.shares.len(), visible_count);
+    let end = (start + visible_count).min(view.shares.len());
+    let rows = view.shares[start..end].iter().map(|share| {
+        Row::new(vec![
+            Cell::from(share.address.share.clone()),
+            Cell::from(share.address.server.clone()),
+            Cell::from(share.state()),
+            Cell::from(share.account()),
+            Cell::from(
+                share
+                    .mount_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "—".into()),
+            ),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(22),
+            Constraint::Percentage(20),
+            Constraint::Length(12),
+            Constraint::Percentage(20),
+            Constraint::Min(18),
+        ],
+    )
+    .header(
+        Row::new(["Share", "Server", "State", "Account", "Local path"])
+            .style(Style::default().fg(MUTED)),
+    )
+    .row_highlight_style(Style::default().bg(Color::DarkGray))
+    .highlight_symbol("> ")
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Network shares · {} found{} ",
+        view.shares.len(),
+        if app.network_refreshing {
+            " · refreshing…"
+        } else {
+            ""
+        }
+    )));
+    let selected = (!view.shares.is_empty()).then_some(view.selected.saturating_sub(start));
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    let selected_share = view.shares.get(view.selected);
+    let contextual = selected_share
+        .map(|share| {
+            let mut actions = if share.mount_path.is_some() {
+                "Enter open · u disconnect".to_string()
+            } else {
+                "Enter connect".to_string()
+            };
+            if share.saved {
+                actions.push_str(" · d forget");
+            }
+            actions
+        })
+        .unwrap_or_else(|| "No shares found · use a to add one".into());
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{contextual}\na add share · r refresh · N/Esc return"
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT))
+        .block(Block::default().borders(Borders::ALL)),
+        sections[1],
+    );
+}
+
+fn draw_network_progress(frame: &mut Frame) {
+    let area = centered(frame.area(), 70, 10);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Network share ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let phase = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 180) as usize % 4)
+        .unwrap_or(0);
+    let mut squares = ["□", "□", "□", "□"];
+    squares[phase] = "■";
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}\n\nWorking with the network share…\n\nPlease wait",
+            squares.join(" ")
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT)),
+        inner,
+    );
+}
+
 fn draw_help(frame: &mut Frame) {
-    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter          toggle directory or open file\n  →/l            expand/child in tree; open in table\n  ←/h            collapse/parent in tree; parent in table\n  v              toggle tree/table view\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
+    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter          toggle directory or open file\n  →/l            expand/child in tree; open in table\n  ←/h            collapse/parent in tree; parent in table\n  v              toggle tree/table view\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nDevices\n  m              device manager\n  e              safely eject selected removable device\n\nNetwork shares\n  N              network shares\n  a              add share\n  Enter          open or connect\n  u              disconnect\n  d              forget saved share\n  r              refresh\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
     let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
-    message_modal(frame, &title, body, "Esc/Enter close", 70, 44);
+    message_modal(frame, &title, body, "Esc/Enter close", 70, 94);
 }
 
 fn draw_info(frame: &mut Frame, app: &App) {
@@ -995,7 +1214,7 @@ fn draw_info(frame: &mut Frame, app: &App) {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
     let body = format!(
-        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}",
+        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}\n  gio: {}\n  secret-tool: {}",
         env!("CARGO_PKG_VERSION"),
         binary,
         app.config_path.display(),
@@ -1007,6 +1226,8 @@ fn draw_info(frame: &mut Frame, app: &App) {
         availability("lsblk"),
         availability("udisksctl"),
         availability("cryptsetup"),
+        availability("gio"),
+        availability("secret-tool"),
     );
     message_modal(
         frame,
@@ -1014,7 +1235,7 @@ fn draw_info(frame: &mut Frame, app: &App) {
         &body,
         "Esc/Enter close",
         78,
-        30,
+        32,
     );
 }
 
@@ -1123,6 +1344,111 @@ fn cursor_input_modal(
     );
 }
 
+fn cursor_input_modal_with_error(
+    frame: &mut Frame,
+    title: &str,
+    prompt: &str,
+    input: &str,
+    cursor: usize,
+    error: Option<&str>,
+    action: &str,
+) {
+    let area = centered(frame.area(), 78, 12);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }), rows[0]);
+
+    let characters = input.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(characters.len());
+    let visible_width = rows[1].width.saturating_sub(6) as usize;
+    let start = cursor.saturating_sub(visible_width);
+    let end = (start + visible_width).min(characters.len());
+    let visible = characters[start..end].iter().collect::<String>();
+    frame.render_widget(
+        Paragraph::new(format!("> {visible}"))
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+    let cursor_x = rows[1].x + 3 + cursor.saturating_sub(start).min(visible_width) as u16;
+    frame.set_cursor_position((cursor_x, rows[1].y + 1));
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(error)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Red)),
+            rows[2],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(format!(
+            "←/→ move · Home/End jump · Enter {action} · Esc cancel"
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(MUTED)),
+        rows[3],
+    );
+}
+
+fn secret_input_modal(
+    frame: &mut Frame,
+    title: &str,
+    body: &str,
+    character_count: usize,
+    footer: &str,
+) {
+    let area = centered(frame.area(), 78, 14);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[0]);
+    frame.render_widget(
+        Paragraph::new(format!("> {}", "•".repeat(character_count)))
+            .block(Block::default().borders(Borders::ALL).title(" Password "))
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "The password is only used for this connection unless you choose to remember it.",
+        )
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(MUTED)),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[3],
+    );
+}
+
 fn message_modal(
     frame: &mut Frame,
     title: &str,
@@ -1179,6 +1505,7 @@ fn viewport_start(selected: usize, item_count: usize, visible_count: usize) -> u
 mod performance_tests {
     use super::*;
     use crate::config::{Config, ConfigLoad};
+    use crate::network::{NetworkSecret, ShareAddress};
     use ratatui::{backend::TestBackend, Terminal};
     use std::{path::PathBuf, time::Instant};
 
@@ -1189,6 +1516,68 @@ mod performance_tests {
         assert_eq!(viewport_start(10, 100, 10), 1);
         assert_eq!(viewport_start(99, 100, 10), 90);
         assert_eq!(viewport_start(0, 5, 10), 0);
+    }
+
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn footer_and_help_expose_the_network_share_hotkey() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let backend = TestBackend::new(150, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(rendered_text(&terminal).contains("N Shares"));
+
+        app.mode = AppMode::Help;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(rendered_text(&terminal).contains("N              network shares"));
+    }
+
+    #[test]
+    fn samba_password_modal_never_renders_the_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let mut secret = NetworkSecret::default();
+        for character in "never-render-this".chars() {
+            secret.push(character);
+        }
+        app.mode = AppMode::Prompt(Prompt::SmbPassword {
+            address: ShareAddress::parse("smb://nas/private").unwrap(),
+            username: "alice".into(),
+            domain: String::new(),
+            input: secret,
+            error: None,
+        });
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(!text.contains("never-render-this"));
+        assert!(text.contains("•••••••••••••••••"));
     }
 
     #[test]
