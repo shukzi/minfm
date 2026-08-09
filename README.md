@@ -12,8 +12,6 @@ functionality.
 
 ![minfm preview](assets/preview.png)
 
-[Watch the minfm demo](https://github.com/shukzi/minfm/raw/refs/heads/main/assets/minfm.mp4)
-
 ## Features
 
 - **Navigation:** File and directory navigation with arrow-key and Vim-style controls
