@@ -24,7 +24,7 @@ functionality.
 - **Trash:** Recoverable trash, second-precise timestamps, and permanent deletion from the trash
 - **Devices:** Integrated in-TUI disk manager with LUKS unlock, mount, unmount, lock, and safe eject
 - **Network:** Discover, add, open, remember, and safely disconnect Samba shares
-- **Apps:** Open built-in tools with `M`, including the device and partition managers
+- **Apps:** Open built-in tools with `M`, including device, partition, and network-share managers
 - **Partitions:** Inspect block topology, format common filesystems, create GPT or
   MBR partition tables, and create partitions in available space
 - **Updates:** Background startup checks with checksum-verified installation
@@ -81,7 +81,9 @@ Filesystems      e2fsprogs, xfsprogs,   e2fsprogs, xfsprogs,   e2fsprogs, xfspro
 ```
 
 The installer checks these tools and asks before offering to install missing
-packages using Fedora's, Debian/Ubuntu's, or Arch's package manager.
+packages using Fedora's, Debian/Ubuntu's, or Arch's package manager. Declining
+does not remove basic file management; unavailable app operations report their
+missing helper instead.
 
 The partition manager always supports inspection through `lsblk`. Write actions
 use trusted root-owned system tools. When minfm is not already running as root,
@@ -178,7 +180,7 @@ For a reproducible installation, pin the installer and release assets to the
 same published version:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.2.0/install.sh | MINFM_VERSION=v0.2.0 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.3.0/install.sh | MINFM_VERSION=v0.3.0 sh
 minfm
 ```
 
@@ -194,6 +196,23 @@ A missing configuration uses safe built-in defaults.
 
 An invalid configuration opens a blocking error screen. File operations remain
 disabled until the configuration is corrected and reloaded.
+
+Every letter, symbol, and function-key shortcut can be changed under
+`[hotkeys]`. The defaults remain the shortcuts shown throughout the TUI. minfm
+accepts a single character, named keys such as `Space` or `F2`, and optional
+`Ctrl+` or `Alt+` modifiers. Arrow keys, Enter, and Escape remain universal so
+dialogs always retain a predictable safe way to navigate, apply, or cancel.
+Bindings that conflict in the same screen are rejected with a configuration
+error instead of producing ambiguous behavior.
+
+For example:
+
+```toml
+[hotkeys]
+apps = "F2"
+network_shares = "Alt+n"
+force_quit = "Ctrl+c"
+```
 
 An example configuration is included in:
 

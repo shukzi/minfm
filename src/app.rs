@@ -271,15 +271,21 @@ pub struct NetworkView {
 pub enum BuiltinApp {
     DeviceManager,
     PartitionManager,
+    NetworkShares,
 }
 
 impl BuiltinApp {
-    pub const ALL: [Self; 2] = [Self::DeviceManager, Self::PartitionManager];
+    pub const ALL: [Self; 3] = [
+        Self::DeviceManager,
+        Self::PartitionManager,
+        Self::NetworkShares,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::DeviceManager => "Device manager",
             Self::PartitionManager => "Partition manager",
+            Self::NetworkShares => "Network shares",
         }
     }
 
@@ -289,6 +295,7 @@ impl BuiltinApp {
             Self::PartitionManager => {
                 "Inspect and safely manage disks, partitions, and filesystems"
             }
+            Self::NetworkShares => "Discover, connect, and manage Samba shares",
         }
     }
 }
@@ -678,10 +685,9 @@ impl App {
         }
         if key.kind == KeyEventKind::Repeat
             && matches!(self.mode, AppMode::Browser)
-            && !matches!(
-                key.code,
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
-            )
+            && !matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && !self.config.hotkeys.up.matches(key)
+            && !self.config.hotkeys.down.matches(key)
         {
             return;
         }
@@ -1558,148 +1564,149 @@ impl App {
     }
 
     fn handle_browser_key(&mut self, key: KeyEvent) -> AppMode {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let hotkeys = self.config.hotkeys.clone();
+        if hotkeys.force_quit.matches(key) {
             self.running = false;
             return AppMode::Browser;
         }
-        match key.code {
-            KeyCode::Esc if self.search_filter.is_some() => {
-                self.search_filter = None;
-                self.refresh();
-                self.set_notice("Search cleared");
-            }
-            KeyCode::Char('q') => self.running = false,
-            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Enter => {
-                return match self.browser_view {
-                    BrowserView::Tree => self.activate_tree_entry(),
-                    BrowserView::Table => self.open_selected_table(),
-                }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                return match self.browser_view {
-                    BrowserView::Tree => self.tree_right(),
-                    BrowserView::Table => self.open_selected_table(),
-                }
-            }
-            KeyCode::Left | KeyCode::Char('h') => match self.browser_view {
+        if key.code == KeyCode::Esc && self.search_filter.is_some() {
+            self.search_filter = None;
+            self.refresh();
+            self.set_notice("Search cleared");
+        } else if hotkeys.quit.matches(key) {
+            self.running = false;
+        } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+            self.move_cursor(1);
+        } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+            self.move_cursor(-1);
+        } else if key.code == KeyCode::Enter {
+            return match self.browser_view {
+                BrowserView::Tree => self.activate_tree_entry(),
+                BrowserView::Table => self.open_selected_table(),
+            };
+        } else if key.code == KeyCode::Right || hotkeys.expand.matches(key) {
+            return match self.browser_view {
+                BrowserView::Tree => self.tree_right(),
+                BrowserView::Table => self.open_selected_table(),
+            };
+        } else if key.code == KeyCode::Left || hotkeys.collapse.matches(key) {
+            match self.browser_view {
                 BrowserView::Tree => self.tree_left(),
                 BrowserView::Table => self.go_parent(),
-            },
-            KeyCode::Char('v') => self.toggle_browser_view(),
-            KeyCode::Char(' ') => self.toggle_selection(),
-            KeyCode::Char('.') => {
-                self.config.ui.show_hidden = !self.config.ui.show_hidden;
-                self.refresh();
             }
-            KeyCode::Char('s') => {
-                self.cycle_sort();
-                self.refresh();
+        } else if hotkeys.toggle_view.matches(key) {
+            self.toggle_browser_view();
+        } else if hotkeys.select.matches(key) {
+            self.toggle_selection();
+        } else if hotkeys.hidden.matches(key) {
+            self.config.ui.show_hidden = !self.config.ui.show_hidden;
+            self.refresh();
+        } else if hotkeys.sort.matches(key) {
+            self.cycle_sort();
+            self.refresh();
+        } else if hotkeys.reverse_sort.matches(key) {
+            self.config.ui.reverse_sort = !self.config.ui.reverse_sort;
+            self.refresh();
+        } else if hotkeys.go_to.matches(key) {
+            return AppMode::Prompt(Prompt::GoTo {
+                input: String::new(),
+            });
+        } else if hotkeys.search.matches(key) {
+            return AppMode::Prompt(Prompt::Search {
+                input: String::new(),
+                scope: SearchScope::CurrentDirectory,
+            });
+        } else if hotkeys.search_filesystem.matches(key) {
+            return AppMode::Prompt(Prompt::Search {
+                input: String::new(),
+                scope: SearchScope::Filesystem,
+            });
+        } else if hotkeys.rename.matches(key) {
+            if let Some(entry) = self.selected_entry() {
+                let input = entry.name.clone();
+                return AppMode::Prompt(Prompt::Rename {
+                    source: entry.path.clone(),
+                    cursor: input.chars().count(),
+                    input,
+                });
             }
-            KeyCode::Char('S') => {
-                self.config.ui.reverse_sort = !self.config.ui.reverse_sort;
-                self.refresh();
+        } else if hotkeys.create_directory.matches(key) {
+            return AppMode::Prompt(Prompt::CreateDirectory {
+                input: String::new(),
+            });
+        } else if hotkeys.create_file.matches(key) {
+            return AppMode::Prompt(Prompt::CreateFile {
+                input: String::new(),
+                cursor: 0,
+            });
+        } else if hotkeys.copy.matches(key) {
+            self.set_clipboard(ClipboardMode::Copy);
+        } else if hotkeys.cut.matches(key) {
+            self.set_clipboard(ClipboardMode::Cut);
+        } else if hotkeys.paste.matches(key) {
+            return self.prepare_paste();
+        } else if hotkeys.trash.matches(key) {
+            if let Some(paths) = self.mutation_targets() {
+                return AppMode::Prompt(Prompt::ConfirmTrash { paths });
             }
-            KeyCode::Char('g') => {
-                return AppMode::Prompt(Prompt::GoTo {
-                    input: String::new(),
-                })
+        } else if hotkeys.quick_trash.matches(key) {
+            if let Some(paths) = self.mutation_targets() {
+                self.start_trash(paths);
+                return AppMode::Progress;
             }
-            KeyCode::Char('/') => {
-                return AppMode::Prompt(Prompt::Search {
-                    input: String::new(),
-                    scope: SearchScope::CurrentDirectory,
-                })
+        } else if hotkeys.trash_bin.matches(key) {
+            return self.open_trash();
+        } else if hotkeys.apps.matches(key) {
+            return AppMode::Apps(AppsView { selected: 0 });
+        } else if hotkeys.info.matches(key) {
+            return AppMode::Info;
+        } else if hotkeys.help.matches(key) {
+            return AppMode::Help;
+        } else if hotkeys.open.matches(key) || hotkeys.edit.matches(key) {
+            return self.open_external(hotkeys.edit.matches(key));
+        } else if hotkeys.devices.matches(key) {
+            if self.config.behavior.read_only {
+                self.status = "Read-only mode: disk operations are disabled".into();
+            } else {
+                return self.open_devices();
             }
-            KeyCode::Char('F') => {
-                return AppMode::Prompt(Prompt::Search {
-                    input: String::new(),
-                    scope: SearchScope::Filesystem,
-                })
-            }
-            KeyCode::Char('r') => {
-                if let Some(entry) = self.selected_entry() {
-                    let input = entry.name.clone();
-                    return AppMode::Prompt(Prompt::Rename {
-                        source: entry.path.clone(),
-                        cursor: input.chars().count(),
-                        input,
-                    });
-                }
-            }
-            KeyCode::Char('a') => {
-                return AppMode::Prompt(Prompt::CreateDirectory {
-                    input: String::new(),
-                })
-            }
-            KeyCode::Char('n') => {
-                return AppMode::Prompt(Prompt::CreateFile {
-                    input: String::new(),
-                    cursor: 0,
-                })
-            }
-            KeyCode::Char('c') => self.set_clipboard(ClipboardMode::Copy),
-            KeyCode::Char('x') => self.set_clipboard(ClipboardMode::Cut),
-            KeyCode::Char('p') => return self.prepare_paste(),
-            KeyCode::Char('d') => {
-                if let Some(paths) = self.mutation_targets() {
-                    return AppMode::Prompt(Prompt::ConfirmTrash { paths });
-                }
-            }
-            KeyCode::Char('D') => {
-                if let Some(paths) = self.mutation_targets() {
-                    self.start_trash(paths);
-                    return AppMode::Progress;
-                }
-            }
-            KeyCode::Char('T') => return self.open_trash(),
-            KeyCode::Char('M') => return AppMode::Apps(AppsView { selected: 0 }),
-            KeyCode::Char('I') => return AppMode::Info,
-            KeyCode::Char('?') => return AppMode::Help,
-            KeyCode::Char('o') | KeyCode::Char('e') => {
-                return self.open_external(key.code == KeyCode::Char('e'))
-            }
-            KeyCode::Char('m') => {
-                if self.config.behavior.read_only {
-                    self.status = "Read-only mode: disk operations are disabled".into();
-                } else {
-                    return self.open_devices();
-                }
-            }
-            KeyCode::Char('N') => return self.open_network(),
-            _ => {}
+        } else if hotkeys.network_shares.matches(key) {
+            return self.open_network();
         }
         AppMode::Browser
     }
 
     fn handle_apps_key(&mut self, mut view: AppsView, key: KeyEvent) -> AppMode {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => AppMode::Browser,
-            KeyCode::Down | KeyCode::Char('j') => {
-                view.selected = (view.selected + 1).min(BuiltinApp::ALL.len() - 1);
-                AppMode::Apps(view)
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                view.selected = view.selected.saturating_sub(1);
-                AppMode::Apps(view)
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                match BuiltinApp::ALL.get(view.selected).copied() {
-                    Some(BuiltinApp::DeviceManager) if self.config.behavior.read_only => {
-                        self.set_notice("Read-only mode: device operations are disabled");
-                        AppMode::Apps(view)
-                    }
-                    Some(BuiltinApp::DeviceManager) => self.open_devices(),
-                    Some(BuiltinApp::PartitionManager) => self.open_partitions(),
-                    None => AppMode::Apps(view),
+        let hotkeys = self.config.hotkeys.clone();
+        if key.code == KeyCode::Esc || hotkeys.quit.matches(key) || hotkeys.apps.matches(key) {
+            AppMode::Browser
+        } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+            view.selected = (view.selected + 1).min(BuiltinApp::ALL.len() - 1);
+            AppMode::Apps(view)
+        } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+            view.selected = view.selected.saturating_sub(1);
+            AppMode::Apps(view)
+        } else if key.code == KeyCode::Enter
+            || key.code == KeyCode::Right
+            || hotkeys.expand.matches(key)
+        {
+            match BuiltinApp::ALL.get(view.selected).copied() {
+                Some(BuiltinApp::DeviceManager) if self.config.behavior.read_only => {
+                    self.set_notice("Read-only mode: device operations are disabled");
+                    AppMode::Apps(view)
                 }
+                Some(BuiltinApp::DeviceManager) => self.open_devices(),
+                Some(BuiltinApp::PartitionManager) => self.open_partitions(),
+                Some(BuiltinApp::NetworkShares) => self.open_network(),
+                None => AppMode::Apps(view),
             }
-            _ => AppMode::Apps(view),
+        } else {
+            AppMode::Apps(view)
         }
     }
 
     fn handle_prompt_key(&mut self, mut prompt: Prompt, key: KeyEvent) -> AppMode {
+        let hotkeys = self.config.hotkeys.clone();
         match &mut prompt {
             Prompt::GoTo { input } => {
                 if edit_input(input, key) {
@@ -1766,19 +1773,28 @@ impl App {
                 }
             }
             Prompt::ConfirmTrash { paths } => match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
+                KeyCode::Enter => {
                     self.start_trash(paths.clone());
                     return AppMode::Progress;
                 }
-                KeyCode::Esc | KeyCode::Char('n') => return AppMode::Browser,
+                _ if hotkeys.confirm_yes.matches(key) => {
+                    self.start_trash(paths.clone());
+                    return AppMode::Progress;
+                }
+                KeyCode::Esc => return AppMode::Browser,
+                _ if hotkeys.confirm_no.matches(key) => return AppMode::Browser,
                 _ => {}
             },
             Prompt::ConfirmOverwrite { sources, cut } => match key.code {
-                KeyCode::Char('o') | KeyCode::Enter => {
+                KeyCode::Enter => {
                     self.start_copy(sources.clone(), *cut, true);
                     return AppMode::Progress;
                 }
-                KeyCode::Char('s') => {
+                _ if hotkeys.overwrite.matches(key) => {
+                    self.start_copy(sources.clone(), *cut, true);
+                    return AppMode::Progress;
+                }
+                _ if hotkeys.skip.matches(key) => {
                     let filtered = sources
                         .iter()
                         .filter(|source| {
@@ -1796,43 +1812,26 @@ impl App {
                     self.start_copy(filtered, *cut, false);
                     return AppMode::Progress;
                 }
-                KeyCode::Esc | KeyCode::Char('a') => return AppMode::Browser,
+                KeyCode::Esc => return AppMode::Browser,
+                _ if hotkeys.abort.matches(key) => return AppMode::Browser,
                 _ => {}
             },
-            Prompt::ConfirmRestore { entries, manager } => match key.code {
-                KeyCode::Enter | KeyCode::Char('r') => {
-                    let mut restored = 0;
-                    let mut failures = Vec::new();
-                    for entry in entries.iter() {
-                        match manager.restore(entry, None) {
-                            Ok(_) => restored += 1,
-                            Err(error) => {
-                                failures.push((entry.trashed_path.clone(), error.to_string()))
-                            }
-                        }
-                    }
-                    if failures.is_empty() {
-                        self.set_notice(format!("Restored {restored} item(s)"));
-                        self.refresh();
-                        return self.open_trash_manager(manager.clone());
-                    }
-                    return AppMode::Prompt(Prompt::Summary {
-                        summary: OperationSummary {
-                            label: "Restoring".into(),
-                            completed: restored,
-                            failed: failures,
-                            ..OperationSummary::default()
-                        },
-                        return_to_trash: Some(manager.clone()),
-                    });
+            Prompt::ConfirmRestore { entries, manager } => {
+                if key.code == KeyCode::Enter || hotkeys.restore.matches(key) {
+                    return self.restore_trash_entries(entries, manager);
                 }
-                KeyCode::Esc => return self.open_trash(),
-                _ => {}
-            },
+                if key.code == KeyCode::Esc {
+                    return self.open_trash();
+                }
+            }
             Prompt::ConfirmPermanentDelete {
                 entries, manager, ..
             } => match key.code {
-                KeyCode::Enter | KeyCode::Char('d') => {
+                KeyCode::Enter => {
+                    self.start_permanent_delete(entries.clone(), manager.clone());
+                    return AppMode::Progress;
+                }
+                _ if hotkeys.permanent_delete.matches(key) => {
                     self.start_permanent_delete(entries.clone(), manager.clone());
                     return AppMode::Progress;
                 }
@@ -2039,14 +2038,18 @@ impl App {
                 _ => {}
             },
             Prompt::SmbRemember { request, .. } => match key.code {
-                KeyCode::Char('y') => {
+                _ if hotkeys.confirm_yes.matches(key) => {
                     if let NetworkAuth::Password { remember, .. } = &mut request.auth {
                         *remember = true;
                     }
                     self.start_network_action(NetworkAction::Connect(request.clone()));
                     return AppMode::NetworkProgress;
                 }
-                KeyCode::Enter | KeyCode::Char('n') => {
+                KeyCode::Enter => {
+                    self.start_network_action(NetworkAction::Connect(request.clone()));
+                    return AppMode::NetworkProgress;
+                }
+                _ if hotkeys.confirm_no.matches(key) => {
                     self.start_network_action(NetworkAction::Connect(request.clone()));
                     return AppMode::NetworkProgress;
                 }
@@ -2054,7 +2057,11 @@ impl App {
                 _ => {}
             },
             Prompt::ConfirmSmbDisconnect { share } => match key.code {
-                KeyCode::Enter | KeyCode::Char('u') => {
+                KeyCode::Enter => {
+                    self.start_network_action(NetworkAction::Disconnect(share.clone()));
+                    return AppMode::NetworkProgress;
+                }
+                _ if hotkeys.network_disconnect.matches(key) => {
                     self.start_network_action(NetworkAction::Disconnect(share.clone()));
                     return AppMode::NetworkProgress;
                 }
@@ -2062,7 +2069,11 @@ impl App {
                 _ => {}
             },
             Prompt::ConfirmSmbForget { share } => match key.code {
-                KeyCode::Enter | KeyCode::Char('d') => {
+                KeyCode::Enter => {
+                    self.start_network_action(NetworkAction::Forget(share.clone()));
+                    return AppMode::NetworkProgress;
+                }
+                _ if hotkeys.network_forget.matches(key) => {
                     self.start_network_action(NetworkAction::Forget(share.clone()));
                     return AppMode::NetworkProgress;
                 }
@@ -2155,127 +2166,136 @@ impl App {
 
     fn handle_search_results_key(&mut self, view: SearchView, key: KeyEvent) -> AppMode {
         let mut view = view;
-        match key.code {
-            KeyCode::Esc => AppMode::Browser,
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !view.results.is_empty() {
-                    view.selected = (view.selected + 1).min(view.results.len() - 1);
-                }
+        let hotkeys = self.config.hotkeys.clone();
+        if key.code == KeyCode::Esc {
+            AppMode::Browser
+        } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+            if !view.results.is_empty() {
+                view.selected = (view.selected + 1).min(view.results.len() - 1);
+            }
+            AppMode::SearchResults(view)
+        } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+            view.selected = view.selected.saturating_sub(1);
+            AppMode::SearchResults(view)
+        } else if key.code == KeyCode::Enter
+            || key.code == KeyCode::Right
+            || hotkeys.expand.matches(key)
+        {
+            if let Some(path) = view.results.get(view.selected).cloned() {
+                self.open_search_result(&path);
+                AppMode::Browser
+            } else {
                 AppMode::SearchResults(view)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                view.selected = view.selected.saturating_sub(1);
-                AppMode::SearchResults(view)
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(path) = view.results.get(view.selected).cloned() {
-                    self.open_search_result(&path);
-                    AppMode::Browser
-                } else {
-                    AppMode::SearchResults(view)
-                }
-            }
-            KeyCode::Char('/') => AppMode::Prompt(Prompt::Search {
+        } else if hotkeys.search.matches(key) {
+            AppMode::Prompt(Prompt::Search {
                 input: String::new(),
                 scope: SearchScope::CurrentDirectory,
-            }),
-            KeyCode::Char('F') => AppMode::Prompt(Prompt::Search {
+            })
+        } else if hotkeys.search_filesystem.matches(key) {
+            AppMode::Prompt(Prompt::Search {
                 input: String::new(),
                 scope: SearchScope::Filesystem,
-            }),
-            _ => AppMode::SearchResults(view),
+            })
+        } else {
+            AppMode::SearchResults(view)
         }
     }
 
     fn handle_trash_key(&mut self, mut view: TrashView, key: KeyEvent) -> AppMode {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('T') => {
-                self.refresh();
-                AppMode::Browser
+        let hotkeys = self.config.hotkeys.clone();
+        if key.code == KeyCode::Esc || hotkeys.trash_bin.matches(key) {
+            self.refresh();
+            AppMode::Browser
+        } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+            if !view.entries.is_empty() {
+                view.selected = (view.selected + 1).min(view.entries.len() - 1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !view.entries.is_empty() {
-                    view.selected = (view.selected + 1).min(view.entries.len() - 1);
+            AppMode::Trash(view)
+        } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+            view.selected = view.selected.saturating_sub(1);
+            AppMode::Trash(view)
+        } else if hotkeys.select.matches(key) {
+            if let Some(entry) = view.entries.get(view.selected) {
+                if !view.marked.remove(&entry.trashed_path) {
+                    view.marked.insert(entry.trashed_path.clone());
                 }
+            }
+            AppMode::Trash(view)
+        } else if key.code == KeyCode::Enter || hotkeys.restore.matches(key) {
+            let entries = trash_targets(&view);
+            if entries.is_empty() {
                 AppMode::Trash(view)
+            } else {
+                AppMode::Prompt(Prompt::ConfirmRestore {
+                    entries,
+                    manager: view.manager,
+                })
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                view.selected = view.selected.saturating_sub(1);
+        } else if hotkeys.permanent_delete.matches(key) {
+            let entries = trash_targets(&view);
+            if entries.is_empty() {
                 AppMode::Trash(view)
+            } else {
+                let total_bytes = entries.iter().map(TrashEntry::estimated_size).sum();
+                AppMode::Prompt(Prompt::ConfirmPermanentDelete {
+                    entries,
+                    manager: view.manager,
+                    clear_all: false,
+                    total_bytes,
+                })
             }
-            KeyCode::Char(' ') => {
-                if let Some(entry) = view.entries.get(view.selected) {
-                    if !view.marked.remove(&entry.trashed_path) {
-                        view.marked.insert(entry.trashed_path.clone());
-                    }
-                }
+        } else if hotkeys.quick_permanent_delete.matches(key) {
+            let entries = trash_targets(&view);
+            if entries.is_empty() {
                 AppMode::Trash(view)
+            } else {
+                self.start_permanent_delete(entries, view.manager);
+                AppMode::Progress
             }
-            KeyCode::Char('r') | KeyCode::Enter => {
-                let entries = trash_targets(&view);
-                if entries.is_empty() {
-                    AppMode::Trash(view)
-                } else {
-                    AppMode::Prompt(Prompt::ConfirmRestore {
-                        entries,
-                        manager: view.manager,
-                    })
-                }
+        } else if hotkeys.clear_trash.matches(key) {
+            if view.entries.is_empty() {
+                AppMode::Trash(view)
+            } else {
+                let total_bytes = view.entries.iter().map(TrashEntry::estimated_size).sum();
+                AppMode::Prompt(Prompt::ConfirmPermanentDelete {
+                    entries: view.entries.clone(),
+                    manager: view.manager,
+                    clear_all: true,
+                    total_bytes,
+                })
             }
-            KeyCode::Char('d') => {
-                let entries = trash_targets(&view);
-                if entries.is_empty() {
-                    AppMode::Trash(view)
-                } else {
-                    let total_bytes = entries.iter().map(TrashEntry::estimated_size).sum();
-                    AppMode::Prompt(Prompt::ConfirmPermanentDelete {
-                        entries,
-                        manager: view.manager,
-                        clear_all: false,
-                        total_bytes,
-                    })
-                }
-            }
-            KeyCode::Char('D') => {
-                let entries = trash_targets(&view);
-                if entries.is_empty() {
-                    AppMode::Trash(view)
-                } else {
-                    self.start_permanent_delete(entries, view.manager);
-                    AppMode::Progress
-                }
-            }
-            KeyCode::Char('C') => {
-                if view.entries.is_empty() {
-                    AppMode::Trash(view)
-                } else {
-                    let total_bytes = view.entries.iter().map(TrashEntry::estimated_size).sum();
-                    AppMode::Prompt(Prompt::ConfirmPermanentDelete {
-                        entries: view.entries.clone(),
-                        manager: view.manager,
-                        clear_all: true,
-                        total_bytes,
-                    })
-                }
-            }
-            _ => AppMode::Trash(view),
+        } else {
+            AppMode::Trash(view)
         }
     }
 
     fn handle_device_key(&mut self, mut view: DeviceView, key: KeyEvent) -> AppMode {
+        let hotkeys = self.config.hotkeys.clone();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => AppMode::Browser,
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Esc => AppMode::Browser,
+            _ if hotkeys.quit.matches(key) => AppMode::Browser,
+            KeyCode::Down => {
                 if !view.devices.is_empty() {
                     view.selected = (view.selected + 1).min(view.devices.len() - 1);
                 }
                 AppMode::Devices(view)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            _ if hotkeys.down.matches(key) => {
+                if !view.devices.is_empty() {
+                    view.selected = (view.selected + 1).min(view.devices.len() - 1);
+                }
+                AppMode::Devices(view)
+            }
+            KeyCode::Up => {
                 view.selected = view.selected.saturating_sub(1);
                 AppMode::Devices(view)
             }
-            KeyCode::Char('r') => {
+            _ if hotkeys.up.matches(key) => {
+                view.selected = view.selected.saturating_sub(1);
+                AppMode::Devices(view)
+            }
+            _ if hotkeys.refresh.matches(key) => {
                 let selected_source = view
                     .devices
                     .get(view.selected)
@@ -2283,7 +2303,7 @@ impl App {
                 self.start_device_refresh(selected_source);
                 AppMode::Devices(view)
             }
-            KeyCode::Char('e') => {
+            _ if hotkeys.device_eject.matches(key) => {
                 let Some(device) = view.devices.get(view.selected) else {
                     return AppMode::Devices(view);
                 };
@@ -2311,34 +2331,42 @@ impl App {
                     ),
                 })
             }
-            KeyCode::Enter | KeyCode::Char('m') | KeyCode::Char('u') => {
-                let Some(device) = view.devices.get(view.selected) else {
-                    return AppMode::Devices(view);
-                };
-                if device.system_protected {
-                    self.status = format!(
-                        "{} is a protected system device; disk actions are disabled",
-                        device.source.display()
-                    );
-                    return AppMode::Devices(view);
-                }
-                if device.is_locked() {
-                    AppMode::Prompt(Prompt::LuksPassphrase {
-                        source: device.source.clone(),
-                        label: device.label.clone(),
-                        size: device.size,
-                        input: SecretInput::default(),
-                        error: None,
-                    })
-                } else if device.is_mounted() {
-                    let Some(mapping) = device.mapping.clone() else {
-                        self.status = format!(
-                            "{} changed state; refresh the device list and try again",
-                            device.source.display()
-                        );
-                        return AppMode::Devices(view);
-                    };
-                    AppMode::Prompt(Prompt::ConfirmLuks {
+            KeyCode::Enter => self.device_action(view),
+            _ if hotkeys.device_action.matches(key) || hotkeys.device_unmount.matches(key) => {
+                self.device_action(view)
+            }
+            _ => AppMode::Devices(view),
+        }
+    }
+
+    fn device_action(&mut self, view: DeviceView) -> AppMode {
+        let Some(device) = view.devices.get(view.selected) else {
+            return AppMode::Devices(view);
+        };
+        if device.system_protected {
+            self.status = format!(
+                "{} is a protected system device; disk actions are disabled",
+                device.source.display()
+            );
+            return AppMode::Devices(view);
+        }
+        if device.is_locked() {
+            AppMode::Prompt(Prompt::LuksPassphrase {
+                source: device.source.clone(),
+                label: device.label.clone(),
+                size: device.size,
+                input: SecretInput::default(),
+                error: None,
+            })
+        } else if device.is_mounted() {
+            let Some(mapping) = device.mapping.clone() else {
+                self.status = format!(
+                    "{} changed state; refresh the device list and try again",
+                    device.source.display()
+                );
+                return AppMode::Devices(view);
+            };
+            AppMode::Prompt(Prompt::ConfirmLuks {
                         action: LuksAction::UnmountAndLock {
                             source: device.source.clone(),
                             mapping,
@@ -2351,47 +2379,58 @@ impl App {
                             device.mountpoints.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "),
                         ),
                     })
-                } else {
-                    let Some(mapping) = device.mapping.clone() else {
-                        self.status = format!(
-                            "{} changed state; refresh the device list and try again",
-                            device.source.display()
-                        );
-                        return AppMode::Devices(view);
-                    };
-                    AppMode::Prompt(Prompt::ConfirmLuks {
-                        action: LuksAction::Mount { mapping },
-                        title: "Mount unlocked LUKS volume".into(),
-                        body: format!(
-                            "Device: {}\nMapping: {}",
-                            device.source.display(),
-                            device
-                                .mapping
-                                .as_ref()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "—".into()),
-                        ),
-                    })
-                }
-            }
-            _ => AppMode::Devices(view),
+        } else {
+            let Some(mapping) = device.mapping.clone() else {
+                self.status = format!(
+                    "{} changed state; refresh the device list and try again",
+                    device.source.display()
+                );
+                return AppMode::Devices(view);
+            };
+            AppMode::Prompt(Prompt::ConfirmLuks {
+                action: LuksAction::Mount { mapping },
+                title: "Mount unlocked LUKS volume".into(),
+                body: format!(
+                    "Device: {}\nMapping: {}",
+                    device.source.display(),
+                    device
+                        .mapping
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+            })
         }
     }
 
     fn handle_network_key(&mut self, mut view: NetworkView, key: KeyEvent) -> AppMode {
+        let hotkeys = self.config.hotkeys.clone();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('N') => AppMode::Browser,
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Esc => AppMode::Browser,
+            _ if hotkeys.quit.matches(key) || hotkeys.network_shares.matches(key) => {
+                AppMode::Browser
+            }
+            KeyCode::Down => {
                 if !view.shares.is_empty() {
                     view.selected = (view.selected + 1).min(view.shares.len() - 1);
                 }
                 AppMode::Network(view)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            _ if hotkeys.down.matches(key) => {
+                if !view.shares.is_empty() {
+                    view.selected = (view.selected + 1).min(view.shares.len() - 1);
+                }
+                AppMode::Network(view)
+            }
+            KeyCode::Up => {
                 view.selected = view.selected.saturating_sub(1);
                 AppMode::Network(view)
             }
-            KeyCode::Char('r') => {
+            _ if hotkeys.up.matches(key) => {
+                view.selected = view.selected.saturating_sub(1);
+                AppMode::Network(view)
+            }
+            _ if hotkeys.refresh.matches(key) => {
                 let selected_uri = view
                     .shares
                     .get(view.selected)
@@ -2399,7 +2438,7 @@ impl App {
                 self.start_network_refresh(selected_uri);
                 AppMode::Network(view)
             }
-            KeyCode::Char('a') => {
+            _ if hotkeys.network_add.matches(key) => {
                 if self.config.behavior.read_only {
                     self.set_notice("Read-only mode: network connections are disabled");
                     return AppMode::Network(view);
@@ -2410,45 +2449,9 @@ impl App {
                     error: None,
                 })
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                let Some(share) = view.shares.get(view.selected).cloned() else {
-                    return AppMode::Network(view);
-                };
-                if let Some(path) = share.mount_path.filter(|path| path.is_dir()) {
-                    self.go_to(path);
-                    return AppMode::Browser;
-                }
-                if self.config.behavior.read_only {
-                    self.set_notice("Read-only mode: network connections are disabled");
-                    return AppMode::Network(view);
-                }
-                if share.saved {
-                    let Some(username) = share.username.clone() else {
-                        return AppMode::Prompt(Prompt::SmbUsername {
-                            address: share.address,
-                            input: String::new(),
-                            cursor: 0,
-                            error: None,
-                        });
-                    };
-                    self.start_network_action(NetworkAction::Connect(ConnectRequest {
-                        address: share.address,
-                        auth: NetworkAuth::Saved {
-                            username,
-                            domain: share.domain.unwrap_or_default(),
-                        },
-                    }));
-                    AppMode::NetworkProgress
-                } else {
-                    AppMode::Prompt(Prompt::SmbUsername {
-                        address: share.address,
-                        input: String::new(),
-                        cursor: 0,
-                        error: None,
-                    })
-                }
-            }
-            KeyCode::Char('u') => {
+            KeyCode::Enter | KeyCode::Right => self.network_open(view),
+            _ if hotkeys.expand.matches(key) => self.network_open(view),
+            _ if hotkeys.network_disconnect.matches(key) => {
                 if self.config.behavior.read_only {
                     self.set_notice("Read-only mode: network disconnection is disabled");
                     return AppMode::Network(view);
@@ -2460,7 +2463,7 @@ impl App {
                     _ => AppMode::Network(view),
                 }
             }
-            KeyCode::Char('d') => {
+            _ if hotkeys.network_forget.matches(key) => {
                 if self.config.behavior.read_only {
                     self.set_notice("Read-only mode: remembered shares cannot be changed");
                     return AppMode::Network(view);
@@ -2476,40 +2479,78 @@ impl App {
         }
     }
 
+    fn network_open(&mut self, view: NetworkView) -> AppMode {
+        let Some(share) = view.shares.get(view.selected).cloned() else {
+            return AppMode::Network(view);
+        };
+        if let Some(path) = share.mount_path.filter(|path| path.is_dir()) {
+            self.go_to(path);
+            return AppMode::Browser;
+        }
+        if self.config.behavior.read_only {
+            self.set_notice("Read-only mode: network connections are disabled");
+            return AppMode::Network(view);
+        }
+        if share.saved {
+            let Some(username) = share.username.clone() else {
+                return AppMode::Prompt(Prompt::SmbUsername {
+                    address: share.address,
+                    input: String::new(),
+                    cursor: 0,
+                    error: None,
+                });
+            };
+            self.start_network_action(NetworkAction::Connect(ConnectRequest {
+                address: share.address,
+                auth: NetworkAuth::Saved {
+                    username,
+                    domain: share.domain.unwrap_or_default(),
+                },
+            }));
+            AppMode::NetworkProgress
+        } else {
+            AppMode::Prompt(Prompt::SmbUsername {
+                address: share.address,
+                input: String::new(),
+                cursor: 0,
+                error: None,
+            })
+        }
+    }
+
     fn handle_partition_key(&mut self, mut view: PartitionView, key: KeyEvent) -> AppMode {
         if let Some(overlay) = view.overlay.take() {
             return self.handle_partition_overlay(view, overlay, key);
         }
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('M') => AppMode::Apps(AppsView { selected: 1 }),
-            KeyCode::Char('q') => AppMode::Browser,
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !view.entries.is_empty() {
-                    view.selected = (view.selected + 1).min(view.entries.len() - 1);
-                }
+        let hotkeys = self.config.hotkeys.clone();
+        if key.code == KeyCode::Esc || hotkeys.apps.matches(key) {
+            AppMode::Apps(AppsView { selected: 1 })
+        } else if hotkeys.quit.matches(key) {
+            AppMode::Browser
+        } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+            if !view.entries.is_empty() {
+                view.selected = (view.selected + 1).min(view.entries.len() - 1);
+            }
+            AppMode::Partitions(view)
+        } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+            view.selected = view.selected.saturating_sub(1);
+            AppMode::Partitions(view)
+        } else if hotkeys.refresh.matches(key) {
+            let selected_path = view
+                .entries
+                .get(view.selected)
+                .map(|entry| entry.device.path.clone());
+            self.start_partition_refresh(selected_path);
+            AppMode::Partitions(view)
+        } else if key.code == KeyCode::Enter || hotkeys.partition_actions.matches(key) {
+            if view.entries.is_empty() {
+                AppMode::Partitions(view)
+            } else {
+                view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
                 AppMode::Partitions(view)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                view.selected = view.selected.saturating_sub(1);
-                AppMode::Partitions(view)
-            }
-            KeyCode::Char('r') => {
-                let selected_path = view
-                    .entries
-                    .get(view.selected)
-                    .map(|entry| entry.device.path.clone());
-                self.start_partition_refresh(selected_path);
-                AppMode::Partitions(view)
-            }
-            KeyCode::Enter | KeyCode::Char('a') => {
-                if view.entries.is_empty() {
-                    AppMode::Partitions(view)
-                } else {
-                    view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
-                    AppMode::Partitions(view)
-                }
-            }
-            _ => AppMode::Partitions(view),
+        } else {
+            AppMode::Partitions(view)
         }
     }
 
@@ -2517,23 +2558,50 @@ impl App {
         &mut self,
         mut view: PartitionView,
         overlay: PartitionOverlay,
-        key: KeyEvent,
+        mut key: KeyEvent,
     ) -> AppMode {
+        let hotkeys = self.config.hotkeys.clone();
+        let list_overlay = matches!(
+            &overlay,
+            PartitionOverlay::Actions { .. }
+                | PartitionOverlay::FormatOptions { .. }
+                | PartitionOverlay::DiskLayoutOptions { .. }
+                | PartitionOverlay::FreeRegionOptions { .. }
+        );
+        let confirmation_overlay = matches!(&overlay, PartitionOverlay::Confirm { .. });
+        if list_overlay && hotkeys.down.matches(key) {
+            key.code = KeyCode::Down;
+            key.modifiers = KeyModifiers::NONE;
+        } else if list_overlay && hotkeys.up.matches(key) {
+            key.code = KeyCode::Up;
+            key.modifiers = KeyModifiers::NONE;
+        } else if (list_overlay || confirmation_overlay) && hotkeys.expand.matches(key) {
+            key.code = KeyCode::Right;
+            key.modifiers = KeyModifiers::NONE;
+        } else if (list_overlay || confirmation_overlay) && hotkeys.collapse.matches(key) {
+            key.code = KeyCode::Left;
+            key.modifiers = KeyModifiers::NONE;
+        } else if matches!(&overlay, PartitionOverlay::Actions { .. })
+            && hotkeys.partition_actions.matches(key)
+        {
+            key.code = KeyCode::Esc;
+            key.modifiers = KeyModifiers::NONE;
+        }
         match overlay {
             PartitionOverlay::Actions { mut selected } => match key.code {
-                KeyCode::Esc | KeyCode::Char('a') => AppMode::Partitions(view),
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Esc => AppMode::Partitions(view),
+                KeyCode::Down => {
                     let tasks = self.partition_tasks_for_view(&view);
                     selected = (selected + 1).min(tasks.len().saturating_sub(1));
                     view.overlay = Some(PartitionOverlay::Actions { selected });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     selected = selected.saturating_sub(1);
                     view.overlay = Some(PartitionOverlay::Actions { selected });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                KeyCode::Enter | KeyCode::Right => {
                     let tasks = self.partition_tasks_for_view(&view);
                     let Some(task) = tasks.get(selected).copied() else {
                         view.overlay = Some(PartitionOverlay::Actions { selected });
@@ -2562,17 +2630,17 @@ impl App {
                     });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     selected = (selected + 1).min(Filesystem::ALL.len() - 1);
                     view.overlay = Some(PartitionOverlay::FormatOptions { selected });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     selected = selected.saturating_sub(1);
                     view.overlay = Some(PartitionOverlay::FormatOptions { selected });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                KeyCode::Enter | KeyCode::Right => {
                     let Some(filesystem) = Filesystem::ALL.get(selected).copied() else {
                         view.overlay = Some(PartitionOverlay::FormatOptions { selected });
                         return AppMode::Partitions(view);
@@ -2601,17 +2669,17 @@ impl App {
                     });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     selected = (selected + 1).min(2);
                     view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     selected = selected.saturating_sub(1);
                     view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected });
                     AppMode::Partitions(view)
                 }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                KeyCode::Enter | KeyCode::Right => {
                     match self.partition_disk_layout_action(&view, selected) {
                         Ok(action) => {
                             if let Err(validation) =
@@ -2649,15 +2717,15 @@ impl App {
                     KeyCode::Esc => {
                         view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down => {
                         selected = (selected + 1).min(regions.len().saturating_sub(1));
                         view.overlay = Some(PartitionOverlay::FreeRegionOptions { selected });
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    KeyCode::Up => {
                         selected = selected.saturating_sub(1);
                         view.overlay = Some(PartitionOverlay::FreeRegionOptions { selected });
                     }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    KeyCode::Enter | KeyCode::Right => {
                         if let Some((start_bytes, maximum_end)) = regions.get(selected).copied() {
                             view.overlay = Some(PartitionOverlay::PartitionSize {
                                 start_bytes,
@@ -2821,14 +2889,18 @@ impl App {
                 mut yes_selected,
             } => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    KeyCode::Esc => {
                         view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
                         return AppMode::Partitions(view);
                     }
-                    KeyCode::Left | KeyCode::Char('h') => yes_selected = false,
-                    KeyCode::Right | KeyCode::Char('l') => yes_selected = true,
+                    _ if hotkeys.confirm_no.matches(key) => {
+                        view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
+                        return AppMode::Partitions(view);
+                    }
+                    KeyCode::Left => yes_selected = false,
+                    KeyCode::Right => yes_selected = true,
                     KeyCode::Tab | KeyCode::BackTab => yes_selected = !yes_selected,
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    _ if hotkeys.confirm_yes.matches(key) => {
                         return self.authorize_partition_operation(action, view);
                     }
                     KeyCode::Enter if yes_selected => {
@@ -3604,7 +3676,9 @@ impl App {
     }
 
     fn handle_readonly_popup(&mut self, key: KeyEvent, mode: AppMode) -> AppMode {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+            || self.config.hotkeys.quit.matches(key)
+        {
             AppMode::Browser
         } else {
             mode
@@ -3612,12 +3686,17 @@ impl App {
     }
 
     fn handle_config_error(&mut self, path: PathBuf, error: String, key: KeyEvent) -> AppMode {
+        let hotkeys = self.config.hotkeys.clone();
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Esc => {
                 self.running = false;
                 AppMode::ConfigError { path, error }
             }
-            KeyCode::Char('r') => match config::load_from(path.clone()) {
+            _ if hotkeys.quit.matches(key) => {
+                self.running = false;
+                AppMode::ConfigError { path, error }
+            }
+            _ if hotkeys.config_reload.matches(key) => match config::load_from(path.clone()) {
                 ConfigLoad::Valid { config, path } => {
                     self.config = config;
                     self.config_path = path;
@@ -3627,7 +3706,7 @@ impl App {
                 }
                 ConfigLoad::Invalid { path, error } => AppMode::ConfigError { path, error },
             },
-            KeyCode::Char('e') => {
+            _ if hotkeys.config_edit.matches(key) => {
                 let program = launcher::resolve_editor(&self.config.open.editor);
                 if launcher::is_terminal_editor(&program) {
                     self.pending_terminal_editor = Some(PendingTerminalEditor {
@@ -4341,6 +4420,31 @@ impl App {
                 body: error.to_string(),
             }),
         }
+    }
+
+    fn restore_trash_entries(&mut self, entries: &[TrashEntry], manager: &TrashManager) -> AppMode {
+        let mut restored = 0;
+        let mut failures = Vec::new();
+        for entry in entries {
+            match manager.restore(entry, None) {
+                Ok(_) => restored += 1,
+                Err(error) => failures.push((entry.trashed_path.clone(), error.to_string())),
+            }
+        }
+        if failures.is_empty() {
+            self.set_notice(format!("Restored {restored} item(s)"));
+            self.refresh();
+            return self.open_trash_manager(manager.clone());
+        }
+        AppMode::Prompt(Prompt::Summary {
+            summary: OperationSummary {
+                label: "Restoring".into(),
+                completed: restored,
+                failed: failures,
+                ..OperationSummary::default()
+            },
+            return_to_trash: Some(manager.clone()),
+        })
     }
 
     fn open_devices(&mut self) -> AppMode {
@@ -5791,6 +5895,19 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, AppMode::Browser));
+    }
+
+    #[test]
+    fn configured_app_hotkey_replaces_the_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        app.config = toml::from_str("[hotkeys]\napps = 'F2'\n").unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
+        assert!(matches!(app.mode, AppMode::Browser));
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 0 })));
     }
 
     #[test]

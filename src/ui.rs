@@ -37,19 +37,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.mode {
         AppMode::Browser => {}
         AppMode::Apps(view) => draw_apps(frame, app, view),
-        AppMode::Prompt(prompt) => draw_prompt(frame, prompt),
+        AppMode::Prompt(prompt) => draw_prompt(frame, app, prompt),
         AppMode::Progress => draw_progress_modal(frame, app),
         AppMode::SearchProgress => draw_search_progress(frame, app),
-        AppMode::SearchResults(view) => draw_search_results(frame, view),
+        AppMode::SearchResults(view) => draw_search_results(frame, app, view),
         AppMode::UpdateProgress => draw_update_progress(frame),
-        AppMode::Trash(view) => draw_trash(frame, view),
+        AppMode::Trash(view) => draw_trash(frame, app, view),
         AppMode::Devices(view) => draw_devices(frame, app, view),
         AppMode::Network(view) => draw_network(frame, app, view),
         AppMode::NetworkProgress => draw_network_progress(frame),
         AppMode::Partitions(view) => draw_partitions(frame, app, view),
-        AppMode::Help => draw_help(frame),
+        AppMode::Help => draw_help(frame, app),
         AppMode::Info => draw_info(frame, app),
-        AppMode::ConfigError { path, error } => draw_config_error(frame, path, error),
+        AppMode::ConfigError { path, error } => draw_config_error(frame, app, path, error),
     }
 
     // Keep these bars above app panels so the active context's shortcuts are
@@ -340,8 +340,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     let context = match &app.mode {
         AppMode::Browser => None,
-        AppMode::Apps(_) => Some(" ↑↓/jk Move · Enter Open · M/Esc Close ".to_string()),
-        AppMode::Partitions(view) => Some(partition_shortcuts(view)),
+        AppMode::Apps(_) => Some(format!(
+            " ↑↓/{}/{} Move · Enter Open · {}/{}/Esc Close ",
+            app.config.hotkeys.down.display(),
+            app.config.hotkeys.up.display(),
+            app.config.hotkeys.apps.display(),
+            app.config.hotkeys.quit.display(),
+        )),
+        AppMode::Partitions(view) => Some(partition_shortcuts(app, view)),
         AppMode::Prompt(Prompt::PartitionAuthentication { .. }) => {
             Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into())
         }
@@ -361,17 +367,20 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
         .selected_entry()
         .is_some_and(|entry| entry.is_text_file())
     {
-        " · e Edit"
+        format!(" · {} Edit", app.config.hotkeys.edit.display())
     } else {
-        ""
+        String::new()
     };
     let open_controls = match app.browser_view {
-        BrowserView::Tree => "→l Expand · Enter Open",
-        BrowserView::Table => "→l/Enter Open",
+        BrowserView::Tree => format!(
+            "→/{} Expand · Enter Open",
+            app.config.hotkeys.expand.display()
+        ),
+        BrowserView::Table => format!("→/{}/Enter Open", app.config.hotkeys.expand.display()),
     };
     let view = match app.browser_view {
-        BrowserView::Tree => "v Table",
-        BrowserView::Table => "v Tree",
+        BrowserView::Tree => format!("{} Table", app.config.hotkeys.toggle_view.display()),
+        BrowserView::Table => format!("{} Tree", app.config.hotkeys.toggle_view.display()),
     };
 
     let columns = Layout::default()
@@ -384,10 +393,12 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
     let groups = [
         format!(
-            " NAVIGATION\n ↑↓/jk Move · ←h Parent\n {open_controls}{edit} · {view} · ? Help"
+            " NAVIGATION\n ↑↓/{}/{} Move · ←/{} Parent\n {open_controls}{edit} · {view} · {} Help",
+            app.config.hotkeys.down.display(), app.config.hotkeys.up.display(),
+            app.config.hotkeys.collapse.display(), app.config.hotkeys.help.display()
         ),
-        " FILE OPERATIONS\n Space Mark · x Cut · c Copy · p Paste\n r Rename · n File · a Dir".into(),
-        " VIEW & APPS\n d/D Trash · T Bin · . Hidden · s Sort\n M Apps · m Devices · N Shares · g Path · / Search · F Search FS".into(),
+        format!(" FILE OPERATIONS\n {} Mark · {} Cut · {} Copy · {} Paste\n {} Rename · {} File · {} Dir", app.config.hotkeys.select.display(), app.config.hotkeys.cut.display(), app.config.hotkeys.copy.display(), app.config.hotkeys.paste.display(), app.config.hotkeys.rename.display(), app.config.hotkeys.create_file.display(), app.config.hotkeys.create_directory.display()),
+        format!(" VIEW & APPS\n {}/{} Trash · {} Bin · {} Hidden · {} Sort\n {} Apps · {} Devices · {} Shares · {} Path · {} Search · {} Search FS", app.config.hotkeys.trash.display(), app.config.hotkeys.quick_trash.display(), app.config.hotkeys.trash_bin.display(), app.config.hotkeys.hidden.display(), app.config.hotkeys.sort.display(), app.config.hotkeys.apps.display(), app.config.hotkeys.devices.display(), app.config.hotkeys.network_shares.display(), app.config.hotkeys.go_to.display(), app.config.hotkeys.search.display(), app.config.hotkeys.search_filesystem.display()),
     ];
 
     for (index, group) in groups.into_iter().enumerate() {
@@ -407,20 +418,30 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn partition_shortcuts(view: &crate::app::PartitionView) -> String {
+fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -> String {
+    let down = app.config.hotkeys.down.display();
+    let up = app.config.hotkeys.up.display();
+    let actions = app.config.hotkeys.partition_actions.display();
+    let refresh = app.config.hotkeys.refresh.display();
     let hint = match &view.overlay {
-        None => " ↑↓/jk Move · Enter/a Actions · r Refresh · Esc Apps ",
+        None => {
+            return format!(
+                " ↑↓/{down}/{up} Move · Enter/{actions} Actions · {refresh} Refresh · {}/Esc Apps · {} Browser ",
+                app.config.hotkeys.apps.display(),
+                app.config.hotkeys.quit.display()
+            )
+        }
         Some(crate::app::PartitionOverlay::Actions { .. }) => {
-            " ↑↓/jk Move · Enter Continue · a/Esc Back "
+            return format!(" ↑↓/{down}/{up} Move · Enter Continue · {actions}/Esc Back ")
         }
         Some(crate::app::PartitionOverlay::FormatOptions { .. }) => {
-            " ↑↓/jk Choose filesystem · Enter Continue · Esc Back "
+            return format!(" ↑↓/{down}/{up} Choose filesystem · Enter Continue · Esc Back ")
         }
         Some(crate::app::PartitionOverlay::DiskLayoutOptions { .. }) => {
-            " ↑↓/jk Choose layout · Enter Review · Esc Back "
+            return format!(" ↑↓/{down}/{up} Choose layout · Enter Review · Esc Back ")
         }
         Some(crate::app::PartitionOverlay::FreeRegionOptions { .. }) => {
-            " ↑↓/jk Choose free space · Enter Continue · Esc Back "
+            return format!(" ↑↓/{down}/{up} Choose free space · Enter Continue · Esc Back ")
         }
         Some(crate::app::PartitionOverlay::PartitionSize { .. }) => {
             " Type size or max · Enter Review · Esc Regions "
@@ -436,7 +457,7 @@ fn partition_shortcuts(view: &crate::app::PartitionView) -> String {
     hint.into()
 }
 
-fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
+fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
     match prompt {
         Prompt::GoTo { input } => input_modal(frame, "Go to path", input, "Enter go · Esc cancel"),
         Prompt::Search { input, scope } => input_modal(
@@ -482,7 +503,11 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                 frame,
                 "Confirm move to trash",
                 &body,
-                "Enter confirm · Esc cancel",
+                &format!(
+                    "{}/Enter confirm · {}/Esc cancel",
+                    app.config.hotkeys.confirm_yes.display(),
+                    app.config.hotkeys.confirm_no.display()
+                ),
                 70,
                 16,
             );
@@ -498,7 +523,12 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                 frame,
                 "Destination already exists",
                 &format!("Existing destination items will be moved to trash before replacement.\n\n{conflicts}"),
-                "o/Enter overwrite · s skip conflicts · a/Esc abort",
+                &format!(
+                    "{}/Enter overwrite · {} skip conflicts · {}/Esc abort",
+                    app.config.hotkeys.overwrite.display(),
+                    app.config.hotkeys.skip.display(),
+                    app.config.hotkeys.abort.display()
+                ),
                 76,
                 16,
             );
@@ -510,7 +540,10 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                 frame,
                 "Confirm restore",
                 &body,
-                "r/Enter restore · Esc cancel",
+                &format!(
+                    "{}/Enter restore · Esc cancel",
+                    app.config.hotkeys.restore.display()
+                ),
                 76,
                 16,
             );
@@ -540,7 +573,10 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                     "Permanently delete from trash"
                 },
                 &body,
-                "d/Enter permanently delete · Esc cancel",
+                &format!(
+                    "{}/Enter permanently delete · Esc cancel",
+                    app.config.hotkeys.permanent_delete.display()
+                ),
                 78,
                 18,
             );
@@ -738,27 +774,37 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                 "Enter continue · Esc cancel",
             );
         }
-        Prompt::SmbRemember { available, .. } => message_modal(
-            frame,
-            "Remember this share?",
-            if *available {
-                "Save the password in your desktop's secure credential service?\n\nThe share address and account name will be saved in minfm's configuration directory."
+        Prompt::SmbRemember { available, .. } => {
+            let footer = if *available {
+                format!(
+                    "{} remember · {}/Enter this session only · Esc cancel",
+                    app.config.hotkeys.confirm_yes.display(),
+                    app.config.hotkeys.confirm_no.display()
+                )
             } else {
-                "Secure credential storage is unavailable.\n\nThe connection will only last for this login session."
-            },
-            if *available {
-                "y remember · n/Enter this session only · Esc cancel"
-            } else {
-                "Enter this session only · Esc cancel"
-            },
-            76,
-            14,
-        ),
+                "Enter this session only · Esc cancel".into()
+            };
+            message_modal(
+                frame,
+                "Remember this share?",
+                if *available {
+                    "Save the password in your desktop's secure credential service?\n\nThe share address and account name will be saved in minfm's configuration directory."
+                } else {
+                    "Secure credential storage is unavailable.\n\nThe connection will only last for this login session."
+                },
+                &footer,
+                76,
+                14,
+            )
+        }
         Prompt::ConfirmSmbDisconnect { share } => message_modal(
             frame,
             "Disconnect network share",
             &format!("Disconnect {}?\n\nOpen files on this share may prevent disconnection.", share.address.uri),
-            "u/Enter disconnect · Esc cancel",
+            &format!(
+                "{}/Enter disconnect · Esc cancel",
+                app.config.hotkeys.network_disconnect.display()
+            ),
             76,
             13,
         ),
@@ -769,7 +815,10 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
                 "Forget {} and remove its saved password?\n\nAn active connection will remain connected.",
                 share.address.uri
             ),
-            "d/Enter forget · Esc cancel",
+            &format!(
+                "{}/Enter forget · Esc cancel",
+                app.config.hotkeys.network_forget.display()
+            ),
             76,
             13,
         ),
@@ -999,7 +1048,7 @@ fn draw_update_progress(frame: &mut Frame) {
     );
 }
 
-fn draw_search_results(frame: &mut Frame, view: &SearchView) {
+fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
     let area = frame.area();
     frame.render_widget(Clear, area);
     let visible_count = usize::from(area.height.saturating_sub(4)).max(1);
@@ -1027,12 +1076,24 @@ fn draw_search_results(frame: &mut Frame, view: &SearchView) {
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
     let footer = if view.limited {
-        "10,000 result limit reached · ↑/↓ j/k Move · Enter open · Esc return".to_string()
+        format!(
+            "10,000 result limit reached · ↑/↓ {}/{} Move · Enter open · Esc return",
+            app.config.hotkeys.down.display(),
+            app.config.hotkeys.up.display()
+        )
     } else if view.skipped == 0 {
-        "↑/↓ j/k Move · Enter open · / Search here · F Search filesystem · Esc return".to_string()
+        format!(
+            "↑/↓ {}/{} Move · Enter open · {} Search here · {} Search filesystem · Esc return",
+            app.config.hotkeys.down.display(),
+            app.config.hotkeys.up.display(),
+            app.config.hotkeys.search.display(),
+            app.config.hotkeys.search_filesystem.display()
+        )
     } else {
         format!(
-            "↑/↓ j/k Move · Enter open · Esc return · {} permission error(s) skipped",
+            "↑/↓ {}/{} Move · Enter open · Esc return · {} permission error(s) skipped",
+            app.config.hotkeys.down.display(),
+            app.config.hotkeys.up.display(),
             view.skipped
         )
     };
@@ -1059,7 +1120,7 @@ fn append_trash_names(body: &mut String, entries: &[crate::trash::TrashEntry]) {
     }
 }
 
-fn draw_trash(frame: &mut Frame, view: &TrashView) {
+fn draw_trash(frame: &mut Frame, app: &App, view: &TrashView) {
     let screen = frame.area();
     let area = Rect {
         x: screen.x.saturating_add(1),
@@ -1108,9 +1169,12 @@ fn draw_trash(frame: &mut Frame, view: &TrashView) {
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
-        Paragraph::new(
-            "Space select │ Enter/r restore │ d permanent delete │ D quick permanent delete\nC clear trash │ T/Esc return",
-        )
+        Paragraph::new(format!(
+            "{} select │ Enter/{} restore │ {} permanent delete │ {} quick permanent delete\n{} clear trash │ {}/Esc return",
+            app.config.hotkeys.select.display(), app.config.hotkeys.restore.display(),
+            app.config.hotkeys.permanent_delete.display(), app.config.hotkeys.quick_permanent_delete.display(),
+            app.config.hotkeys.clear_trash.display(), app.config.hotkeys.trash_bin.display()
+        ))
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT))
             .block(Block::default().borders(Borders::ALL)),
@@ -1142,10 +1206,16 @@ fn draw_apps(frame: &mut Frame, app: &App, view: &AppsView) {
     let mut state = TableState::default().with_selected(Some(view.selected));
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
-        Paragraph::new("↑/k ↓/j move · Enter open · M/Esc close")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(ACCENT))
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(format!(
+            "↑/{} ↓/{} move · Enter open · {}/{}/Esc close",
+            app.config.hotkeys.up.display(),
+            app.config.hotkeys.down.display(),
+            app.config.hotkeys.apps.display(),
+            app.config.hotkeys.quit.display()
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT))
+        .block(Block::default().borders(Borders::ALL)),
         sections[1],
     );
 }
@@ -1259,10 +1329,18 @@ fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView) {
         sections[1],
     );
     frame.render_widget(
-        Paragraph::new("Enter/a actions · r refresh · ↑/k ↓/j move · Esc apps · q browser")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(ACCENT))
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(format!(
+            "Enter/{} actions · {} refresh · ↑/{} ↓/{} move · {}/Esc apps · {} browser",
+            app.config.hotkeys.partition_actions.display(),
+            app.config.hotkeys.refresh.display(),
+            app.config.hotkeys.up.display(),
+            app.config.hotkeys.down.display(),
+            app.config.hotkeys.apps.display(),
+            app.config.hotkeys.quit.display()
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT))
+        .block(Block::default().borders(Borders::ALL)),
         sections[2],
     );
     if let Some(overlay) = &view.overlay {
@@ -1332,10 +1410,13 @@ fn draw_partition_overlay(
             let mut state = TableState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(table, sections[0], &mut state);
             frame.render_widget(
-                Paragraph::new("Enter continue · a/Esc back")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(ACCENT))
-                    .block(Block::default().borders(Borders::ALL)),
+                Paragraph::new(format!(
+                    "Enter continue · {}/Esc back",
+                    app.config.hotkeys.partition_actions.display()
+                ))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(ACCENT))
+                .block(Block::default().borders(Borders::ALL)),
                 sections[1],
             );
         }
@@ -1920,14 +2001,23 @@ fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
                 return "Protected system volume · disk actions unavailable".to_string();
             }
             let mut action = if device.is_locked() {
-                "Enter/u unlock and mount".to_string()
+                format!(
+                    "Enter/{} unlock and mount",
+                    app.config.hotkeys.device_unmount.display()
+                )
             } else if device.is_mounted() {
-                "Enter/u unmount and lock".to_string()
+                format!(
+                    "Enter/{} unmount and lock",
+                    app.config.hotkeys.device_unmount.display()
+                )
             } else {
-                "Enter/m mount".to_string()
+                format!("Enter/{} mount", app.config.hotkeys.device_action.display())
             };
             if device.ejectable && !device.eject_blocked {
-                action.push_str(" · e eject");
+                action.push_str(&format!(
+                    " · {} eject",
+                    app.config.hotkeys.device_eject.display()
+                ));
             } else if device.ejectable && device.eject_blocked {
                 action.push_str(" · eject unavailable: drive in use");
             }
@@ -1941,9 +2031,13 @@ fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
             }
         });
     frame.render_widget(
-        Paragraph::new(format!("{action} · r refresh · Esc return"))
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(ACCENT)),
+        Paragraph::new(format!(
+            "{action} · {} refresh · Esc return · {} browser",
+            app.config.hotkeys.refresh.display(),
+            app.config.hotkeys.quit.display()
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT)),
         footer,
     );
 }
@@ -2005,19 +2099,34 @@ fn draw_network(frame: &mut Frame, app: &App, view: &NetworkView) {
     let contextual = selected_share
         .map(|share| {
             let mut actions = if share.mount_path.is_some() {
-                "Enter open · u disconnect".to_string()
+                format!(
+                    "Enter open · {} disconnect",
+                    app.config.hotkeys.network_disconnect.display()
+                )
             } else {
                 "Enter connect".to_string()
             };
             if share.saved {
-                actions.push_str(" · d forget");
+                actions.push_str(&format!(
+                    " · {} forget",
+                    app.config.hotkeys.network_forget.display()
+                ));
             }
             actions
         })
-        .unwrap_or_else(|| "No shares found · use a to add one".into());
+        .unwrap_or_else(|| {
+            format!(
+                "No shares found · use {} to add one",
+                app.config.hotkeys.network_add.display()
+            )
+        });
     frame.render_widget(
         Paragraph::new(format!(
-            "{contextual}\na add share · r refresh · N/Esc return"
+            "{contextual}\n{} add share · {} refresh · {}/Esc return · {} browser",
+            app.config.hotkeys.network_add.display(),
+            app.config.hotkeys.refresh.display(),
+            app.config.hotkeys.network_shares.display(),
+            app.config.hotkeys.quit.display()
         ))
         .alignment(Alignment::Center)
         .style(Style::default().fg(ACCENT))
@@ -2051,10 +2160,23 @@ fn draw_network_progress(frame: &mut Frame) {
     );
 }
 
-fn draw_help(frame: &mut Frame) {
-    let body = "Navigation\n  ↑/k ↓/j       move\n  Enter          toggle directory or open file\n  →/l            expand/child in tree; open in table\n  ←/h            collapse/parent in tree; parent in table\n  v              toggle tree/table view\n  g              go to path\n  /              search current directory\n  F              search entire filesystem\n\nClipboard\n  x              cut\n  c              copy\n  p              paste\n\nFiles\n  Space          select\n  e              edit selected text file\n  r              rename file or directory\n  d / D          trash with prompt / quick trash\n  T              trash bin\n\nTrash bin\n  Space          select\n  Enter / r      restore\n  d / D          permanent delete / quick permanent delete\n  C              clear trash with confirmation\n\nCreate\n  n              create file\n  a              create directory\n\nApps and devices\n  M              built-in apps\n  m              encrypted device manager\n  e              safely eject selected removable device\n\nNetwork shares\n  N              network shares\n  a              add share\n  Enter          open or connect\n  u              disconnect\n  d              forget saved share\n  r              refresh\n\nView\n  .              hidden files\n  s / S          sort mode / reverse\n  I              information\n  Esc            close this view";
+fn draw_help(frame: &mut Frame, app: &App) {
+    let h = &app.config.hotkeys;
+    let body = format!(
+        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nApps and devices\n  {}              built-in apps (devices, partitions, shares)\n  {}              encrypted device manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
+        h.up.display(), h.down.display(), h.expand.display(), h.collapse.display(),
+        h.toggle_view.display(), h.go_to.display(), h.search.display(), h.search_filesystem.display(),
+        h.cut.display(), h.copy.display(), h.paste.display(), h.select.display(), h.edit.display(),
+        h.rename.display(), h.trash.display(), h.quick_trash.display(), h.trash_bin.display(),
+        h.select.display(), h.restore.display(), h.permanent_delete.display(),
+        h.quick_permanent_delete.display(), h.clear_trash.display(), h.create_file.display(),
+        h.create_directory.display(), h.apps.display(), h.devices.display(),
+        h.device_eject.display(), h.network_shares.display(), h.network_add.display(),
+        h.network_disconnect.display(), h.network_forget.display(), h.refresh.display(),
+        h.hidden.display(), h.sort.display(), h.reverse_sort.display(), h.info.display(),
+    );
     let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
-    message_modal(frame, &title, body, "Esc/Enter close", 70, 94);
+    message_modal(frame, &title, &body, "Esc/Enter close", 70, 94);
 }
 
 fn draw_info(frame: &mut Frame, app: &App) {
@@ -2103,7 +2225,7 @@ fn availability(command: &str) -> &'static str {
         .unwrap_or("missing")
 }
 
-fn draw_config_error(frame: &mut Frame, path: &std::path::Path, error: &str) {
+fn draw_config_error(frame: &mut Frame, app: &App, path: &std::path::Path, error: &str) {
     let body = format!(
         "minfm cannot use its configuration.\n\nFile:\n{}\n\n{}\n\nAll file interaction is disabled until the configuration is corrected and reloaded.",
         path.display(), error
@@ -2112,7 +2234,12 @@ fn draw_config_error(frame: &mut Frame, path: &std::path::Path, error: &str) {
         frame,
         "Configuration error",
         &body,
-        "e edit config · r reload · q quit",
+        &format!(
+            "{} edit config · {} reload · {} quit",
+            app.config.hotkeys.config_edit.display(),
+            app.config.hotkeys.config_reload.display(),
+            app.config.hotkeys.quit.display()
+        ),
         84,
         24,
     );
@@ -2453,6 +2580,33 @@ mod performance_tests {
         app.mode = AppMode::Help;
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         assert!(rendered_text(&terminal).contains("N              network shares"));
+    }
+
+    #[test]
+    fn footer_and_help_render_configured_hotkeys() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = toml::from_str("[hotkeys]\napps = 'F2'\nnetwork_shares = 'F3'\n").unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config,
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let backend = TestBackend::new(150, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("F2 Apps"));
+        assert!(text.contains("F3 Shares"));
+        assert!(!text.contains("M Apps"));
+
+        app.mode = AppMode::Help;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("F2              built-in apps"));
+        assert!(text.contains("F3              network shares"));
     }
 
     #[test]

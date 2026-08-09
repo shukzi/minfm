@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.3.0
+
 ### Added
 
 - Network shares: open the dedicated Samba manager with `N`, discover available
@@ -29,6 +31,9 @@
 - Media-aware erasure: offer 1/3/7-pass overwrite plus a final zero pass only
   for rotational HDDs, and controller-native NVMe Sanitize preferring an
   advertised Block Erase, Crypto Erase, or Overwrite capability in that order.
+- Configurable hotkeys: expose every letter, symbol, and function-key shortcut
+  under `[hotkeys]`, retain the established defaults, render configured values
+  throughout the TUI, and reject duplicates within each active screen.
 
 ### Changed
 
@@ -38,6 +43,9 @@
   actions in the Help popup and contextual manager footer.
 - Installer: detect distribution-specific Samba and Secret Service packages on
   Fedora, Debian/Ubuntu, and Arch, then ask before installing anything.
+- Installer: detect partition-layout, filesystem, HDD-wipe, NVMe, and
+  authentication helpers, offer the correct packages on supported
+  distributions, and verify isolated noninteractive installation in tests.
 - Device discovery: share strict `lsblk` pair parsing and system-storage
   protection between the encrypted-device and partition managers.
 - Partition UI: use responsive columns and dialogs, concise action wording,
