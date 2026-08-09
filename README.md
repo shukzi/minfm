@@ -14,29 +14,16 @@ functionality.
 
 ## Features
 
-- File and directory navigation
-- Arrow-key and Vim-style navigation
-- File search in the current directory
-- File search across the filesystem
-- Background update checks with confirmed, checksum-verified updates
-- Hidden-file toggle
-- Sorting by name, extension, size, type, permissions, and modification time
-- File size, permissions, and modification-time display
-- Multi-selection
-- Cut, copy, paste, rename, and file or directory creation
-- Copy verification
-- Operation progress
-- Clear errors and failed-operation summaries
-- Recoverable trash
-- Trash timestamps with second precision
-- Restore files from trash
-- Permanent deletion from trash
-- Protected system paths
-- Overwrite confirmations
-- Invalid-configuration protection
-- Encrypted-device manager
-- In-TUI LUKS unlock, mount, unmount, lock, and eject operations
-- Masked LUKS passphrase entry
+- **Navigation:** File and directory navigation with arrow-key and Vim-style controls
+- **Search:** Search the current directory or across the filesystem
+- **Files:** Create, rename, cut, copy, paste, and open files with a preferred text editor or default application
+- **Selection:** Multi-entry selection
+- **Display:** File size, permissions, and modification time
+- **Sorting:** Sort by name, extension, size, type, permissions, or modification time
+- **Trash:** Recoverable trash, second-precise timestamps, and permanent deletion from the trash
+- **Devices:** Integrated in-TUI disk manager with LUKS unlock, mount, unmount, lock, and safe eject
+- **Updates:** Background startup checks with checksum-verified installation
+- **Configuration:** Invalid-configuration detection with safe-operation blocking
 
 ## Install
 
