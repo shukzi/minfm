@@ -38,10 +38,10 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Run debug tests
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
 
       - name: Run release tests
-        run: cargo test --release --locked
+        run: cargo test --release --locked -- --test-threads=1
 
       - name: Build release binary
         run: cargo build --release --locked
