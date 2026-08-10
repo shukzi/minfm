@@ -37,6 +37,8 @@ esac
         .env("HOME", temp.path())
         .env("PATH", path)
         .env("MINFM_VERSION", "v-test")
+        .env_remove("XDG_BIN_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .output()
         .unwrap();
 

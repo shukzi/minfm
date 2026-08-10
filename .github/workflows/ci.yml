@@ -38,23 +38,10 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Run debug tests
-        run: |
-          set +e
-          cargo test --locked -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/minfm-debug-tests.log"
-          test_status=${PIPESTATUS[0]}
-          set -e
-          if [ "$test_status" -ne 0 ]; then
-            grep -E 'FAILED|panicked|assertion failed|error: test failed' \
-              "$RUNNER_TEMP/minfm-debug-tests.log" |
-              tail -30 |
-              while IFS= read -r line; do
-                echo "::error title=Debug test failure::$line"
-              done
-            exit "$test_status"
-          fi
+        run: cargo test --locked
 
       - name: Run release tests
-        run: cargo test --release --locked -- --test-threads=1
+        run: cargo test --release --locked
 
       - name: Build release binary
         run: cargo build --release --locked
