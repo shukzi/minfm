@@ -1,6 +1,47 @@
 # minfm changelog
 
-## Unreleased
+## v0.4.0
+
+### Added
+
+- Browser UI: show one semantic icon per entry in tree and table views, using a
+  font-independent Unicode theme by default and an optional Nerd Font theme.
+- Icon configuration: allow focused per-icon overrides for the file, directory,
+  device, and header actions minfm actually renders, with display-width
+  validation that preserves alignment.
+- Nerd Font icons: use rounded, filled monochrome glyphs so the optional theme
+  is visibly distinct from the Unicode fallback.
+- Footer: flatten browser shortcuts into one horizontally aligned shortcut rail
+  without section headers or divider columns, and wrap it to at most two rows
+  when the terminal is narrow.
+- Header actions: expose Trash, Information, Devices, Partitions, and the
+  active sort mode in the path bar with their configured shortcuts.
+- Header iconography: use a dedicated action icon set in the top-right rail so
+  those controls do not reuse browser entry symbols.
+- NVMe erasure: list every controller-reported Sanitize and secure Format
+  method, identify controller-wide versus namespace-only scope, and let the
+  user choose the method before confirmation.
+- NVMe recovery: offer Exit Sanitize Failure Mode only when the controller's
+  status log reports a failed Sanitize operation.
+
+### Changed
+
+- Browser footer: remove the solid gray background and use spaced monochrome
+  shortcut keys and labels without repeating actions now shown in the header.
+- Configuration: rename the built-in launcher shortcut from `apps` to `tools`,
+  migrate existing configuration files atomically without changing other
+  custom values or comments, and keep `apps` as a compatibility alias.
+- Installation and updates: require no icon font package, never modify terminal
+  fonts, and preserve the user's icon theme and overrides with the rest of the
+  configuration.
+- Installer reliability: check the default `xdg-open` integration and stage
+  replacement binaries beside the installed executable before the final atomic
+  rename, while leaving existing configuration untouched.
+- Partition access: add a direct configurable `partitions` shortcut, defaulting
+  to `P`, and include it in browser-context duplicate-hotkey validation.
+- NVMe safety: revalidate the selected erase capability immediately before
+  execution, retain the multi-namespace block for controller-wide Sanitize,
+  and keep secure Format scoped to the selected namespace without `--force`.
 
 ## v0.3.0
 

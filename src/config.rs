@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{de, Deserialize, Deserializer};
@@ -7,9 +12,83 @@ use serde::{de, Deserialize, Deserializer};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub ui: UiConfig,
+    pub icons: Box<IconConfig>,
     pub behavior: BehaviorConfig,
     pub open: OpenConfig,
     pub hotkeys: Box<HotkeyConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IconTheme {
+    #[default]
+    Unicode,
+    NerdFont,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IconConfig {
+    pub theme: IconTheme,
+    pub overrides: IconOverrides,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IconOverrides {
+    pub directory_closed: Option<String>,
+    pub directory_open: Option<String>,
+    pub file: Option<String>,
+    pub text: Option<String>,
+    pub code: Option<String>,
+    pub image: Option<String>,
+    pub audio: Option<String>,
+    pub video: Option<String>,
+    pub archive: Option<String>,
+    pub executable: Option<String>,
+    pub symlink: Option<String>,
+    pub block_device: Option<String>,
+    pub other: Option<String>,
+    pub trash: Option<String>,
+    pub info: Option<String>,
+    pub devices: Option<String>,
+    pub partitions: Option<String>,
+    pub sort: Option<String>,
+}
+
+impl IconConfig {
+    fn validate(&self) -> Result<(), String> {
+        let overrides = [
+            ("directory_closed", &self.overrides.directory_closed),
+            ("directory_open", &self.overrides.directory_open),
+            ("file", &self.overrides.file),
+            ("text", &self.overrides.text),
+            ("code", &self.overrides.code),
+            ("image", &self.overrides.image),
+            ("audio", &self.overrides.audio),
+            ("video", &self.overrides.video),
+            ("archive", &self.overrides.archive),
+            ("executable", &self.overrides.executable),
+            ("symlink", &self.overrides.symlink),
+            ("block_device", &self.overrides.block_device),
+            ("other", &self.overrides.other),
+            ("trash", &self.overrides.trash),
+            ("info", &self.overrides.info),
+            ("devices", &self.overrides.devices),
+            ("partitions", &self.overrides.partitions),
+            ("sort", &self.overrides.sort),
+        ];
+        for (name, value) in overrides {
+            let Some(value) = value else { continue };
+            let width = unicode_width::UnicodeWidthStr::width(value.as_str());
+            if value.chars().any(char::is_control) || !(1..=3).contains(&width) {
+                return Err(format!(
+                    "icon override {name:?} must be a printable symbol one to three terminal cells wide"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,8 +270,10 @@ pub struct HotkeyConfig {
     pub help: KeyBinding,
     pub open: KeyBinding,
     pub edit: KeyBinding,
-    pub apps: KeyBinding,
+    #[serde(alias = "apps")]
+    pub tools: KeyBinding,
     pub devices: KeyBinding,
+    pub partitions: KeyBinding,
     pub network_shares: KeyBinding,
     pub device_eject: KeyBinding,
     pub device_action: KeyBinding,
@@ -245,8 +326,9 @@ impl Default for HotkeyConfig {
             help: key("?"),
             open: key("o"),
             edit: key("e"),
-            apps: key("M"),
+            tools: key("M"),
             devices: key("m"),
+            partitions: key("P"),
             network_shares: key("N"),
             device_eject: key("e"),
             device_action: key("m"),
@@ -302,8 +384,9 @@ impl HotkeyConfig {
                 ("help", &self.help),
                 ("open", &self.open),
                 ("edit", &self.edit),
-                ("apps", &self.apps),
+                ("tools", &self.tools),
                 ("devices", &self.devices),
+                ("partitions", &self.partitions),
                 ("network_shares", &self.network_shares),
             ],
         )?;
@@ -355,7 +438,7 @@ impl HotkeyConfig {
                 ("collapse", &self.collapse),
                 ("refresh", &self.refresh),
                 ("partition_actions", &self.partition_actions),
-                ("apps", &self.apps),
+                ("tools", &self.tools),
             ],
         )?;
         self.validate_context(
@@ -365,7 +448,7 @@ impl HotkeyConfig {
                 ("down", &self.down),
                 ("up", &self.up),
                 ("expand", &self.expand),
-                ("apps", &self.apps),
+                ("tools", &self.tools),
             ],
         )?;
         self.validate_context(
@@ -492,8 +575,24 @@ pub fn load() -> ConfigLoad {
 pub fn load_from(path: PathBuf) -> ConfigLoad {
     match fs::read_to_string(&path) {
         Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(config) => match config.hotkeys.validate() {
-                Ok(()) => ConfigLoad::Valid { config, path },
+            Ok(config) => match config
+                .icons
+                .validate()
+                .and_then(|()| config.hotkeys.validate())
+            {
+                Ok(()) => {
+                    if let Some(migrated) = migrate_legacy_apps_hotkey(&text) {
+                        if let Err(error) = replace_config_atomically(&path, migrated.as_bytes()) {
+                            return ConfigLoad::Invalid {
+                                path,
+                                error: format!(
+                                    "could not migrate hotkey 'apps' to 'tools': {error}"
+                                ),
+                            };
+                        }
+                    }
+                    ConfigLoad::Valid { config, path }
+                }
                 Err(error) => ConfigLoad::Invalid { path, error },
             },
             Err(error) => ConfigLoad::Invalid {
@@ -512,6 +611,60 @@ pub fn load_from(path: PathBuf) -> ConfigLoad {
     }
 }
 
+fn migrate_legacy_apps_hotkey(text: &str) -> Option<String> {
+    let mut in_hotkeys = false;
+    let mut changed = false;
+    let mut migrated = String::with_capacity(text.len() + 1);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let declaration = trimmed.split('#').next().unwrap_or_default().trim();
+        if declaration.starts_with('[') {
+            in_hotkeys = declaration == "[hotkeys]";
+        }
+        if in_hotkeys {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                if key.trim() == "apps" {
+                    let indentation = line.len() - trimmed.len();
+                    let key_start = indentation + key.find("apps").unwrap_or_default();
+                    migrated.push_str(&line[..key_start]);
+                    migrated.push_str("tools");
+                    migrated.push_str(&line[key_start + "apps".len()..]);
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        migrated.push_str(line);
+    }
+    changed.then_some(migrated)
+}
+
+fn replace_config_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let temporary =
+        path.with_file_name(format!(".{file_name}.minfm-migrate-{}", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        if let Ok(metadata) = fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +678,8 @@ mod tests {
         };
         assert_eq!(config.open.opener, "xdg-open");
         assert_eq!(config.open.editor, "xdg-open");
+        assert_eq!(config.icons.theme, IconTheme::Unicode);
+        config.hotkeys.validate().unwrap();
     }
 
     #[test]
@@ -542,6 +697,7 @@ mod tests {
             parsed.is_ok(),
             "example config must remain loadable: {parsed:?}"
         );
+        parsed.unwrap().hotkeys.validate().unwrap();
     }
 
     #[test]
@@ -550,19 +706,47 @@ mod tests {
         assert_eq!(config.open.editor, "nano");
         assert_eq!(config.open.opener, "xdg-open");
         assert!(config.behavior.verify_copies);
-        assert_eq!(config.hotkeys.apps.display(), "M");
+        assert_eq!(config.hotkeys.tools.display(), "M");
+        assert_eq!(config.icons.theme, IconTheme::Unicode);
+    }
+
+    #[test]
+    fn icon_theme_and_focused_overrides_parse() {
+        let config = toml::from_str::<Config>(
+            "[icons]\ntheme = 'nerd-font'\n[icons.overrides]\ndirectory_closed = 'D'\nsort = 'S'\n",
+        )
+        .unwrap();
+        assert_eq!(config.icons.theme, IconTheme::NerdFont);
+        assert_eq!(
+            config.icons.overrides.directory_closed.as_deref(),
+            Some("D")
+        );
+        config.icons.validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_icon_overrides_block_startup() {
+        for value in ["", "abcd", "\n"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            std::fs::write(&path, format!("[icons.overrides]\nfile = {value:?}\n")).unwrap();
+            let ConfigLoad::Invalid { error, .. } = load_from(path) else {
+                panic!("invalid icon {value:?} must block startup");
+            };
+            assert!(error.contains("one to three terminal cells"));
+        }
     }
 
     #[test]
     fn custom_hotkeys_parse_named_keys_and_modifiers() {
         let config = toml::from_str::<Config>(
-            "[hotkeys]\napps = 'F2'\nforce_quit = 'Alt+x'\nselect = 'Tab'\n",
+            "[hotkeys]\ntools = 'F2'\nforce_quit = 'Alt+x'\nselect = 'Tab'\n",
         )
         .unwrap();
         config.hotkeys.validate().unwrap();
         assert!(config
             .hotkeys
-            .apps
+            .tools
             .matches(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)));
         assert!(config
             .hotkeys
@@ -572,6 +756,30 @@ mod tests {
             .hotkeys
             .select
             .matches(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn legacy_apps_hotkey_remains_an_alias_for_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\n[ui]\nshow_hidden = true\n\n[hotkeys]\napps = 'F2' # custom tool key\nquit = 'Q'\n",
+        )
+        .unwrap();
+        let ConfigLoad::Valid { config, .. } = load_from(path.clone()) else {
+            panic!("legacy configuration must migrate successfully");
+        };
+        assert!(config
+            .hotkeys
+            .tools
+            .matches(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)));
+        assert!(config.ui.show_hidden);
+        assert_eq!(config.hotkeys.quit.display(), "Q");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "# keep this comment\n[ui]\nshow_hidden = true\n\n[hotkeys]\ntools = 'F2' # custom tool key\nquit = 'Q'\n"
+        );
     }
 
     #[test]
@@ -587,10 +795,23 @@ mod tests {
     }
 
     #[test]
+    fn direct_partition_hotkey_cannot_conflict_with_a_browser_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[hotkeys]\npartitions = 'm'\n").unwrap();
+        let ConfigLoad::Invalid { error, .. } = load_from(path) else {
+            panic!("the direct partition hotkey must be unique in the browser context");
+        };
+        assert!(error.contains("partitions"));
+        assert!(error.contains("devices"));
+        assert!(error.contains("browser"));
+    }
+
+    #[test]
     fn universal_control_keys_cannot_be_shadowed() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
-        std::fs::write(&path, "[hotkeys]\napps = 'Enter'\n").unwrap();
+        std::fs::write(&path, "[hotkeys]\ntools = 'Enter'\n").unwrap();
         let ConfigLoad::Invalid { error, .. } = load_from(path) else {
             panic!("reserved universal controls must be rejected");
         };
