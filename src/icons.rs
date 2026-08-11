@@ -66,26 +66,6 @@ impl<'a> Icons<'a> {
         }
     }
 
-    pub fn header_trash(&self) -> &str {
-        self.resolve(&self.config.overrides.trash, "󰩹")
-    }
-
-    pub fn header_info(&self) -> &str {
-        self.resolve(&self.config.overrides.info, "󰋼")
-    }
-
-    pub fn header_devices(&self) -> &str {
-        self.resolve(&self.config.overrides.devices, "󰍹")
-    }
-
-    pub fn header_partitions(&self) -> &str {
-        self.resolve(&self.config.overrides.partitions, "󰋊")
-    }
-
-    pub fn header_sort(&self) -> &str {
-        self.resolve(&self.config.overrides.sort, "󰒺")
-    }
-
     pub fn slot(icon: &str) -> String {
         let padding = 3usize.saturating_sub(UnicodeWidthStr::width(icon));
         format!("{icon}{}", " ".repeat(padding))
@@ -211,7 +191,6 @@ mod tests {
         let config = IconConfig {
             overrides: IconOverrides {
                 directory_closed: Some("D".into()),
-                trash: Some("X".into()),
                 ..IconOverrides::default()
             },
         };
@@ -224,7 +203,6 @@ mod tests {
             icons.entry(&entry("main.rs", EntryKind::File, 0), false),
             "󰅩"
         );
-        assert_eq!(icons.header_trash(), "X");
     }
 
     #[test]

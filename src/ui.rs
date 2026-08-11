@@ -19,7 +19,7 @@ use crate::{
 };
 use unicode_width::UnicodeWidthStr;
 
-const ACCENT: Color = Color::Cyan;
+const ACCENT: Color = Color::Gray;
 const MUTED: Color = Color::DarkGray;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -61,7 +61,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let icons = Icons::new(&app.config.icons);
     let title = format!(" {}", app.current_dir.display());
     let mode = if app.config.behavior.read_only {
         "READ ONLY"
@@ -82,41 +81,29 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         "↑"
     };
     let full_actions = format!(
-        "{} {}  {} {}  {} {}  {} {}  {} {}{} {}/{}",
-        icons.header_trash(),
+        "{} Trash   {} Info   {} Devices   Sort: {} {}",
         app.config.hotkeys.trash_bin.display(),
-        icons.header_info(),
         app.config.hotkeys.info.display(),
-        icons.header_devices(),
         app.config.hotkeys.devices.display(),
-        icons.header_partitions(),
-        app.config.hotkeys.partitions.display(),
-        icons.header_sort(),
         app.sort_label(),
         arrow,
-        app.config.hotkeys.sort.display(),
-        app.config.hotkeys.reverse_sort.display(),
     );
-    let compact_actions = format!(
-        "{} {}   {} {}   {} {}   {} {}   {} {}",
-        icons.header_trash(),
-        app.config.hotkeys.trash_bin.display(),
-        icons.header_info(),
-        app.config.hotkeys.info.display(),
-        icons.header_devices(),
-        app.config.hotkeys.devices.display(),
-        icons.header_partitions(),
-        app.config.hotkeys.partitions.display(),
-        icons.header_sort(),
-        app.config.hotkeys.sort.display(),
-    );
-    let actions = if usize::from(inner.width) >= UnicodeWidthStr::width(full_actions.as_str()) + 18
-    {
-        full_actions
+    let compact = usize::from(inner.width) < UnicodeWidthStr::width(full_actions.as_str()) + 18;
+    let action_width = if compact {
+        UnicodeWidthStr::width(
+            format!(
+                "{}  {}  {}  Sort {}",
+                app.config.hotkeys.trash_bin.display(),
+                app.config.hotkeys.info.display(),
+                app.config.hotkeys.devices.display(),
+                arrow
+            )
+            .as_str(),
+        )
     } else {
-        compact_actions
+        UnicodeWidthStr::width(full_actions.as_str())
     };
-    let action_width = u16::try_from(UnicodeWidthStr::width(actions.as_str())).unwrap_or(u16::MAX);
+    let action_width = u16::try_from(action_width).unwrap_or(u16::MAX);
     let columns = Layout::horizontal([
         Constraint::Min(4),
         Constraint::Length(action_width.min(inner.width.saturating_sub(4))),
@@ -134,13 +121,40 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         columns[0],
     );
     frame.render_widget(
-        Paragraph::new(actions).alignment(Alignment::Right).style(
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(header_action_line(app, arrow, compact)).alignment(Alignment::Right),
         columns[1],
     );
+}
+
+fn header_action_line(app: &App, arrow: &str, compact: bool) -> Line<'static> {
+    let key_style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(MUTED);
+    let mut spans = Vec::new();
+    for (key, label) in [
+        (app.config.hotkeys.trash_bin.display(), "Trash"),
+        (app.config.hotkeys.info.display(), "Info"),
+        (app.config.hotkeys.devices.display(), "Devices"),
+    ] {
+        if !spans.is_empty() {
+            spans.push(Span::raw(if compact { "  " } else { "   " }));
+        }
+        spans.push(Span::styled(key.to_owned(), key_style));
+        if !compact {
+            spans.push(Span::styled(format!(" {label}"), label_style));
+        }
+    }
+    spans.push(Span::raw(if compact { "  " } else { "   " }));
+    spans.push(Span::styled(
+        if compact {
+            format!("Sort {arrow}")
+        } else {
+            format!("Sort: {} {arrow}", app.sort_label())
+        },
+        label_style,
+    ));
+    Line::from(spans)
 }
 
 fn draw_browser(frame: &mut Frame, app: &App, area: Rect) {
@@ -179,7 +193,10 @@ fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
             let expanded =
                 entry.kind == EntryKind::Directory && app.is_tree_directory_expanded(&entry.path);
             let name = Line::from(vec![
-                Span::raw("  ".repeat(depth)),
+                Span::styled(
+                    tree_line_prefix(app, index, depth),
+                    Style::default().fg(MUTED),
+                ),
                 icon_span(Icons::slot(icons.entry(entry, expanded))),
                 Span::raw(" "),
                 Span::raw(entry.name.clone()),
@@ -239,6 +256,36 @@ fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
     let selected = (!app.entries.is_empty()).then_some(app.cursor.saturating_sub(start));
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn tree_line_prefix(app: &App, index: usize, depth: usize) -> String {
+    let mut prefix = String::with_capacity(depth.saturating_mul(4) + 4);
+    for ancestor_depth in 0..depth {
+        if has_later_tree_sibling(app, index, ancestor_depth) {
+            prefix.push_str("│   ");
+        } else {
+            prefix.push_str("    ");
+        }
+    }
+    if has_later_tree_sibling(app, index, depth) {
+        prefix.push_str("├── ");
+    } else {
+        prefix.push_str("└── ");
+    }
+    prefix
+}
+
+fn has_later_tree_sibling(app: &App, index: usize, depth: usize) -> bool {
+    for candidate in index.saturating_add(1)..app.entries.len() {
+        let candidate_depth = app.tree_depth(candidate);
+        if candidate_depth < depth {
+            return false;
+        }
+        if candidate_depth == depth {
+            return true;
+        }
+    }
+    false
 }
 
 fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
@@ -409,9 +456,9 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
             app.config.hotkeys.quit.display(),
         )),
         AppMode::Partitions(view) => Some(partition_shortcuts(app, view)),
-        AppMode::Prompt(
-            Prompt::PartitionAuthentication { .. } | Prompt::PartitionNvmeCapabilities { .. },
-        ) => Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into()),
+        AppMode::Prompt(Prompt::PartitionAuthentication { .. }) => {
+            Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into())
+        }
         _ => Some(" A dialog owns input · File shortcuts are disabled until it closes. ".into()),
     };
     if let Some(context) = context {
@@ -538,13 +585,12 @@ fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -> String {
         None => {
             let exit = if app.partition_returns_to_apps() {
                 format!(
-                    "{}/Esc Apps · {} Browser",
-                    app.config.hotkeys.tools.display(),
+                    "Esc Back to menu · {} Files",
                     app.config.hotkeys.quit.display()
                 )
             } else {
                 format!(
-                    "Esc/{} Browser · {} Tools",
+                    "Esc/{} Back to files · {} Menu",
                     app.config.hotkeys.quit.display(),
                     app.config.hotkeys.tools.display()
                 )
@@ -559,10 +605,12 @@ fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -> String {
         Some(crate::app::PartitionOverlay::FormatOptions { .. }) => {
             return format!(" ↑↓/{down}/{up} Choose filesystem · Enter Continue · Esc Back ")
         }
-        Some(crate::app::PartitionOverlay::NvmeEraseOptions { .. }) => {
-            return format!(
-                " ↑↓/{down}/{up} Choose supported NVMe method · Enter Review · Esc Back "
-            )
+        Some(crate::app::PartitionOverlay::EncryptionFilesystem { .. }) => {
+            return format!(" ↑↓/{down}/{up} Choose inner filesystem · Enter Continue · Esc Back ")
+        }
+        Some(crate::app::PartitionOverlay::EncryptionPassphrase { .. })
+        | Some(crate::app::PartitionOverlay::ChangePassphrase { .. }) => {
+            " Enter Continue · Esc Back "
         }
         Some(crate::app::PartitionOverlay::DiskLayoutOptions { .. }) => {
             return format!(" ↑↓/{down}/{up} Choose layout · Enter Review · Esc Back ")
@@ -719,7 +767,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             error,
         } => {
             let area = centered(frame.area(), 80, 16);
-            frame.render_widget(Clear, area);
+            draw_popup_halo(frame, area);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(" Unlock and mount LUKS volume ");
@@ -790,7 +838,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 .split(inner);
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Action: {}\nDevice: {}\n\nEnter your administrator password to continue.",
+                    "{}\n{}\n\nAdministrator password required.",
                     action.title(),
                     action.target().path.display()
                 )),
@@ -805,7 +853,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             frame.render_widget(
                 Paragraph::new(
                     error.as_deref().unwrap_or(
-                        "The password is passed directly to sudo and is never displayed.",
+                        "Sent only to sudo.",
                     ),
                 )
                 .style(Style::default().fg(if error.is_some() {
@@ -817,52 +865,6 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             );
             frame.render_widget(
                 Paragraph::new("Enter authenticate · Esc cancel")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(ACCENT)),
-                rows[3],
-            );
-        }
-        Prompt::PartitionNvmeCapabilities {
-            view, input, error, ..
-        } => {
-            let area = responsive_centered(frame.area(), 72, 56, 90, 13);
-            frame.render_widget(Clear, area);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(" NVMe capability authentication ");
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            let rows = Layout::vertical([
-                Constraint::Length(4),
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-            let target = view
-                .entries
-                .get(view.selected)
-                .map(|entry| entry.device.path.display().to_string())
-                .unwrap_or_else(|| "selected NVMe drive".into());
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "Device: {target}\n\nAdministrator access is required to read this drive's supported erase methods."
-                )),
-                rows[0],
-            );
-            frame.render_widget(
-                Paragraph::new(format!("> {}", "•".repeat(input.character_count())))
-                    .block(Block::default().borders(Borders::ALL).title(" Password "))
-                    .style(Style::default().fg(ACCENT)),
-                rows[1],
-            );
-            frame.render_widget(
-                Paragraph::new(error.as_deref().unwrap_or(""))
-                    .style(Style::default().fg(Color::Red)),
-                rows[2],
-            );
-            frame.render_widget(
-                Paragraph::new("Enter inspect capabilities · Esc cancel")
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(ACCENT)),
                 rows[3],
@@ -1017,6 +1019,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
         Prompt::Message { title, body } => {
             message_modal(frame, title, body, "Enter/Esc close", 72, 12)
         }
+        Prompt::SmartReport { body, scroll, .. } => smart_report_modal(frame, body, *scroll),
         Prompt::OpenError { body, .. } => message_modal(
             frame,
             "Unable to open file",
@@ -1437,7 +1440,7 @@ fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView) {
                 .join(", ")
         };
         let style = if entry.protected {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(Color::Gray)
         } else if device.is_disk() {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
@@ -1456,11 +1459,11 @@ fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView) {
     });
     let title = if app.partition_refreshing {
         format!(
-            " Partition manager · refreshing · {} device(s) ",
+            " Device manager · refreshing · {} device(s) ",
             view.entries.len()
         )
     } else {
-        format!(" Partition manager · {} device(s) ", view.entries.len())
+        format!(" Device manager · {} device(s) ", view.entries.len())
     };
     let table = Table::new(rows, partition_table_widths(area.width))
         .header(
@@ -1532,7 +1535,7 @@ fn draw_partition_overlay(
             let tasks = app.partition_tasks_for_view(view);
             let height = (tasks.len() as u16 + 7).clamp(10, 18);
             let area = responsive_centered(frame.area(), 92, 64, 150, height);
-            frame.render_widget(Clear, area);
+            draw_popup_halo(frame, area);
             let sections = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(4), Constraint::Length(3)])
@@ -1547,7 +1550,7 @@ fn draw_partition_overlay(
                 };
                 let risk_style = match task.risk() {
                     "Erases data" => Style::default().fg(Color::Red),
-                    "Changes layout" => Style::default().fg(Color::Yellow),
+                    "Changes layout" => Style::default().fg(Color::Gray),
                     _ => Style::default().fg(ACCENT),
                 };
                 Row::new(vec![
@@ -1593,29 +1596,67 @@ fn draw_partition_overlay(
                 sections[1],
             );
         }
-        PartitionOverlay::FormatOptions { selected } => {
+        PartitionOverlay::FormatOptions {
+            selected,
+            encrypted,
+        } => {
             let target = view
                 .entries
                 .get(view.selected)
                 .map(|entry| entry.device.path.display().to_string())
                 .unwrap_or_else(|| "selected device".into());
-            draw_format_options(frame, &target, *selected);
+            draw_format_options(frame, &target, *selected, *encrypted);
         }
-        PartitionOverlay::NvmeEraseOptions { selected, methods } => {
+        PartitionOverlay::EncryptionFilesystem {
+            selected,
+            whole_disk,
+        } => {
             let target = view
                 .entries
                 .get(view.selected)
                 .map(|entry| entry.device.path.display().to_string())
-                .unwrap_or_else(|| "selected NVMe drive".into());
-            draw_nvme_erase_options(frame, &target, methods, *selected);
+                .unwrap_or_else(|| "selected storage".into());
+            draw_encryption_filesystems(frame, &target, *selected, *whole_disk);
         }
-        PartitionOverlay::DiskLayoutOptions { selected } => {
+        PartitionOverlay::EncryptionPassphrase {
+            filesystem,
+            passphrase,
+            confirmation,
+            confirming,
+            error,
+            ..
+        } => draw_encryption_passphrase(
+            frame,
+            *filesystem,
+            passphrase.character_count(),
+            confirmation.character_count(),
+            *confirming,
+            error.as_deref(),
+        ),
+        PartitionOverlay::ChangePassphrase {
+            old,
+            new,
+            confirmation,
+            stage,
+            error,
+        } => draw_change_passphrase(
+            frame,
+            old.character_count(),
+            new.character_count(),
+            confirmation.character_count(),
+            *stage,
+            error.as_deref(),
+        ),
+        PartitionOverlay::DiskLayoutOptions {
+            selected,
+            overwrite,
+        } => {
             let target = view
                 .entries
                 .get(view.selected)
                 .map(|entry| entry.device.path.display().to_string())
                 .unwrap_or_else(|| "selected disk".into());
-            draw_disk_layout_options(frame, &target, *selected);
+            draw_disk_layout_options(frame, &target, *selected, *overwrite);
         }
         PartitionOverlay::FreeRegionOptions { selected } => {
             let (target, regions) = view
@@ -1653,6 +1694,7 @@ fn draw_partition_overlay(
             input,
             cursor,
             error,
+            ..
         } => draw_partition_input(
             frame,
             "Optional label",
@@ -1687,90 +1729,240 @@ fn draw_partition_overlay(
     }
 }
 
-fn draw_format_options(frame: &mut Frame, target: &str, selected: usize) {
-    let area = responsive_centered(frame.area(), 80, 60, 110, 14);
-    frame.render_widget(Clear, area);
+fn draw_format_options(frame: &mut Frame, target: &str, selected: usize, encrypted: bool) {
+    let area = responsive_centered(frame.area(), 80, 60, 110, 17);
+    draw_popup_halo(frame, area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
         .split(area);
     let rows = Filesystem::ALL
         .into_iter()
-        .map(|filesystem| Row::new([filesystem.name(), filesystem.description()]));
-    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(30)])
-        .header(Row::new(["Filesystem", "Best for"]).style(Style::default().fg(MUTED)))
-        .row_highlight_style(Style::default().bg(Color::DarkGray))
-        .highlight_symbol("> ")
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Format {target} ")),
-        );
-    let mut state = TableState::default().with_selected(Some(selected));
-    frame.render_stateful_widget(table, sections[0], &mut state);
-    frame.render_widget(
-        Paragraph::new("Choose a filesystem · Enter continue · Esc back")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(ACCENT))
-            .block(Block::default().borders(Borders::ALL)),
-        sections[1],
-    );
-}
-
-fn draw_nvme_erase_options(
-    frame: &mut Frame,
-    target: &str,
-    methods: &[crate::partition::NvmeEraseMethod],
-    selected: usize,
-) {
-    let height = (methods.len() as u16 + 7).clamp(11, 16);
-    let area = responsive_centered(frame.area(), 92, 65, 130, height);
-    frame.render_widget(Clear, area);
-    let sections = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).split(area);
-    let rows = methods.iter().copied().map(|method| {
-        let scope = match method {
-            crate::partition::NvmeEraseMethod::SanitizeBlockErase
-            | crate::partition::NvmeEraseMethod::SanitizeCryptoErase
-            | crate::partition::NvmeEraseMethod::SanitizeOverwrite => "Controller-wide",
-            crate::partition::NvmeEraseMethod::FormatUserDataErase
-            | crate::partition::NvmeEraseMethod::FormatCryptoErase => "Namespace only",
-            crate::partition::NvmeEraseMethod::ExitFailureMode => "Recovery",
-        };
-        Row::new([method.name(), scope, method.description()])
-    });
+        .enumerate()
+        .map(|(index, filesystem)| {
+            Row::new([
+                if index < 3 { "Primary" } else { "Other" },
+                filesystem.name(),
+                filesystem.description(),
+            ])
+        });
     let table = Table::new(
         rows,
         [
-            Constraint::Length(30),
-            Constraint::Length(17),
-            Constraint::Min(28),
+            Constraint::Length(9),
+            Constraint::Length(14),
+            Constraint::Min(30),
         ],
     )
-    .header(Row::new(["Available method", "Scope", "Effect"]).style(Style::default().fg(MUTED)))
-    .row_highlight_style(
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
+    .header(Row::new(["Group", "Filesystem", "Best for"]).style(Style::default().fg(MUTED)))
+    .row_highlight_style(Style::default().bg(Color::DarkGray))
     .highlight_symbol("> ")
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" NVMe methods reported by {target} ")),
+            .title(format!(" Format {target} ")),
     );
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
-        Paragraph::new("Only controller-reported methods are shown · Enter review · Esc back")
+        Paragraph::new(format!(
+            "[{}] Password protection (LUKS2)",
+            if encrypted { "x" } else { " " }
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(if encrypted { Color::White } else { MUTED }))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Press e to toggle "),
+        ),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter continue · Esc back")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT))
             .block(Block::default().borders(Borders::ALL)),
+        sections[2],
+    );
+}
+
+fn draw_popup_halo(frame: &mut Frame, area: Rect) {
+    let frame_area = frame.area();
+    let left = area.x.saturating_sub(1).max(frame_area.x);
+    let top = area.y.saturating_sub(1).max(frame_area.y);
+    let right = area.right().saturating_add(1).min(frame_area.right());
+    let bottom = area.bottom().saturating_add(1).min(frame_area.bottom());
+    let halo = Rect::new(
+        left,
+        top,
+        right.saturating_sub(left),
+        bottom.saturating_sub(top),
+    );
+    frame.render_widget(Clear, halo);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(0x00, 0x00, 0x00))),
+        halo,
+    );
+}
+
+fn draw_encryption_filesystems(frame: &mut Frame, target: &str, selected: usize, whole_disk: bool) {
+    let area = responsive_centered(frame.area(), 84, 60, 115, 14);
+    frame.render_widget(Clear, area);
+    let sections = Layout::vertical([Constraint::Min(8), Constraint::Length(3)]).split(area);
+    let rows = Filesystem::ALL
+        .into_iter()
+        .map(|filesystem| Row::new([filesystem.name(), filesystem.description()]));
+    let title = if whole_disk {
+        format!(" Filesystem inside encrypted GPT disk · {target} ")
+    } else {
+        format!(" Filesystem inside LUKS2 · {target} ")
+    };
+    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(30)])
+        .header(Row::new(["Filesystem", "Best for"]).style(Style::default().fg(MUTED)))
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ")
+        .block(Block::default().borders(Borders::ALL).title(title));
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new(
+            "Choose the filesystem stored inside encryption · Enter continue · Esc back",
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT))
+        .block(Block::default().borders(Borders::ALL)),
         sections[1],
     );
 }
 
-fn draw_disk_layout_options(frame: &mut Frame, target: &str, selected: usize) {
+fn draw_encryption_passphrase(
+    frame: &mut Frame,
+    filesystem: Filesystem,
+    passphrase_length: usize,
+    confirmation_length: usize,
+    confirming: bool,
+    error: Option<&str>,
+) {
+    let area = responsive_centered(frame.area(), 76, 58, 100, 15);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" LUKS2 encryption passphrase ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "The unlocked container will be formatted as {}. Store this passphrase safely; it cannot be recovered.",
+            filesystem.name()
+        ))
+        .wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("> {}", "•".repeat(passphrase_length)))
+            .block(Block::default().borders(Borders::ALL).title(" Passphrase "))
+            .style(Style::default().fg(if confirming { MUTED } else { ACCENT })),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("> {}", "•".repeat(confirmation_length)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Confirm passphrase "),
+            )
+            .style(Style::default().fg(if confirming { ACCENT } else { MUTED })),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(error.unwrap_or(if confirming {
+            "Enter the same passphrase again."
+        } else {
+            "Use at least 8 characters, then press Enter."
+        }))
+        .style(Style::default().fg(if error.is_some() { Color::Red } else { MUTED })),
+        rows[3],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter continue · Esc back")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[4],
+    );
+}
+
+fn draw_change_passphrase(
+    frame: &mut Frame,
+    old_length: usize,
+    new_length: usize,
+    confirmation_length: usize,
+    stage: u8,
+    error: Option<&str>,
+) {
+    let area = responsive_centered(frame.area(), 72, 58, 100, 16);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Change LUKS passphrase ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new("Enter the current key, then the new key twice."),
+        rows[0],
+    );
+    for (index, (title, length, row)) in [
+        (" Current passphrase ", old_length, rows[1]),
+        (" New passphrase ", new_length, rows[2]),
+        (" Confirm new passphrase ", confirmation_length, rows[3]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        frame.render_widget(
+            Paragraph::new(format!("> {}", "•".repeat(length)))
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .style(Style::default().fg(if index == stage as usize {
+                    ACCENT
+                } else {
+                    MUTED
+                })),
+            row,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(error.unwrap_or("Passphrases are never shown or stored."))
+            .style(Style::default().fg(if error.is_some() { Color::Red } else { MUTED })),
+        rows[4],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter continue · Esc back").alignment(Alignment::Center),
+        rows[5],
+    );
+}
+
+fn draw_disk_layout_options(frame: &mut Frame, target: &str, selected: usize, overwrite: bool) {
     let area = responsive_centered(frame.area(), 80, 58, 110, 12);
     frame.render_widget(Clear, area);
     let sections = Layout::default()
@@ -1804,10 +1996,13 @@ fn draw_disk_layout_options(frame: &mut Frame, target: &str, selected: usize) {
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
-        Paragraph::new("Choose the resulting disk layout · Enter review · Esc back")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(ACCENT))
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(format!(
+            "w Full overwrite: {} · Enter review · Esc back",
+            if overwrite { "on" } else { "off" }
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ACCENT))
+        .block(Block::default().borders(Borders::ALL)),
         sections[1],
     );
 }
@@ -1922,7 +2117,7 @@ fn draw_partition_confirmation(
         .border_style(Style::default().fg(if erases_data {
             Color::Red
         } else if destructive {
-            Color::Yellow
+            Color::Gray
         } else {
             ACCENT
         }))
@@ -1949,7 +2144,7 @@ fn draw_partition_confirmation(
             .style(Style::default().fg(if erases_data {
                 Color::Red
             } else if destructive {
-                Color::Yellow
+                Color::Gray
             } else {
                 MUTED
             })),
@@ -2181,10 +2376,18 @@ fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
     frame.render_widget(Clear, area);
     let rows = view.devices.iter().map(|device| {
         Row::new(vec![
-            Cell::from(device.source.display().to_string()),
+            Cell::from(format!(
+                "{}{}",
+                "  ".repeat((device.kind != "disk") as usize),
+                device.source.display()
+            )),
             Cell::from(device.label.clone().unwrap_or_else(|| "—".into())),
             Cell::from(human_size(device.size)),
-            Cell::from(device.state_text()),
+            Cell::from(if device.encrypted {
+                format!("LUKS · {}", device.state_text())
+            } else {
+                device.state_text().into()
+            }),
             Cell::from(
                 device
                     .mountpoints
@@ -2211,10 +2414,11 @@ fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
     )
     .row_highlight_style(Style::default().bg(Color::DarkGray))
     .highlight_symbol("> ")
-    .block(Block::default().borders(Borders::ALL).title(format!(
-        " Encrypted devices · {} found ",
-        view.devices.len()
-    )));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Storage devices · {} found ", view.devices.len())),
+    );
     let mut state = TableState::default().with_selected(if view.devices.is_empty() {
         None
     } else {
@@ -2234,14 +2438,21 @@ fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
             if device.system_protected {
                 return "Protected system volume · disk actions unavailable".to_string();
             }
-            let mut action = if device.is_locked() {
+            let mut action = if !device.encrypted && device.filesystem.is_none() {
+                "No directly mountable filesystem".to_string()
+            } else if device.encrypted && device.is_locked() {
                 format!(
                     "Enter/{} unlock and mount",
                     app.config.hotkeys.device_unmount.display()
                 )
-            } else if device.is_mounted() {
+            } else if device.encrypted && device.is_mounted() {
                 format!(
                     "Enter/{} unmount and lock",
+                    app.config.hotkeys.device_unmount.display()
+                )
+            } else if device.is_mounted() {
+                format!(
+                    "Enter/{} unmount",
                     app.config.hotkeys.device_unmount.display()
                 )
             } else {
@@ -2261,7 +2472,7 @@ fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
             if app.device_refreshing {
                 "Refreshing devices…".into()
             } else {
-                "No encrypted volumes found".into()
+                "No storage devices found".into()
             }
         });
     frame.render_widget(
@@ -2397,14 +2608,14 @@ fn draw_network_progress(frame: &mut Frame) {
 fn draw_help(frame: &mut Frame, app: &App) {
     let h = &app.config.hotkeys;
     let body = format!(
-        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nTools and devices\n  {}              built-in tools launcher\n  {}              encrypted device manager\n  {}              partition manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
+        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nTools and devices\n  {}              built-in tools launcher\n  {}              device manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
         h.up.display(), h.down.display(), h.expand.display(), h.collapse.display(),
         h.toggle_view.display(), h.go_to.display(), h.search.display(), h.search_filesystem.display(),
         h.cut.display(), h.copy.display(), h.paste.display(), h.select.display(), h.edit.display(),
         h.rename.display(), h.trash.display(), h.quick_trash.display(), h.trash_bin.display(),
         h.select.display(), h.restore.display(), h.permanent_delete.display(),
         h.quick_permanent_delete.display(), h.clear_trash.display(), h.create_file.display(),
-        h.create_directory.display(), h.tools.display(), h.devices.display(), h.partitions.display(),
+        h.create_directory.display(), h.tools.display(), h.devices.display(),
         h.device_eject.display(), h.network_shares.display(), h.network_add.display(),
         h.network_disconnect.display(), h.network_forget.display(), h.refresh.display(),
         h.hidden.display(), h.sort.display(), h.reverse_sort.display(), h.info.display(),
@@ -2418,7 +2629,7 @@ fn draw_info(frame: &mut Frame, app: &App) {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
     let body = format!(
-        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}\n  gio: {}\n  secret-tool: {}\n  parted: {}\n  wipefs: {}\n  sfdisk: {}\n  shred: {}\n  nvme: {}\n  sudo: {}",
+        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}\n  smartctl: {}\n  hdparm: {}\n  gio: {}\n  secret-tool: {}\n  parted: {}\n  wipefs: {}\n  sfdisk: {}\n  sudo: {}",
         env!("CARGO_PKG_VERSION"),
         binary,
         app.config_path.display(),
@@ -2430,13 +2641,13 @@ fn draw_info(frame: &mut Frame, app: &App) {
         availability("lsblk"),
         availability("udisksctl"),
         availability("cryptsetup"),
+        availability("smartctl"),
+        availability("hdparm"),
         availability("gio"),
         availability("secret-tool"),
         availability("parted"),
         availability("wipefs"),
         availability("sfdisk"),
-        availability("shred"),
-        availability("nvme"),
         availability("sudo"),
     );
     message_modal(
@@ -2692,8 +2903,37 @@ fn message_modal(
     );
 }
 
+fn smart_report_modal(frame: &mut Frame, body: &str, scroll: u16) {
+    let content_lines = body.lines().count().max(1) as u16;
+    let desired_height = content_lines.saturating_add(3).clamp(6, 20);
+    let area = responsive_centered(frame.area(), 84, 70, 96, desired_height);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" SMART report ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let maximum_scroll = content_lines.saturating_sub(rows[0].height);
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(maximum_scroll), 0)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("↑/↓ scroll · PageUp/PageDown jump · Enter/Esc close")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+}
+
 fn partition_error_modal(frame: &mut Frame, body: &str) {
-    let area = responsive_centered(frame.area(), 82, 58, 100, 20);
+    let area = responsive_centered(frame.area(), 76, 52, 96, 14);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2716,7 +2956,7 @@ fn partition_error_modal(frame: &mut Frame, body: &str) {
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new("Enter/Esc return to partition manager")
+        Paragraph::new("Enter/Esc return")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT)),
         rows[1],
@@ -2819,6 +3059,40 @@ mod performance_tests {
     }
 
     #[test]
+    fn expanded_tree_renders_continuing_and_last_branch_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("alpha/child")).unwrap();
+        std::fs::create_dir(temp.path().join("beta")).unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+
+        assert!(text.contains("├──"), "the first root entry needs a branch");
+        assert!(
+            text.contains("│   └──"),
+            "an expanded child needs its ancestor continuation"
+        );
+        assert!(
+            text.contains("└──"),
+            "the final sibling needs an end branch"
+        );
+    }
+
+    #[test]
     fn footer_and_help_expose_the_network_share_hotkey() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = App::new(
@@ -2843,7 +3117,7 @@ mod performance_tests {
     fn footer_and_help_render_configured_hotkeys() {
         let temp = tempfile::tempdir().unwrap();
         let config =
-            toml::from_str("[hotkeys]\ntools = 'F2'\nnetwork_shares = 'F3'\npartitions = 'F4'\n")
+            toml::from_str("[hotkeys]\ntools = 'F2'\nnetwork_shares = 'F3'\ndevices = 'F4'\n")
                 .unwrap();
         let mut app = App::new(
             temp.path().to_path_buf(),
@@ -2859,7 +3133,7 @@ mod performance_tests {
         let text = rendered_text(&terminal);
         assert!(text.contains("F2 Tools"));
         assert!(text.contains("F3 Shares"));
-        assert!(text.contains("󰋊 F4"));
+        assert!(text.contains("F4"));
         assert!(!text.contains("M Tools"));
 
         app.mode = AppMode::Help;
@@ -2867,7 +3141,7 @@ mod performance_tests {
         let text = rendered_text(&terminal);
         assert!(text.contains("F2              built-in tools launcher"));
         assert!(text.contains("F3              network shares"));
-        assert!(text.contains("F4              partition manager"));
+        assert!(text.contains("F4              device manager"));
     }
 
     #[test]
@@ -2886,18 +3160,18 @@ mod performance_tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|frame| draw(frame, &app)).unwrap();
             let text = rendered_text(&terminal);
-            assert!(text.contains('󰩹'), "missing trash action at {width}");
-            assert!(text.contains('󰋼'), "missing info action at {width}");
-            assert!(text.contains('󰋊'), "missing partitions action at {width}");
+            assert!(!text.contains('󰩹'), "old trash icon at {width}");
+            assert!(!text.contains('󰋼'), "old info icon at {width}");
+            assert!(!text.contains('󰍹'), "old device icon at {width}");
+            assert!(text.contains("Sort"), "missing sort status at {width}");
         }
     }
 
     #[test]
-    fn header_actions_follow_configured_icon_overrides() {
+    fn removed_header_icon_overrides_do_not_change_the_text_bar() {
         let temp = tempfile::tempdir().unwrap();
         let config =
-            toml::from_str("[icons.overrides]\ntrash = 'X'\ninfo = 'Y'\npartitions = 'Z'\n")
-                .unwrap();
+            toml::from_str("[icons.overrides]\ntrash = 'X'\ninfo = 'Y'\ndevices = 'Z'\n").unwrap();
         let app = App::new(
             temp.path().to_path_buf(),
             ConfigLoad::Valid {
@@ -2910,9 +3184,9 @@ mod performance_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = rendered_text(&terminal);
-        assert!(text.contains('X'));
-        assert!(text.contains('Y'));
-        assert!(text.contains('Z'));
+        assert!(text.contains("Trash"));
+        assert!(text.contains("Info"));
+        assert!(text.contains("Devices"));
         assert!(!text.contains('󰋼'));
     }
 
@@ -3001,7 +3275,7 @@ mod performance_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Partition manager"));
+        assert!(rendered.contains("Device manager"));
         assert!(rendered.contains("sda1"));
         assert!(rendered.contains("Protected system storage"));
         assert!(rendered.contains("UUID: test-uuid"));
@@ -3038,7 +3312,7 @@ mod performance_tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Create partition"));
-        assert!(rendered.contains("Reset disk"));
+        assert!(rendered.contains("Format disk"));
 
         if let AppMode::Partitions(view) = &mut app.mode {
             view.overlay = Some(PartitionOverlay::FreeRegionOptions { selected: 0 });
@@ -3056,7 +3330,10 @@ mod performance_tests {
         assert!(rendered.contains("Choose free space"));
 
         if let AppMode::Partitions(view) = &mut app.mode {
-            view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected: 0 });
+            view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                selected: 0,
+                overwrite: false,
+            });
         }
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let rendered = terminal
@@ -3073,7 +3350,10 @@ mod performance_tests {
 
         if let AppMode::Partitions(view) = &mut app.mode {
             view.selected = 1;
-            view.overlay = Some(PartitionOverlay::FormatOptions { selected: 0 });
+            view.overlay = Some(PartitionOverlay::FormatOptions {
+                selected: 0,
+                encrypted: false,
+            });
         }
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let rendered = terminal
@@ -3145,7 +3425,7 @@ mod performance_tests {
             _ => unreachable!(),
         };
         app.mode = AppMode::Prompt(Prompt::PartitionError {
-            body: "Action: Erase NVMe\nDevice: /dev/nvme0n1\n\nReason:\nThis controller does not support NVMe Sanitize. No erase command was started."
+            body: "Action: Format\nDevice: /dev/sdb1\n\nReason:\nThe filesystem tool failed before formatting started."
                 .into(),
             view,
         });
@@ -3158,9 +3438,9 @@ mod performance_tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Partition operation failed"));
-        assert!(rendered.contains("Erase NVMe"));
-        assert!(rendered.contains("No erase command was started"));
-        assert!(rendered.contains("return to partition manager"));
+        assert!(rendered.contains("Format"));
+        assert!(rendered.contains("failed before formatting started"));
+        assert!(rendered.contains("Enter/Esc return"));
     }
 
     #[test]

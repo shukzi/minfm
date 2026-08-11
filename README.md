@@ -23,11 +23,11 @@ functionality.
 - **Icons:** Rounded monochrome icons with focused per-icon overrides
 - **Sorting:** Sort by name, extension, size, type, permissions, or modification time
 - **Trash:** Recoverable trash, second-precise timestamps, and permanent deletion from the trash
-- **Devices:** Integrated in-TUI disk manager with LUKS unlock, mount, unmount, lock, and safe eject
+- **Devices:** One contextual manager for disk formatting, partition and
+  filesystem maintenance, raw images, SMART tests, ATA drive settings, LUKS,
+  persistent mount/encryption options, and safe eject
 - **Network:** Discover, add, open, remember, and safely disconnect Samba shares
-- **Tools:** Open the built-in launcher with `M` for device, partition, and network-share managers
-- **Partitions:** Inspect block topology, format common filesystems, create GPT or
-  MBR partition tables, and create partitions in available space
+- **Tools:** Open the built-in launcher with `M` for device management and network shares
 - **Updates:** Background startup checks with checksum-verified installation
 - **Configuration:** Invalid-configuration detection with safe-operation blocking
 
@@ -77,20 +77,28 @@ and shows what is missing. It then asks whether it may install the corresponding
 packages with your distribution's package manager. Nothing is installed without
 your confirmation.
 
-These are the packages minfm checks for and may offer to install:
+The installer supports Fedora, Debian/Ubuntu, and Arch Linux. These package
+names are the same on all three:
 
-| Capability | Fedora | Debian/Ubuntu | Arch Linux |
-| --- | --- | --- | --- |
-| Icon rendering | `fontconfig` | `fontconfig` | `fontconfig` |
-| Open files with the desktop default | `xdg-utils` | `xdg-utils` | `xdg-utils` |
-| Devices and LUKS | `util-linux`, `udisks2`, `cryptsetup` | `util-linux`, `udisks2`, `cryptsetup` | `util-linux`, `udisks2`, `cryptsetup` |
-| Samba shares and saved credentials | `gvfs-smb`, `libsecret` | `gvfs-backends`, `libsecret-tools` | `gvfs-smb`, `libsecret` |
-| Partition management | `parted`, `util-linux`, `sudo` | `parted`, `util-linux`, `sudo` | `parted`, `util-linux`, `sudo` |
-| NVMe erasure | `nvme-cli` | `nvme-cli` | `nvme-cli` |
-| ext4, XFS, Btrfs, FAT32, and exFAT | `e2fsprogs`, `xfsprogs`, `btrfs-progs`, `dosfstools`, `exfatprogs` | `e2fsprogs`, `xfsprogs`, `btrfs-progs`, `dosfstools`, `exfatprogs` | `e2fsprogs`, `xfsprogs`, `btrfs-progs`, `dosfstools`, `exfatprogs` |
+`fontconfig`, `xdg-utils`, `util-linux`, `udisks2`, `cryptsetup`,
+`smartmontools`, `hdparm`, `parted`, `sudo`, `coreutils`, `e2fsprogs`,
+`ntfs-3g`, `dosfstools`, `xfsprogs`, `btrfs-progs`, `f2fs-tools`,
+`exfatprogs`, and `udftools`.
+
+Only the Samba package names differ:
+
+- Fedora and Arch Linux: `gvfs-smb`, `libsecret`
+- Debian and Ubuntu: `gvfs-backends`, `libsecret-tools`
 
 You may decline any package prompt and continue using the basic file manager.
 Features whose helpers are unavailable will explain what they need when opened.
+
+Open Device Manager through `M`, or directly with `m`. Actions are contextual:
+unsupported or unsafe choices remain visible with a short reason. Eject first
+unmounts filesystems and locks LUKS mappings belonging to that drive. Formatting
+offers Ext4, NTFS, and FAT first; XFS, swap, Btrfs, F2FS, exFAT, UDF, and no
+filesystem are under Other. Password protection is a LUKS2 toggle, independent
+of the filesystem choice.
 
 ## Uninstall
 
@@ -107,11 +115,11 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.4.1` in
+Pin both the installer and release asset to the same tag. Replace `v0.5.2` in
 both places with the version you want:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.4.1/install.sh | MINFM_VERSION=v0.4.1 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.5.2/install.sh | MINFM_VERSION=v0.5.2 sh
 minfm
 ```
 
@@ -138,8 +146,9 @@ dialogs always retain a predictable safe way to navigate, apply, or cancel.
 Bindings that conflict in the same screen are rejected with a configuration
 error instead of producing ambiguous behavior.
 
-minfm uses one rounded, filled monochrome icon set adapted to its file,
-directory, device, and action roles. Individual project icons can be changed
+minfm uses one rounded, filled monochrome icon set for files, directories, and
+device types. The top action bar uses compact text like the footer. File and
+directory icons can be changed
 under `[icons.overrides]`; see
 [config.example.toml](config.example.toml) for the complete, deliberately small
 set. Overrides must be printable and one to three terminal cells wide so browser
@@ -150,7 +159,7 @@ For example:
 ```toml
 [hotkeys]
 tools = "F2"
-partitions = "F4"
+devices = "F4"
 ```
 
 Files open with the Linux default application. To use another editor, set it in
@@ -190,8 +199,11 @@ cargo build --release --locked
 - Storage operations revalidate the selected device immediately before running
   and reject read-only devices, mounted descendants, identity changes, unsafe
   boundaries, and mismatched parent disks.
-- LUKS and Samba passwords remain masked and are passed through standard input,
-  never command-line arguments or configuration files.
+- LUKS and Samba passwords remain masked and never appear in command-line
+  arguments or configuration files. LUKS key changes pass the new key through
+  a private named pipe that is removed immediately afterward.
+- Persistent mount and encryption options are validated, staged privately, and
+  atomically installed in `/etc/fstab` or `/etc/crypttab`.
 - Copy and restore operations avoid overwriting existing destinations and clean
   up incomplete output after failure or cancellation.
 - Keep independent backups of important data. Safety checks reduce risk but do

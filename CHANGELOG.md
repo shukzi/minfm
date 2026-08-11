@@ -1,5 +1,61 @@
 # minfm changelog
 
+## v0.5.2
+
+### Fixed
+
+- SMART health data and short or extended self-tests now open a dedicated,
+  scrollable report instead of disappearing behind the Device Manager.
+- Active SMART self-tests are detected and reported without being interrupted
+  or incorrectly shown as failed when another test is selected.
+- SMART health-warning exit codes are treated as report findings rather than
+  command failures.
+- SMART report dialogs fit short results and stop scrolling at the final line.
+
+## v0.5.1
+
+### Changed
+
+- Persistent mount and encryption options still use validation, private staging,
+  and atomic replacement, but no longer create stale `.minfm-backup` files.
+
+## v0.5.0
+
+### Added
+
+- Device Manager: manage disks, partitions, ordinary filesystems, and LUKS
+  volumes from one contextual screen opened through `M` or its direct shortcut.
+- Drive health: view SMART data, start short or extended self-tests, and change
+  supported ATA standby, power-management, acoustic, and write-cache settings.
+- LUKS maintenance: change passphrases through private pipes and configure
+  persistent mount and encryption options with atomic system-file updates.
+- Disk workflows: create GPT or MBR layouts, leave a disk without a partition
+  table, optionally overwrite the full disk, and create or restore raw images.
+- Formatting: offer Ext4, NTFS, and FAT first, with XFS, swap, Btrfs, F2FS,
+  exFAT, UDF, and no filesystem under Other; LUKS2 is an independent password
+  protection toggle.
+- Partition workflows: create, resize, edit, format, delete, check, repair,
+  image, mount, and unmount supported storage.
+- Tree view: expand directories in place with persistent tree lines that make
+  the current hierarchy clear.
+
+### Changed
+
+- LUKS handling: restore contextual unlock-and-mount, mount, unmount-and-lock,
+  and smart eject behavior that first unmounts and locks related volumes.
+- Storage safety: offer automatic preflight unmounting when an operation needs
+  inactive media, while explaining the change before asking for confirmation.
+- Interface: use monochrome dialogs, a high-contrast black popup surround, and
+  compact text action rails in both the header and footer.
+- Configuration: migrate the former `partitions` binding to `devices` without
+  replacing custom shortcuts, comments, or other settings.
+- Documentation: replace the application preview and document install-time
+  dependency checks for Fedora, Debian/Ubuntu, and Arch Linux.
+
+### Removed
+
+- Controller-native NVMe erase commands and their device-specific recovery UI.
+
 ## v0.4.1
 
 ### Added

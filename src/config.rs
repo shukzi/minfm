@@ -264,7 +264,6 @@ pub struct HotkeyConfig {
     #[serde(alias = "apps")]
     pub tools: KeyBinding,
     pub devices: KeyBinding,
-    pub partitions: KeyBinding,
     pub network_shares: KeyBinding,
     pub device_eject: KeyBinding,
     pub device_action: KeyBinding,
@@ -319,7 +318,6 @@ impl Default for HotkeyConfig {
             edit: key("e"),
             tools: key("M"),
             devices: key("m"),
-            partitions: key("P"),
             network_shares: key("N"),
             device_eject: key("e"),
             device_action: key("m"),
@@ -377,7 +375,6 @@ impl HotkeyConfig {
                 ("edit", &self.edit),
                 ("tools", &self.tools),
                 ("devices", &self.devices),
-                ("partitions", &self.partitions),
                 ("network_shares", &self.network_shares),
             ],
         )?;
@@ -420,7 +417,7 @@ impl HotkeyConfig {
             ],
         )?;
         self.validate_context(
-            "partition manager",
+            "device manager",
             &[
                 ("quit", &self.quit),
                 ("down", &self.down),
@@ -572,6 +569,10 @@ pub fn load_from(path: PathBuf) -> ConfigLoad {
                 migrated = updated;
                 migration_needed = true;
             }
+            if let Some(updated) = migrate_partition_hotkey(&migrated) {
+                migrated = updated;
+                migration_needed = true;
+            }
             if let Some(updated) = migrate_legacy_icon_theme(&migrated) {
                 migrated = updated;
                 migration_needed = true;
@@ -638,6 +639,65 @@ fn migrate_legacy_apps_hotkey(text: &str) -> Option<String> {
             }
         }
         migrated.push_str(line);
+    }
+    changed.then_some(migrated)
+}
+
+fn migrate_partition_hotkey(text: &str) -> Option<String> {
+    let mut in_hotkeys = false;
+    let mut has_devices = false;
+    for line in text.lines() {
+        let declaration = line
+            .trim_start()
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if declaration.starts_with('[') {
+            in_hotkeys = declaration == "[hotkeys]";
+        } else if in_hotkeys
+            && declaration
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "devices")
+        {
+            has_devices = true;
+        }
+    }
+    let mut in_hotkeys = false;
+    let mut changed = false;
+    let mut migrated = String::with_capacity(text.len());
+    for line in text.lines() {
+        let declaration = line
+            .trim_start()
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if declaration.starts_with('[') {
+            in_hotkeys = declaration == "[hotkeys]";
+        }
+        if in_hotkeys
+            && declaration
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "partitions")
+        {
+            changed = true;
+            if !has_devices {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                let value = line
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                migrated.push_str(indent);
+                migrated.push_str("devices =");
+                migrated.push_str(value);
+                migrated.push('\n');
+                has_devices = true;
+            }
+            continue;
+        }
+        migrated.push_str(line);
+        migrated.push('\n');
     }
     changed.then_some(migrated)
 }
@@ -839,16 +899,31 @@ mod tests {
     }
 
     #[test]
-    fn direct_partition_hotkey_cannot_conflict_with_a_browser_action() {
+    fn legacy_partition_hotkey_migrates_to_devices() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
-        std::fs::write(&path, "[hotkeys]\npartitions = 'm'\n").unwrap();
-        let ConfigLoad::Invalid { error, .. } = load_from(path) else {
-            panic!("the direct partition hotkey must be unique in the browser context");
+        std::fs::write(&path, "[hotkeys]\npartitions = 'F4'\n").unwrap();
+        let ConfigLoad::Valid { config, .. } = load_from(path.clone()) else {
+            panic!("the old partition shortcut should migrate");
         };
-        assert!(error.contains("partitions"));
-        assert!(error.contains("devices"));
-        assert!(error.contains("browser"));
+        assert_eq!(config.hotkeys.devices.display(), "F4");
+        let migrated = std::fs::read_to_string(path).unwrap();
+        assert!(migrated.contains("devices = 'F4'"));
+        assert!(!migrated.contains("partitions"));
+    }
+
+    #[test]
+    fn configured_device_hotkey_wins_over_removed_partition_hotkey() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[hotkeys]\ndevices = 'F3'\npartitions = 'F4'\n").unwrap();
+        let ConfigLoad::Valid { config, .. } = load_from(path.clone()) else {
+            panic!("the redundant old shortcut should be removed");
+        };
+        assert_eq!(config.hotkeys.devices.display(), "F3");
+        let migrated = std::fs::read_to_string(path).unwrap();
+        assert!(migrated.contains("devices = 'F3'"));
+        assert!(!migrated.contains("partitions"));
     }
 
     #[test]

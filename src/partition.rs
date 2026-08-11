@@ -4,18 +4,22 @@ use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use nix::unistd::Uid;
+use nix::{
+    sys::stat::Mode,
+    unistd::{mkfifo, Gid, Uid},
+};
 
 use crate::{
     block::{self, BlockDevice, BlockInventory},
     error::{MinfmError, Result},
+    luks::SecretInput,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,71 +49,6 @@ impl PartitionEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionInventory {
     pub entries: Vec<PartitionEntry>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NvmeEraseMethod {
-    SanitizeBlockErase,
-    SanitizeCryptoErase,
-    SanitizeOverwrite,
-    FormatUserDataErase,
-    FormatCryptoErase,
-    ExitFailureMode,
-}
-
-impl NvmeEraseMethod {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::SanitizeBlockErase => "Sanitize: Block Erase",
-            Self::SanitizeCryptoErase => "Sanitize: Crypto Erase",
-            Self::SanitizeOverwrite => "Sanitize: Overwrite",
-            Self::FormatUserDataErase => "Format: User Data Erase",
-            Self::FormatCryptoErase => "Format: Cryptographic Erase",
-            Self::ExitFailureMode => "Exit Sanitize Failure Mode",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::SanitizeBlockErase => "Controller-wide media block erase",
-            Self::SanitizeCryptoErase => "Controller-wide encryption-key erase",
-            Self::SanitizeOverwrite => "Controller-wide overwrite; slow and adds flash wear",
-            Self::FormatUserDataErase => "Selected namespace only; user-data erase",
-            Self::FormatCryptoErase => "Selected namespace only; cryptographic erase",
-            Self::ExitFailureMode => "Recovery only; does not start a new erase",
-        }
-    }
-
-    fn sanitize_action(self) -> Option<&'static str> {
-        match self {
-            Self::SanitizeBlockErase => Some("2"),
-            Self::SanitizeCryptoErase => Some("4"),
-            Self::SanitizeOverwrite => Some("3"),
-            Self::ExitFailureMode => Some("1"),
-            Self::FormatUserDataErase | Self::FormatCryptoErase => None,
-        }
-    }
-
-    fn format_secure_erase(self) -> Option<&'static str> {
-        match self {
-            Self::FormatUserDataErase => Some("1"),
-            Self::FormatCryptoErase => Some("2"),
-            _ => None,
-        }
-    }
-
-    fn controller_wide_erase(self) -> bool {
-        matches!(
-            self,
-            Self::SanitizeBlockErase | Self::SanitizeCryptoErase | Self::SanitizeOverwrite
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NvmeEraseCapabilities {
-    pub methods: Vec<NvmeEraseMethod>,
-    pub sanitize_failed: bool,
 }
 
 impl PartitionInventory {
@@ -245,32 +184,44 @@ impl PartitionTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filesystem {
     Ext4,
-    Xfs,
-    Btrfs,
+    Ntfs,
     Fat32,
-    Exfat,
+    Xfs,
     Swap,
+    Btrfs,
+    F2fs,
+    Exfat,
+    Udf,
+    None,
 }
 
 impl Filesystem {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::Ext4,
-        Self::Xfs,
-        Self::Btrfs,
+        Self::Ntfs,
         Self::Fat32,
-        Self::Exfat,
+        Self::Xfs,
         Self::Swap,
+        Self::Btrfs,
+        Self::F2fs,
+        Self::Exfat,
+        Self::Udf,
+        Self::None,
     ];
-    pub const NAMES: &'static str = "ext4, xfs, btrfs, fat32, exfat, swap";
+    pub const NAMES: &'static str = "ext4, ntfs, fat, xfs, swap, btrfs, f2fs, exfat, udf, none";
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "ext4" => Some(Self::Ext4),
+            "ntfs" | "ntfs3" => Some(Self::Ntfs),
             "xfs" => Some(Self::Xfs),
             "btrfs" => Some(Self::Btrfs),
+            "f2fs" => Some(Self::F2fs),
             "fat32" | "vfat" => Some(Self::Fat32),
             "exfat" => Some(Self::Exfat),
             "swap" => Some(Self::Swap),
+            "udf" => Some(Self::Udf),
+            "none" => Some(Self::None),
             _ => None,
         }
     }
@@ -278,22 +229,30 @@ impl Filesystem {
     pub fn name(self) -> &'static str {
         match self {
             Self::Ext4 => "ext4",
+            Self::Ntfs => "NTFS",
             Self::Xfs => "XFS",
             Self::Btrfs => "Btrfs",
+            Self::F2fs => "F2FS",
             Self::Fat32 => "FAT32",
             Self::Exfat => "exFAT",
             Self::Swap => "swap",
+            Self::Udf => "UDF",
+            Self::None => "No filesystem",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
             Self::Ext4 => "Recommended Linux default",
+            Self::Ntfs => "For Windows",
             Self::Xfs => "Large files and high-performance storage",
             Self::Btrfs => "Snapshots and advanced Linux features",
+            Self::F2fs => "Flash storage on Linux",
             Self::Fat32 => "EFI and broad device compatibility",
             Self::Exfat => "Large files across Linux, macOS, and Windows",
             Self::Swap => "Linux swap space",
+            Self::Udf => "Removable media across many systems",
+            Self::None => "Leave the partition unformatted",
         }
     }
 
@@ -301,17 +260,43 @@ impl Filesystem {
         match (self, current) {
             (Self::Fat32, Some("vfat" | "fat" | "fat32")) => true,
             (Self::Swap, Some("swap")) => true,
+            (Self::None, None) => true,
             (expected, Some(current)) => Self::parse(current) == Some(expected),
             (_, None) => false,
         }
     }
 }
 
-// The initial TUI intentionally exposes only the basic workflow. Keep the
-// validated advanced actions available for a future, separately designed menu.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionAction {
+    SmartReport {
+        disk: DeviceIdentity,
+    },
+    SmartTest {
+        disk: DeviceIdentity,
+        extended: bool,
+    },
+    DriveSetting {
+        disk: DeviceIdentity,
+        setting: DriveSetting,
+    },
+    ChangeLuksPassphrase {
+        target: DeviceIdentity,
+        old: SecretInput,
+        new: SecretInput,
+    },
+    SetMountOptions {
+        target: DeviceIdentity,
+        uuid: String,
+        mountpoint: PathBuf,
+        options: String,
+    },
+    SetEncryptionOptions {
+        target: DeviceIdentity,
+        uuid: String,
+        name: String,
+        options: String,
+    },
     Mount {
         target: DeviceIdentity,
     },
@@ -321,9 +306,11 @@ pub enum PartitionAction {
     CreateTable {
         disk: DeviceIdentity,
         table: PartitionTable,
+        overwrite: bool,
     },
     EraseDisk {
         disk: DeviceIdentity,
+        overwrite: bool,
     },
     CreatePartition {
         disk: DeviceIdentity,
@@ -352,6 +339,18 @@ pub enum PartitionAction {
         filesystem: Filesystem,
         label: Option<String>,
     },
+    EncryptFormat {
+        target: DeviceIdentity,
+        filesystem: Filesystem,
+        label: Option<String>,
+        passphrase: SecretInput,
+    },
+    CreateEncryptedDisk {
+        disk: DeviceIdentity,
+        filesystem: Filesystem,
+        label: Option<String>,
+        passphrase: SecretInput,
+    },
     Grow {
         target: DeviceIdentity,
         disk: DeviceIdentity,
@@ -375,8 +374,9 @@ pub enum PartitionAction {
         target: DeviceIdentity,
         filesystem: Filesystem,
     },
-    WipeSignatures {
+    RepairFilesystem {
         target: DeviceIdentity,
+        filesystem: Filesystem,
     },
     SetFlag {
         target: DeviceIdentity,
@@ -389,37 +389,52 @@ pub enum PartitionAction {
         disk: DeviceIdentity,
         destination: PathBuf,
     },
-    HddWipe {
-        disk: DeviceIdentity,
-        passes: u8,
+    CreateImage {
+        target: DeviceIdentity,
+        destination: PathBuf,
     },
-    NvmeErase {
-        disk: DeviceIdentity,
-        method: NvmeEraseMethod,
+    RestoreImage {
+        target: DeviceIdentity,
+        source: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveSetting {
+    Standby(u8),
+    PowerManagement(u8),
+    AcousticManagement(u8),
+    WriteCache(bool),
 }
 
 impl PartitionAction {
     pub fn target(&self) -> &DeviceIdentity {
         match self {
-            Self::Mount { target }
+            Self::ChangeLuksPassphrase { target, .. }
+            | Self::SetMountOptions { target, .. }
+            | Self::SetEncryptionOptions { target, .. }
+            | Self::Mount { target }
             | Self::Unmount { target }
             | Self::DeletePartition { target, .. }
             | Self::SetPartitionName { target, .. }
             | Self::SetPartitionType { target, .. }
             | Self::Format { target, .. }
+            | Self::EncryptFormat { target, .. }
             | Self::Grow { target, .. }
             | Self::Shrink { target, .. }
             | Self::SetLabel { target, .. }
             | Self::CheckFilesystem { target, .. }
-            | Self::WipeSignatures { target }
+            | Self::RepairFilesystem { target, .. }
             | Self::SetFlag { target, .. } => target,
-            Self::CreateTable { disk, .. }
-            | Self::EraseDisk { disk }
+            Self::CreateImage { target, .. } | Self::RestoreImage { target, .. } => target,
+            Self::SmartReport { disk }
+            | Self::SmartTest { disk, .. }
+            | Self::DriveSetting { disk, .. }
+            | Self::CreateTable { disk, .. }
+            | Self::EraseDisk { disk, .. }
             | Self::CreatePartition { disk, .. }
-            | Self::BackupTable { disk, .. }
-            | Self::HddWipe { disk, .. }
-            | Self::NvmeErase { disk, .. } => disk,
+            | Self::BackupTable { disk, .. } => disk,
+            Self::CreateEncryptedDisk { disk, .. } => disk,
         }
     }
 
@@ -428,8 +443,11 @@ impl PartitionAction {
             self,
             Self::Mount { .. }
                 | Self::Unmount { .. }
+                | Self::SmartReport { .. }
+                | Self::SmartTest { .. }
                 | Self::CheckFilesystem { .. }
                 | Self::BackupTable { .. }
+                | Self::CreateImage { .. }
         )
     }
 
@@ -440,16 +458,9 @@ impl PartitionAction {
                 | Self::EraseDisk { .. }
                 | Self::DeletePartition { .. }
                 | Self::Format { .. }
-                | Self::WipeSignatures { .. }
-                | Self::HddWipe { .. }
-                | Self::NvmeErase {
-                    method: NvmeEraseMethod::SanitizeBlockErase
-                        | NvmeEraseMethod::SanitizeCryptoErase
-                        | NvmeEraseMethod::SanitizeOverwrite
-                        | NvmeEraseMethod::FormatUserDataErase
-                        | NvmeEraseMethod::FormatCryptoErase,
-                    ..
-                }
+                | Self::EncryptFormat { .. }
+                | Self::CreateEncryptedDisk { .. }
+                | Self::RestoreImage { .. }
         )
     }
 
@@ -469,24 +480,28 @@ impl PartitionAction {
                 "This changes partition metadata on the selected disk."
             }
             Self::Format { .. } => "This permanently erases data on the selected device.",
+            Self::EncryptFormat { .. } => {
+                "This erases the target and creates LUKS2. Losing the passphrase makes its data inaccessible."
+            }
+            Self::CreateEncryptedDisk { .. } => {
+                "This erases the disk, creates GPT with one LUKS2 partition, and formats its encrypted contents."
+            }
             Self::Grow { .. }
             | Self::Shrink { .. }
             | Self::SetLabel { .. }
             | Self::SetFlag { .. } => "This changes data stored on the selected device.",
-            Self::WipeSignatures { .. } => {
-                "This permanently removes filesystem identification data."
-            }
             Self::BackupTable { .. } => "This reads the partition table without changing it.",
-            Self::HddWipe { .. } => {
-                "This irreversibly overwrites the entire rotational disk multiple times."
+            Self::CreateImage { .. } => "This reads the device without changing it.",
+            Self::RestoreImage { .. } => "This replaces all data on the selected device.",
+            Self::RepairFilesystem { .. } => {
+                "Repair can change filesystem data. Keep a backup when possible."
             }
-            Self::NvmeErase { method, .. } if *method == NvmeEraseMethod::ExitFailureMode => {
-                "This asks the controller to leave a previously reported Sanitize failure state."
-            }
-            Self::NvmeErase { method, .. } if method.controller_wide_erase() => {
-                "This irreversibly erases the entire NVMe controller, including all namespaces."
-            }
-            Self::NvmeErase { .. } => "This irreversibly erases the selected NVMe namespace.",
+            Self::ChangeLuksPassphrase { .. } => "The old passphrase stops unlocking this volume.",
+            Self::SetMountOptions { .. } => "This updates the persistent system mount configuration.",
+            Self::SetEncryptionOptions { .. } => "This updates the persistent encrypted-volume configuration.",
+            Self::SmartReport { .. } => "This reads drive health data without changing it.",
+            Self::SmartTest { .. } => "This starts a drive self-test without erasing data.",
+            Self::DriveSetting { .. } => "This changes a hardware setting until the drive resets.",
             Self::Mount { .. } | Self::Unmount { .. } | Self::CheckFilesystem { .. } => {
                 "Proceed with this operation?"
             }
@@ -495,6 +510,15 @@ impl PartitionAction {
 
     pub fn title(&self) -> &'static str {
         match self {
+            Self::ChangeLuksPassphrase { .. } => "Change LUKS passphrase",
+            Self::SetMountOptions { .. } => "Change mount options",
+            Self::SetEncryptionOptions { .. } => "Change encryption options",
+            Self::SmartReport { .. } => "SMART report",
+            Self::SmartTest {
+                extended: false, ..
+            } => "Start short SMART test",
+            Self::SmartTest { extended: true, .. } => "Start extended SMART test",
+            Self::DriveSetting { .. } => "Change drive setting",
             Self::Mount { .. } => "Mount filesystem",
             Self::Unmount { .. } => "Unmount filesystem",
             Self::CreateTable { .. } => "Create table",
@@ -504,24 +528,32 @@ impl PartitionAction {
             Self::SetPartitionName { .. } => "Rename partition",
             Self::SetPartitionType { .. } => "Change partition type",
             Self::Format { .. } => "Format",
+            Self::EncryptFormat { .. } => "Encrypt and format",
+            Self::CreateEncryptedDisk { .. } => "Create encrypted disk",
             Self::Grow { .. } => "Grow partition",
             Self::Shrink { .. } => "Shrink partition",
             Self::SetLabel { .. } => "Change filesystem label",
             Self::CheckFilesystem { .. } => "Check filesystem",
-            Self::WipeSignatures { .. } => "Wipe filesystem signatures",
+            Self::RepairFilesystem { .. } => "Repair filesystem",
             Self::SetFlag { .. } => "Change partition flag",
             Self::BackupTable { .. } => "Back up partition table",
-            Self::HddWipe { .. } => "Wipe HDD",
-            Self::NvmeErase { method, .. } if *method == NvmeEraseMethod::ExitFailureMode => {
-                "Recover NVMe Sanitize"
-            }
-            Self::NvmeErase { .. } => "Erase NVMe",
+            Self::CreateImage { .. } => "Create image",
+            Self::RestoreImage { .. } => "Restore image",
         }
     }
 
     pub fn confirmation_text(&self) -> String {
         let path = self.target().path.display();
         match self {
+            Self::ChangeLuksPassphrase { .. } => format!("Replace the LUKS passphrase for {path}."),
+            Self::SetMountOptions { mountpoint, options, .. } => format!("Mount {path} at {} with {options} after startup.", mountpoint.display()),
+            Self::SetEncryptionOptions { name, options, .. } => format!("Configure {path} as {name} with {options}."),
+            Self::SmartReport { .. } => format!("Read SMART health data from {path}."),
+            Self::SmartTest { extended, .. } => format!(
+                "Start a {} SMART self-test on {path}.",
+                if *extended { "extended" } else { "short" }
+            ),
+            Self::DriveSetting { setting, .. } => format!("Apply {setting:?} to {path}."),
             Self::Mount { .. } => format!("Mount {path} through udisksctl."),
             Self::Unmount { .. } => format!("Unmount {path} through udisksctl."),
             Self::CreateTable { table, .. } => format!(
@@ -558,6 +590,14 @@ impl PartitionAction {
                     .map(|label| format!(" labeled {label:?}"))
                     .unwrap_or_default()
             ),
+            Self::EncryptFormat { filesystem, .. } => format!(
+                "Erase {path}, create a LUKS2 encrypted container, and format its unlocked contents as {}.",
+                filesystem.name()
+            ),
+            Self::CreateEncryptedDisk { filesystem, .. } => format!(
+                "Erase {path}, create GPT with one LUKS2 encrypted partition, and format its unlocked contents as {}.",
+                filesystem.name()
+            ),
             Self::Grow { end_bytes, .. } => format!(
                 "Grow {path} to end at {}. Shrinking is never performed.",
                 format_bytes(*end_bytes)
@@ -572,9 +612,7 @@ impl PartitionAction {
             Self::CheckFilesystem { .. } => {
                 format!("Run a read-only filesystem check on {path}.")
             }
-            Self::WipeSignatures { .. } => format!(
-                "Remove all recognizable filesystem and RAID signatures from {path}."
-            ),
+            Self::RepairFilesystem { .. } => format!("Repair the filesystem on {path}."),
             Self::SetFlag { flag, enabled, .. } => format!(
                 "Turn partition flag {flag:?} {} for {path}.",
                 if *enabled { "on" } else { "off" }
@@ -583,14 +621,12 @@ impl PartitionAction {
                 "Save a restorable text backup of the partition table on {path} to {}.",
                 destination.display()
             ),
-            Self::HddWipe { passes, .. } => format!(
-                "Overwrite every addressable byte on rotational disk {path} {passes} time(s), then write zeros."
-            ),
-            Self::NvmeErase { method, .. } => format!(
-                "Use {} on {path}. {}. Capabilities are checked again immediately before execution.",
-                method.name(),
-                method.description()
-            ),
+            Self::CreateImage { destination, .. } => {
+                format!("Save an image of {path} to {}.", destination.display())
+            }
+            Self::RestoreImage { source, .. } => {
+                format!("Replace {path} with image {}.", source.display())
+            }
         }
     }
 }
@@ -631,8 +667,8 @@ pub fn authentication_required(action: &PartitionAction) -> bool {
         )
 }
 
-pub fn administrator_authentication_required() -> bool {
-    !Uid::effective().is_root()
+pub fn helper_available(program: &str) -> bool {
+    trusted_program(&OsString::from(program)).is_ok()
 }
 
 pub fn execute(
@@ -644,7 +680,16 @@ pub fn execute(
     let mut inventory = discover()?;
     validate_action(action, &inventory)?;
     let commands = command_plan(action, &inventory)?;
-    let use_sudo = !Uid::effective().is_root() && commands.iter().any(|command| command.elevated);
+    let custom_elevated = matches!(
+        action,
+        PartitionAction::EncryptFormat { .. }
+            | PartitionAction::CreateEncryptedDisk { .. }
+            | PartitionAction::ChangeLuksPassphrase { .. }
+            | PartitionAction::SetMountOptions { .. }
+            | PartitionAction::SetEncryptionOptions { .. }
+    );
+    let use_sudo = !Uid::effective().is_root()
+        && (custom_elevated || commands.iter().any(|command| command.elevated));
     let _sudo_session = if use_sudo {
         report_phase("Authenticating administrator");
         let program = authenticate_sudo(administrator_password.ok_or_else(|| {
@@ -657,58 +702,58 @@ pub fn execute(
     } else {
         None
     };
-    if let PartitionAction::NvmeErase { method, .. } = action {
-        report_phase("Checking NVMe erase capabilities");
-        let identify = run_command(&commands[0], use_sudo, administrator_password)?;
-        if method.format_secure_erase().is_some() {
-            let format = nvme_format_command(action, &inventory, &identify)?;
-            report_phase("Starting namespace-scoped NVMe Format erase");
-            let _ = run_command(&format, use_sudo, administrator_password)?;
-        } else {
-            if *method == NvmeEraseMethod::ExitFailureMode {
-                let log = nvme_sanitize_log_command(action, &inventory)?;
-                let status = run_command(&log, use_sudo, administrator_password)?;
-                if nvme_sanitize_status(&status)? != NvmeSanitizeStatus::Failed {
-                    return Err(MinfmError::Message(
-                        "the controller no longer reports a failed Sanitize state; recovery was not started"
-                            .into(),
-                    ));
-                }
-            }
-            let sanitize = nvme_sanitize_command(action, &inventory, &identify)?;
-            report_phase(if *method == NvmeEraseMethod::ExitFailureMode {
-                "Exiting NVMe Sanitize failure mode"
-            } else {
-                "Starting controller-wide NVMe Sanitize"
-            });
-            let _ = run_command(&sanitize, use_sudo, administrator_password)?;
-            if *method != NvmeEraseMethod::ExitFailureMode {
-                let log = nvme_sanitize_log_command(action, &inventory)?;
-                report_phase("Waiting for NVMe Sanitize to finish");
-                loop {
-                    thread::sleep(Duration::from_secs(1));
-                    let output = run_command(&log, use_sudo, administrator_password)?;
-                    match nvme_sanitize_status(&output)? {
-                        NvmeSanitizeStatus::Complete => break,
-                        NvmeSanitizeStatus::InProgress => {}
-                        NvmeSanitizeStatus::Failed => {
-                            return Err(MinfmError::Message(
-                                "the NVMe controller reports that Sanitize failed; reopen Erase NVMe to use Exit Sanitize Failure Mode"
-                                    .into(),
-                            ));
-                        }
-                        NvmeSanitizeStatus::NeverRun => {
-                            return Err(MinfmError::Message(
-                                "the NVMe controller did not start Sanitize".into(),
-                            ));
-                        }
-                    }
-                }
-            }
+    if matches!(
+        action,
+        PartitionAction::SetMountOptions { .. } | PartitionAction::SetEncryptionOptions { .. }
+    ) {
+        report_phase("Updating persistent device options");
+        execute_persistent_options(action, use_sudo, administrator_password)?;
+    } else if matches!(action, PartitionAction::ChangeLuksPassphrase { .. }) {
+        report_phase("Changing LUKS passphrase");
+        execute_luks_passphrase_change(action, use_sudo)?;
+    } else if matches!(
+        action,
+        PartitionAction::EncryptFormat { .. } | PartitionAction::CreateEncryptedDisk { .. }
+    ) {
+        execute_encrypted_format(
+            action,
+            &inventory,
+            use_sudo,
+            administrator_password,
+            &mut report_phase,
+        )?;
+    } else if matches!(action, PartitionAction::SmartReport { .. }) {
+        report_phase("Reading SMART health data");
+        let output = run_command(&commands[0], use_sudo, administrator_password)?;
+        let report = complete_smart_report(&String::from_utf8_lossy(&output));
+        return Ok(report);
+    } else if matches!(action, PartitionAction::SmartTest { .. }) {
+        let report_command = smart_report_command(action.target());
+        report_phase("Checking current SMART test status");
+        let current_output = run_command(&report_command, use_sudo, administrator_password)?;
+        let current_report = String::from_utf8_lossy(&current_output);
+        if smart_self_test_running(&current_report) {
+            return Ok(format!(
+                "A SMART self-test is already running.\n\n{}",
+                complete_smart_report(&current_report)
+            ));
         }
-        report_phase("Reloading kernel partition map");
-        let reread = reread_partition_table_command(action.target());
-        let _ = run_command(&reread, use_sudo, administrator_password)?;
+        report_phase("Starting SMART self-test");
+        if let Err(error) = run_command(&commands[0], use_sudo, administrator_password) {
+            if !smart_test_already_running_error(&error.to_string()) {
+                return Err(error);
+            }
+            report_phase("Reading active SMART test status");
+            let output = run_command(&report_command, use_sudo, administrator_password)?;
+            return Ok(format!(
+                "A SMART self-test is already running.\n\n{}",
+                complete_smart_report(&String::from_utf8_lossy(&output))
+            ));
+        }
+        report_phase("Reading SMART test status");
+        let output = run_command(&report_command, use_sudo, administrator_password)?;
+        let report = complete_smart_report(&String::from_utf8_lossy(&output));
+        return Ok(format!("{} started.\n\n{}", action.title(), report));
     } else {
         for command in commands {
             report_phase(command_phase(&command));
@@ -738,6 +783,474 @@ pub fn execute(
     })
 }
 
+fn summarize_smart_report(report: &str) -> String {
+    const FIELDS: [&str; 14] = [
+        "Device Model",
+        "Model Number",
+        "Serial Number",
+        "Firmware Version",
+        "User Capacity",
+        "SMART overall-health",
+        "SMART Health Status",
+        "Critical Warning",
+        "Temperature",
+        "Available Spare",
+        "Percentage Used",
+        "Power_On_Hours",
+        "Self-test execution status",
+        "Self-test status",
+    ];
+    let mut lines = report
+        .lines()
+        .map(str::trim)
+        .filter(|line| FIELDS.iter().any(|field| line.contains(field)))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    lines.dedup();
+    lines.truncate(18);
+    if lines.is_empty() {
+        "SMART data is available, but no standard summary fields were reported.".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn smart_report_command(target: &DeviceIdentity) -> CommandSpec {
+    CommandSpec {
+        program: "smartctl".into(),
+        arguments: vec!["--all".into(), target.path.as_os_str().to_os_string()],
+        elevated: true,
+        accepted_codes: (0..=255).filter(|code| code & 0b111 == 0).collect(),
+    }
+}
+
+fn smart_self_test_running(report: &str) -> bool {
+    report.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("self-test")
+            && line.contains("in progress")
+            && !line.contains("no self-test in progress")
+            && !line.contains("not in progress")
+    })
+}
+
+fn smart_test_already_running_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("can't start self-test without aborting current test")
+        || error.contains("cannot start self-test without aborting current test")
+}
+
+fn complete_smart_report(report: &str) -> String {
+    let report = report.trim();
+    if report.is_empty() {
+        return "smartctl returned an empty report.".into();
+    }
+    let summary = summarize_smart_report(report);
+    format!("Summary\n{summary}\n\nFull report\n{report}")
+}
+
+struct PrivatePipeDir(PathBuf);
+
+impl Drop for PrivatePipeDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn execute_luks_passphrase_change(action: &PartitionAction, use_sudo: bool) -> Result<()> {
+    let PartitionAction::ChangeLuksPassphrase { target, old, new } = action else {
+        return Err(MinfmError::Message(
+            "expected a LUKS passphrase action".into(),
+        ));
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| MinfmError::Message("system clock is unavailable".into()))?
+        .as_nanos();
+    let directory = env::temp_dir().join(format!("minfm-key-{}-{unique}", std::process::id()));
+    fs::create_dir(&directory)
+        .map_err(|error| crate::error::io_error("could not create a private key pipe", error))?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|error| crate::error::io_error("could not secure the key pipe", error))?;
+    let cleanup = PrivatePipeDir(directory.clone());
+    let fifo = directory.join("new-key");
+    mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR)
+        .map_err(|error| MinfmError::Message(format!("could not create key pipe: {error}")))?;
+    let keeper = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .map_err(|error| crate::error::io_error("could not open key pipe", error))?;
+    let secret = new.clone();
+    let writer_path = fifo.clone();
+    let writer = thread::spawn(move || -> std::io::Result<()> {
+        OpenOptions::new()
+            .write(true)
+            .open(writer_path)?
+            .write_all(secret.expose())
+    });
+    let result = run_command_with_secret(
+        "cryptsetup",
+        [
+            OsString::from("luksChangeKey"),
+            OsString::from("--key-file"),
+            OsString::from("-"),
+            OsString::from("--new-keyfile"),
+            fifo.into_os_string(),
+            OsString::from("--new-keyfile-size"),
+            OsString::from(new.expose().len().to_string()),
+            target.path.as_os_str().to_owned(),
+        ],
+        old.expose(),
+        use_sudo,
+    );
+    drop(keeper);
+    writer
+        .join()
+        .map_err(|_| MinfmError::Message("key pipe writer stopped unexpectedly".into()))?
+        .map_err(|error| crate::error::io_error("could not send the new key", error))?;
+    drop(cleanup);
+    result
+}
+
+fn validate_option_field(value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_,=.-".contains(character))
+    {
+        return Err(MinfmError::Message(
+            "options may contain letters, numbers, commas, equals, dots, underscores, and dashes"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn replace_config_entry(contents: &str, uuid: &str, replacement: &str) -> String {
+    let marker = format!("UUID={uuid}");
+    let mut replaced = false;
+    let mut output = String::new();
+    for line in contents.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let matches =
+            !line.trim_start().starts_with('#') && fields.iter().any(|field| *field == marker);
+        if matches {
+            if !replaced {
+                output.push_str(replacement);
+                output.push('\n');
+                replaced = true;
+            }
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !replaced {
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        output.push_str(replacement);
+        output.push('\n');
+    }
+    output
+}
+
+pub fn current_mount_options(uuid: &str) -> Option<(PathBuf, String)> {
+    let contents = fs::read_to_string("/etc/fstab").ok()?;
+    let marker = format!("UUID={uuid}");
+    contents.lines().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        (!line.trim_start().starts_with('#')
+            && fields.first() == Some(&marker.as_str())
+            && fields.len() >= 4)
+            .then(|| (PathBuf::from(fields[1]), fields[3].to_owned()))
+    })
+}
+
+pub fn current_encryption_options(uuid: &str) -> Option<(String, String)> {
+    let contents = fs::read_to_string("/etc/crypttab").ok()?;
+    let marker = format!("UUID={uuid}");
+    contents.lines().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        (!line.trim_start().starts_with('#')
+            && fields.get(1) == Some(&marker.as_str())
+            && fields.len() >= 4)
+            .then(|| (fields[0].to_owned(), fields[3].to_owned()))
+    })
+}
+
+fn execute_persistent_options(
+    action: &PartitionAction,
+    use_sudo: bool,
+    administrator_password: Option<&[u8]>,
+) -> Result<()> {
+    let (system_path, uuid, replacement, mountpoint) = match action {
+        PartitionAction::SetMountOptions {
+            uuid,
+            mountpoint,
+            options,
+            ..
+        } => (
+            Path::new("/etc/fstab"),
+            uuid,
+            format!(
+                "UUID={uuid}\t{}\tauto\t{options}\t0\t0",
+                mountpoint.display()
+            ),
+            Some(mountpoint.as_path()),
+        ),
+        PartitionAction::SetEncryptionOptions {
+            uuid,
+            name,
+            options,
+            ..
+        } => (
+            Path::new("/etc/crypttab"),
+            uuid,
+            format!("{name}\tUUID={uuid}\tnone\t{options}"),
+            None,
+        ),
+        _ => {
+            return Err(MinfmError::Message(
+                "expected persistent device options".into(),
+            ))
+        }
+    };
+    let current = match fs::read_to_string(system_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(crate::error::io_error(
+                "could not read system configuration",
+                error,
+            ))
+        }
+    };
+    let updated = replace_config_entry(&current, uuid, &replacement);
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| MinfmError::Message("system clock is unavailable".into()))?
+        .as_nanos();
+    let directory = env::temp_dir().join(format!("minfm-config-{}-{unique}", std::process::id()));
+    fs::create_dir(&directory)
+        .map_err(|error| crate::error::io_error("could not stage device options", error))?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|error| crate::error::io_error("could not secure staged options", error))?;
+    let cleanup = PrivatePipeDir(directory.clone());
+    let staged = directory.join("configuration");
+    fs::write(&staged, updated)
+        .map_err(|error| crate::error::io_error("could not stage device options", error))?;
+    if let Some(mountpoint) = mountpoint {
+        run_command(
+            &CommandSpec::elevated(
+                "mkdir",
+                [
+                    OsString::from("--parents"),
+                    mountpoint.as_os_str().to_owned(),
+                ],
+            ),
+            use_sudo,
+            administrator_password,
+        )?;
+    }
+    let pending = system_path.with_extension("minfm-new");
+    run_command(
+        &CommandSpec::elevated(
+            "install",
+            [
+                OsString::from("--mode=0644"),
+                staged.into_os_string(),
+                pending.as_os_str().to_owned(),
+            ],
+        ),
+        use_sudo,
+        administrator_password,
+    )?;
+    run_command(
+        &CommandSpec::elevated(
+            "mv",
+            [
+                OsString::from("--force"),
+                pending.into_os_string(),
+                system_path.as_os_str().to_owned(),
+            ],
+        ),
+        use_sudo,
+        administrator_password,
+    )?;
+    drop(cleanup);
+    Ok(())
+}
+
+fn execute_encrypted_format(
+    action: &PartitionAction,
+    inventory: &PartitionInventory,
+    use_sudo: bool,
+    administrator_password: Option<&[u8]>,
+    report_phase: &mut impl FnMut(&'static str),
+) -> Result<()> {
+    let _ = trusted_program(&OsString::from("cryptsetup"))?;
+    let expected_filesystem = match action {
+        PartitionAction::EncryptFormat { filesystem, .. }
+        | PartitionAction::CreateEncryptedDisk { filesystem, .. } => *filesystem,
+        _ => {
+            return Err(MinfmError::Message(
+                "expected an encrypted format action".into(),
+            ))
+        }
+    };
+    let formatter = format_command(
+        OsString::from("/dev/mapper/minfm-preflight"),
+        expected_filesystem,
+        None,
+    );
+    let _ = trusted_program(&formatter.program)?;
+    let mapping_name = format!("minfm-{}", action.target().major_minor.replace(':', "-"));
+    if Path::new("/dev/mapper").join(&mapping_name).exists() {
+        return Err(MinfmError::Message(format!(
+            "encrypted mapping {mapping_name} already exists; close it before retrying"
+        )));
+    }
+    let (filesystem, label, passphrase, target_path) = match action {
+        PartitionAction::EncryptFormat {
+            target,
+            filesystem,
+            label,
+            passphrase,
+        } => (
+            *filesystem,
+            label.as_deref(),
+            passphrase,
+            target.path.clone(),
+        ),
+        PartitionAction::CreateEncryptedDisk {
+            disk,
+            filesystem,
+            label,
+            passphrase,
+        } => {
+            report_phase("Creating GPT partition layout");
+            let mut commands = wipe_disk_commands(disk, inventory);
+            commands.extend([
+                CommandSpec::elevated(
+                    "parted",
+                    [
+                        OsString::from("--script"),
+                        disk.path.as_os_str().to_owned(),
+                        OsString::from("mklabel"),
+                        OsString::from("gpt"),
+                    ],
+                ),
+                CommandSpec::elevated(
+                    "parted",
+                    [
+                        OsString::from("--script"),
+                        OsString::from("--align"),
+                        OsString::from("optimal"),
+                        disk.path.as_os_str().to_owned(),
+                        OsString::from("mkpart"),
+                        OsString::from("primary"),
+                        OsString::from("1MiB"),
+                        OsString::from("100%"),
+                    ],
+                ),
+                reread_partition_table_command(disk),
+            ]);
+            for command in commands {
+                let _ = run_command(&command, use_sudo, administrator_password)?;
+            }
+            settle_devices();
+            let refreshed = discover()?;
+            let partition = refreshed
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.device.kind == "part"
+                        && entry.device.parent.as_ref() == Some(&disk.path)
+                        && !entry.protected
+                })
+                .ok_or_else(|| {
+                    MinfmError::Message(
+                        "GPT was created, but its encrypted partition was not discovered".into(),
+                    )
+                })?;
+            (
+                *filesystem,
+                label.as_deref(),
+                passphrase,
+                partition.device.path.clone(),
+            )
+        }
+        _ => {
+            return Err(MinfmError::Message(
+                "expected an encrypted format action".into(),
+            ))
+        }
+    };
+
+    report_phase("Removing old filesystem signatures");
+    let _ = run_command(
+        &CommandSpec::elevated(
+            "wipefs",
+            [
+                OsString::from("--all"),
+                OsString::from("--force"),
+                target_path.as_os_str().to_owned(),
+            ],
+        ),
+        use_sudo,
+        administrator_password,
+    )?;
+    report_phase("Creating LUKS2 encrypted container");
+    run_command_with_secret(
+        "cryptsetup",
+        [
+            OsString::from("luksFormat"),
+            OsString::from("--type"),
+            OsString::from("luks2"),
+            OsString::from("--batch-mode"),
+            OsString::from("--key-file"),
+            OsString::from("-"),
+            target_path.as_os_str().to_owned(),
+        ],
+        passphrase.expose(),
+        use_sudo,
+    )?;
+    report_phase("Opening encrypted container");
+    run_command_with_secret(
+        "cryptsetup",
+        [
+            OsString::from("open"),
+            OsString::from("--key-file"),
+            OsString::from("-"),
+            target_path.as_os_str().to_owned(),
+            OsString::from(&mapping_name),
+        ],
+        passphrase.expose(),
+        use_sudo,
+    )?;
+    let mapping = Path::new("/dev/mapper").join(&mapping_name);
+    report_phase("Creating filesystem inside encryption");
+    let format_result = run_command(
+        &format_command(mapping.into_os_string(), filesystem, label),
+        use_sudo,
+        administrator_password,
+    );
+    report_phase("Closing encrypted container");
+    let close_result = run_command(
+        &CommandSpec::elevated(
+            "cryptsetup",
+            [OsString::from("close"), OsString::from(mapping_name)],
+        ),
+        use_sudo,
+        administrator_password,
+    );
+    format_result?;
+    close_result?;
+    Ok(())
+}
+
 fn command_phase(command: &CommandSpec) -> &'static str {
     match command.program.to_string_lossy().as_ref() {
         "udisksctl"
@@ -761,8 +1274,8 @@ fn command_phase(command: &CommandSpec) -> &'static str {
         }
         "wipefs" => "Removing storage signatures",
         "sfdisk" => "Reading partition table",
-        "shred" => "Overwriting rotational disk",
-        "nvme" => "Checking NVMe controller",
+        "smartctl" => "Running SMART operation",
+        "hdparm" => "Updating drive settings",
         _ => "Running partition operation",
     }
 }
@@ -780,7 +1293,11 @@ fn validate_action(action: &PartitionAction, inventory: &PartitionInventory) -> 
     let target = matching_entry(inventory, action.target())?;
     let read_only_operation = matches!(
         action,
-        PartitionAction::CheckFilesystem { .. } | PartitionAction::BackupTable { .. }
+        PartitionAction::CheckFilesystem { .. }
+            | PartitionAction::BackupTable { .. }
+            | PartitionAction::CreateImage { .. }
+            | PartitionAction::SmartReport { .. }
+            | PartitionAction::SmartTest { .. }
     );
     if target.protected && !read_only_operation {
         return Err(MinfmError::Message(format!(
@@ -796,6 +1313,78 @@ fn validate_action(action: &PartitionAction, inventory: &PartitionInventory) -> 
     }
 
     match action {
+        PartitionAction::ChangeLuksPassphrase { old, new, .. } => {
+            require_inactive(target)?;
+            if target.device.filesystem.as_deref() != Some("crypto_LUKS") {
+                return Err(MinfmError::Message("select a locked LUKS volume".into()));
+            }
+            if old.is_empty() {
+                return Err(MinfmError::Message("enter the current passphrase".into()));
+            }
+            if new.character_count() < 8 {
+                return Err(MinfmError::Message(
+                    "the new passphrase must contain at least 8 characters".into(),
+                ));
+            }
+        }
+        PartitionAction::SetMountOptions {
+            uuid,
+            mountpoint,
+            options,
+            ..
+        } => {
+            if uuid.is_empty()
+                || !mountpoint.is_absolute()
+                || mountpoint.components().any(|component| {
+                    !matches!(component, Component::RootDir | Component::Normal(_))
+                })
+            {
+                return Err(MinfmError::Message(
+                    "a UUID and absolute mount point are required".into(),
+                ));
+            }
+            validate_option_field(options)?;
+        }
+        PartitionAction::SetEncryptionOptions {
+            uuid,
+            name,
+            options,
+            ..
+        } => {
+            if uuid.is_empty()
+                || name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            {
+                return Err(MinfmError::Message(
+                    "enter a safe mapping name and UUID".into(),
+                ));
+            }
+            validate_option_field(options)?;
+            if target.device.filesystem.as_deref() != Some("crypto_LUKS") {
+                return Err(MinfmError::Message("select a LUKS volume".into()));
+            }
+        }
+        PartitionAction::SmartReport { .. } | PartitionAction::SmartTest { .. } => {
+            require_disk(target)?;
+        }
+        PartitionAction::DriveSetting { setting, .. } => {
+            require_disk(target)?;
+            match setting {
+                DriveSetting::Standby(_) | DriveSetting::WriteCache(_) => {}
+                DriveSetting::PowerManagement(value) if *value >= 1 => {}
+                DriveSetting::AcousticManagement(value) if (128..=254).contains(value) => {}
+                DriveSetting::PowerManagement(_) => {
+                    return Err(MinfmError::Message("APM must be between 1 and 255".into()))
+                }
+                DriveSetting::AcousticManagement(_) => {
+                    return Err(MinfmError::Message(
+                        "AAM must be between 128 and 254".into(),
+                    ))
+                }
+            }
+        }
         PartitionAction::Mount { .. } => {
             if target.device.is_mounted() {
                 return Err(MinfmError::Message(
@@ -853,6 +1442,24 @@ fn validate_action(action: &PartitionAction, inventory: &PartitionInventory) -> 
         PartitionAction::Format { label, .. } => {
             require_inactive(target)?;
             validate_label(label.as_deref())?;
+        }
+        PartitionAction::EncryptFormat { passphrase, .. } => {
+            require_inactive(target)?;
+            if passphrase.character_count() < 8 {
+                return Err(MinfmError::Message(
+                    "the encryption passphrase must contain at least 8 characters".into(),
+                ));
+            }
+        }
+        PartitionAction::CreateEncryptedDisk { passphrase, .. } => {
+            require_disk(target)?;
+            require_inactive(target)?;
+            require_no_mapped_descendants(target, inventory)?;
+            if passphrase.character_count() < 8 {
+                return Err(MinfmError::Message(
+                    "the encryption passphrase must contain at least 8 characters".into(),
+                ));
+            }
         }
         PartitionAction::Grow {
             disk,
@@ -949,7 +1556,15 @@ fn validate_action(action: &PartitionAction, inventory: &PartitionInventory) -> 
                 ));
             }
         }
-        PartitionAction::WipeSignatures { .. } => require_inactive(target)?,
+        PartitionAction::RepairFilesystem { filesystem, .. } => {
+            require_inactive(target)?;
+            require_filesystem(target, *filesystem)?;
+            if matches!(filesystem, Filesystem::Swap | Filesystem::None) {
+                return Err(MinfmError::Message(
+                    "this filesystem has no repair operation".into(),
+                ));
+            }
+        }
         PartitionAction::BackupTable { destination, .. } => {
             require_disk(target)?;
             if target.device.table_type.is_none() {
@@ -959,37 +1574,22 @@ fn validate_action(action: &PartitionAction, inventory: &PartitionInventory) -> 
             }
             validate_backup_destination(destination)?;
         }
-        PartitionAction::HddWipe { passes, .. } => {
-            require_disk(target)?;
-            require_inactive(target)?;
-            require_no_mapped_descendants(target, inventory)?;
-            if !is_rotational_hdd(&target.device) {
-                return Err(MinfmError::Message(
-                    "multi-pass overwrite is available only for disks reported as rotational HDDs"
-                        .into(),
-                ));
-            }
-            if !matches!(passes, 1 | 3 | 7) {
-                return Err(MinfmError::Message(
-                    "HDD overwrite passes must be 1, 3, or 7".into(),
-                ));
-            }
+        PartitionAction::CreateImage { destination, .. } => {
+            validate_new_image_destination(destination)?;
         }
-        PartitionAction::NvmeErase { method, .. } => {
-            require_disk(target)?;
+        PartitionAction::RestoreImage { source, .. } => {
             require_inactive(target)?;
-            require_no_mapped_descendants(target, inventory)?;
-            let controller = nvme_controller_path(&target.device)?;
-            if method.controller_wide_erase()
-                && inventory.entries.iter().any(|entry| {
-                    entry.device.path != target.device.path
-                        && entry.device.is_disk()
-                        && nvme_controller_path(&entry.device).ok().as_ref() == Some(&controller)
-                })
-            {
+            let metadata = fs::metadata(source).map_err(|error| {
+                crate::error::io_error("could not inspect the disk image", error)
+            })?;
+            if !metadata.is_file() || metadata.len() == 0 {
                 return Err(MinfmError::Message(
-                    "this NVMe controller exposes multiple namespaces; controller-wide erase is disabled to avoid erasing an unselected namespace"
-                        .into(),
+                    "the selected disk image is empty or not a regular file".into(),
+                ));
+            }
+            if metadata.len() > target.device.size {
+                return Err(MinfmError::Message(
+                    "the disk image is larger than the selected device".into(),
                 ));
             }
         }
@@ -1225,46 +1825,24 @@ fn validate_backup_destination(destination: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn is_rotational_hdd(device: &BlockDevice) -> bool {
-    let model = device
-        .model
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    device.is_disk()
-        && device.rotational
-        && device.transport.as_deref() != Some("nvme")
-        && !["ssd", "flash", "solid state", "nvme"]
-            .iter()
-            .any(|marker| model.contains(marker))
-}
-
-fn nvme_controller_path(device: &BlockDevice) -> Result<PathBuf> {
-    if device.transport.as_deref() != Some("nvme") {
+fn validate_new_image_destination(destination: &Path) -> Result<()> {
+    if destination.exists() {
         return Err(MinfmError::Message(
-            "controller-native erase is available only for NVMe disks".into(),
+            "the image destination already exists".into(),
         ));
     }
-    let name = device
-        .path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| MinfmError::Message("invalid NVMe namespace path".into()))?;
-    let suffix = name
-        .strip_prefix("nvme")
-        .and_then(|suffix| suffix.split_once('n'))
-        .filter(|(controller, namespace)| {
-            !controller.is_empty()
-                && !namespace.is_empty()
-                && controller
-                    .chars()
-                    .all(|character| character.is_ascii_digit())
-                && namespace
-                    .chars()
-                    .all(|character| character.is_ascii_digit())
-        })
-        .ok_or_else(|| MinfmError::Message("invalid NVMe namespace path".into()))?;
-    Ok(Path::new("/dev").join(format!("nvme{}", suffix.0)))
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let metadata = fs::metadata(parent)
+        .map_err(|error| crate::error::io_error("could not inspect the image folder", error))?;
+    if !metadata.is_dir() {
+        return Err(MinfmError::Message(
+            "the image folder is not a directory".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn command_plan(
@@ -1274,6 +1852,44 @@ fn command_plan(
     let path = || action.target().path.as_os_str().to_owned();
     let bytes = |value: u64| OsString::from(format!("{value}B"));
     let commands = match action {
+        PartitionAction::ChangeLuksPassphrase { .. }
+        | PartitionAction::SetMountOptions { .. }
+        | PartitionAction::SetEncryptionOptions { .. } => Vec::new(),
+        PartitionAction::SmartReport { .. } => {
+            let mut command = CommandSpec::elevated("smartctl", [OsString::from("--all"), path()]);
+            // smartctl uses the upper five exit bits to report health findings;
+            // those are valid report results, not command failures.
+            command.accepted_codes = (0..=255).filter(|code| code & 0b111 == 0).collect();
+            vec![command]
+        }
+        PartitionAction::SmartTest { extended, .. } => {
+            let mut command = CommandSpec::elevated(
+                "smartctl",
+                [
+                    OsString::from("--test"),
+                    OsString::from(if *extended { "long" } else { "short" }),
+                    path(),
+                ],
+            );
+            // Health findings use the upper exit bits and do not mean that
+            // starting the self-test failed.
+            command.accepted_codes = (0..=255).filter(|code| code & 0b111 == 0).collect();
+            vec![command]
+        }
+        PartitionAction::DriveSetting { setting, .. } => {
+            let argument = match setting {
+                DriveSetting::Standby(value) => format!("-S{value}"),
+                DriveSetting::PowerManagement(value) => format!("-B{value}"),
+                DriveSetting::AcousticManagement(value) => format!("-M{value}"),
+                DriveSetting::WriteCache(enabled) => {
+                    format!("-W{}", if *enabled { 1 } else { 0 })
+                }
+            };
+            vec![CommandSpec::elevated(
+                "hdparm",
+                [OsString::from(argument), path()],
+            )]
+        }
         PartitionAction::Mount { .. } => vec![CommandSpec::user(
             "udisksctl",
             [
@@ -1292,8 +1908,15 @@ fn command_plan(
                 OsString::from("--no-user-interaction"),
             ],
         )],
-        PartitionAction::CreateTable { table, disk } => {
+        PartitionAction::CreateTable {
+            table,
+            disk,
+            overwrite,
+        } => {
             let mut commands = wipe_disk_commands(disk, inventory);
+            if *overwrite {
+                commands.insert(0, full_overwrite_command(disk));
+            }
             commands.push(CommandSpec::elevated(
                 "parted",
                 [
@@ -1306,8 +1929,11 @@ fn command_plan(
             commands.push(reread_partition_table_command(disk));
             commands
         }
-        PartitionAction::EraseDisk { disk } => {
+        PartitionAction::EraseDisk { disk, overwrite } => {
             let mut commands = wipe_disk_commands(disk, inventory);
+            if *overwrite {
+                commands.insert(0, full_overwrite_command(disk));
+            }
             commands.push(reread_partition_table_command(disk));
             commands
         }
@@ -1371,13 +1997,19 @@ fn command_plan(
         )],
         PartitionAction::Format {
             filesystem, label, ..
-        } => vec![
-            CommandSpec::elevated(
+        } => {
+            let mut commands = vec![CommandSpec::elevated(
                 "wipefs",
                 [OsString::from("--all"), OsString::from("--force"), path()],
-            ),
-            format_command(path(), *filesystem, label.as_deref()),
-        ],
+            )];
+            if *filesystem != Filesystem::None {
+                commands.push(format_command(path(), *filesystem, label.as_deref()));
+            }
+            commands
+        }
+        PartitionAction::EncryptFormat { .. } | PartitionAction::CreateEncryptedDisk { .. } => {
+            Vec::new()
+        }
         PartitionAction::Grow {
             disk,
             number,
@@ -1458,10 +2090,9 @@ fn command_plan(
         PartitionAction::CheckFilesystem { filesystem, .. } => {
             vec![check_command(path(), *filesystem)]
         }
-        PartitionAction::WipeSignatures { .. } => vec![CommandSpec::elevated(
-            "wipefs",
-            [OsString::from("--all"), path()],
-        )],
+        PartitionAction::RepairFilesystem { filesystem, .. } => {
+            vec![repair_command(path(), *filesystem)]
+        }
         PartitionAction::SetFlag {
             disk,
             number,
@@ -1483,30 +2114,57 @@ fn command_plan(
             "sfdisk",
             [OsString::from("--dump"), path()],
         )],
-        PartitionAction::HddWipe { passes, disk } => vec![
+        PartitionAction::CreateImage { destination, .. } => vec![
             CommandSpec::elevated(
-                "shred",
+                "dd",
                 [
-                    OsString::from("--verbose"),
-                    OsString::from("--iterations"),
-                    OsString::from(passes.to_string()),
-                    OsString::from("--zero"),
-                    path(),
+                    OsString::from(format!("if={}", action.target().path.display())),
+                    OsString::from(format!("of={}", destination.display())),
+                    OsString::from("bs=4M"),
+                    OsString::from("iflag=fullblock"),
+                    OsString::from("oflag=excl"),
+                    OsString::from("status=progress"),
+                    OsString::from("conv=fsync"),
                 ],
             ),
-            reread_partition_table_command(disk),
+            CommandSpec::elevated(
+                "chown",
+                [
+                    OsString::from(format!("{}:{}", Uid::current(), Gid::current())),
+                    destination.as_os_str().to_owned(),
+                ],
+            ),
         ],
-        PartitionAction::NvmeErase { .. } => vec![CommandSpec::elevated(
-            "nvme",
-            [
-                OsString::from("id-ctrl"),
-                nvme_controller_path(&matching_entry(inventory, action.target())?.device)?
-                    .into_os_string(),
-                OsString::from("--output-format=json"),
-            ],
-        )],
+        PartitionAction::RestoreImage { source, .. } => vec![
+            CommandSpec::elevated(
+                "dd",
+                [
+                    OsString::from(format!("if={}", source.display())),
+                    OsString::from(format!("of={}", action.target().path.display())),
+                    OsString::from("bs=4M"),
+                    OsString::from("iflag=fullblock"),
+                    OsString::from("oflag=direct"),
+                    OsString::from("status=progress"),
+                    OsString::from("conv=fsync"),
+                ],
+            ),
+            CommandSpec::elevated("blockdev", [OsString::from("--rereadpt"), path()]),
+        ],
     };
     Ok(commands)
+}
+
+fn full_overwrite_command(disk: &DeviceIdentity) -> CommandSpec {
+    CommandSpec::elevated(
+        "dd",
+        [
+            OsString::from("if=/dev/zero"),
+            OsString::from(format!("of={}", disk.path.display())),
+            OsString::from("bs=16M"),
+            OsString::from("status=progress"),
+            OsString::from("conv=fsync"),
+        ],
+    )
 }
 
 fn wipe_disk_commands(disk: &DeviceIdentity, inventory: &PartitionInventory) -> Vec<CommandSpec> {
@@ -1569,7 +2227,7 @@ fn verify_final_state(action: &PartitionAction, inventory: &PartitionInventory) 
     }
     let target = matching_entry(inventory, action.target())?;
     match action {
-        PartitionAction::CreateTable { table, disk } => {
+        PartitionAction::CreateTable { table, disk, .. } => {
             if !table.current_matches(target.device.table_type.as_deref()) {
                 return Err(MinfmError::Message(format!(
                     "{} does not report the requested {} table",
@@ -1579,7 +2237,7 @@ fn verify_final_state(action: &PartitionAction, inventory: &PartitionInventory) 
             }
             require_no_partition_children(disk, inventory)?;
         }
-        PartitionAction::EraseDisk { disk } => {
+        PartitionAction::EraseDisk { disk, .. } => {
             if target.device.table_type.is_some() {
                 return Err(MinfmError::Message(format!(
                     "{} still reports a partition table",
@@ -1596,6 +2254,37 @@ fn verify_final_state(action: &PartitionAction, inventory: &PartitionInventory) 
                 target.device.path.display(),
                 filesystem.name()
             )));
+        }
+        PartitionAction::EncryptFormat { .. } => {
+            if target.device.filesystem.as_deref() != Some("crypto_LUKS") {
+                return Err(MinfmError::Message(format!(
+                    "{} does not report the requested LUKS2 container",
+                    target.device.path.display()
+                )));
+            }
+        }
+        PartitionAction::CreateEncryptedDisk { disk, .. } => {
+            if target.device.table_type.as_deref() != Some("gpt") {
+                return Err(MinfmError::Message(format!(
+                    "{} does not report the requested GPT table",
+                    disk.path.display()
+                )));
+            }
+            let encrypted = inventory
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.device.kind == "part"
+                        && entry.device.parent.as_ref() == Some(&disk.path)
+                        && entry.device.filesystem.as_deref() == Some("crypto_LUKS")
+                })
+                .count();
+            if encrypted != 1 {
+                return Err(MinfmError::Message(format!(
+                    "{} does not report exactly one LUKS2 partition",
+                    disk.path.display()
+                )));
+            }
         }
         PartitionAction::Grow { end_bytes, .. } | PartitionAction::Shrink { end_bytes, .. } => {
             let start = target.device.start_bytes().ok_or_else(|| {
@@ -1684,24 +2373,6 @@ fn verify_final_state(action: &PartitionAction, inventory: &PartitionInventory) 
             }
         }
         PartitionAction::SetFlag { .. } => {}
-        PartitionAction::HddWipe { disk, .. }
-        | PartitionAction::NvmeErase {
-            disk,
-            method:
-                NvmeEraseMethod::SanitizeBlockErase
-                | NvmeEraseMethod::SanitizeCryptoErase
-                | NvmeEraseMethod::SanitizeOverwrite
-                | NvmeEraseMethod::FormatUserDataErase
-                | NvmeEraseMethod::FormatCryptoErase,
-        } => {
-            if target.device.table_type.is_some() || target.device.filesystem.is_some() {
-                return Err(MinfmError::Message(format!(
-                    "{} still reports storage signatures after erasure",
-                    disk.path.display()
-                )));
-            }
-            require_no_partition_children(disk, inventory)?;
-        }
         _ => {}
     }
     Ok(())
@@ -1779,15 +2450,20 @@ fn require_no_partition_children(
 fn format_command(path: OsString, filesystem: Filesystem, label: Option<&str>) -> CommandSpec {
     let (program, mut arguments) = match filesystem {
         Filesystem::Ext4 => ("mkfs.ext4", vec![OsString::from("-F")]),
+        Filesystem::Ntfs => ("mkfs.ntfs", vec![OsString::from("-F")]),
         Filesystem::Xfs => ("mkfs.xfs", vec![OsString::from("-f")]),
         Filesystem::Btrfs => ("mkfs.btrfs", vec![OsString::from("-f")]),
+        Filesystem::F2fs => ("mkfs.f2fs", vec![OsString::from("-f")]),
         Filesystem::Fat32 => ("mkfs.fat", vec![OsString::from("-F"), OsString::from("32")]),
         Filesystem::Exfat => ("mkfs.exfat", Vec::new()),
         Filesystem::Swap => ("mkswap", Vec::new()),
+        Filesystem::Udf => ("mkudffs", Vec::new()),
+        Filesystem::None => unreachable!("no-filesystem formatting only wipes signatures"),
     };
     if let Some(label) = label.filter(|label| !label.is_empty()) {
         arguments.push(OsString::from(match filesystem {
-            Filesystem::Fat32 => "-n",
+            Filesystem::Fat32 | Filesystem::Ntfs => "-n",
+            Filesystem::Udf => "--lvid",
             _ => "-L",
         }));
         arguments.push(OsString::from(label));
@@ -1799,6 +2475,7 @@ fn format_command(path: OsString, filesystem: Filesystem, label: Option<&str>) -
 fn label_command(path: OsString, filesystem: Filesystem, label: &str) -> CommandSpec {
     let (program, arguments) = match filesystem {
         Filesystem::Ext4 => ("e2label", vec![path, label.into()]),
+        Filesystem::Ntfs => ("ntfslabel", vec![path, label.into()]),
         Filesystem::Xfs => ("xfs_admin", vec![OsString::from("-L"), label.into(), path]),
         Filesystem::Btrfs => (
             "btrfs",
@@ -1809,9 +2486,12 @@ fn label_command(path: OsString, filesystem: Filesystem, label: &str) -> Command
                 label.into(),
             ],
         ),
+        Filesystem::F2fs => ("f2fslabel", vec![path, label.into()]),
         Filesystem::Fat32 => ("fatlabel", vec![path, label.into()]),
         Filesystem::Exfat => ("exfatlabel", vec![path, label.into()]),
         Filesystem::Swap => ("swaplabel", vec![OsString::from("-L"), label.into(), path]),
+        Filesystem::Udf => ("udflabel", vec![path, label.into()]),
+        Filesystem::None => unreachable!("an unformatted partition has no label"),
     };
     CommandSpec::elevated(program, arguments)
 }
@@ -1819,16 +2499,47 @@ fn label_command(path: OsString, filesystem: Filesystem, label: &str) -> Command
 fn check_command(path: OsString, filesystem: Filesystem) -> CommandSpec {
     let (program, arguments) = match filesystem {
         Filesystem::Ext4 => ("e2fsck", vec![OsString::from("-fn"), path]),
+        Filesystem::Ntfs => ("ntfsfix", vec![OsString::from("-n"), path]),
         Filesystem::Xfs => ("xfs_repair", vec![OsString::from("-n"), path]),
         Filesystem::Btrfs => (
             "btrfs",
             vec![OsString::from("check"), OsString::from("--readonly"), path],
         ),
+        Filesystem::F2fs => ("fsck.f2fs", vec![OsString::from("-f"), path]),
         Filesystem::Fat32 => ("fsck.fat", vec![OsString::from("-n"), path]),
         Filesystem::Exfat => ("fsck.exfat", vec![OsString::from("-n"), path]),
         Filesystem::Swap => ("swaplabel", vec![path]),
+        Filesystem::Udf => ("fsck.udf", vec![OsString::from("-n"), path]),
+        Filesystem::None => unreachable!("an unformatted partition cannot be checked"),
     };
     CommandSpec::elevated(program, arguments)
+}
+
+fn repair_command(path: OsString, filesystem: Filesystem) -> CommandSpec {
+    let (program, arguments) = match filesystem {
+        Filesystem::Ext4 => (
+            "e2fsck",
+            vec![OsString::from("-f"), OsString::from("-p"), path],
+        ),
+        Filesystem::Ntfs => ("ntfsfix", vec![path]),
+        Filesystem::Xfs => ("xfs_repair", vec![path]),
+        Filesystem::Btrfs => (
+            "btrfs",
+            vec![OsString::from("check"), OsString::from("--repair"), path],
+        ),
+        Filesystem::F2fs => ("fsck.f2fs", vec![OsString::from("-f"), path]),
+        Filesystem::Fat32 => ("fsck.fat", vec![OsString::from("-a"), path]),
+        Filesystem::Exfat => ("fsck.exfat", vec![OsString::from("-p"), path]),
+        Filesystem::Udf => ("fsck.udf", vec![OsString::from("-p"), path]),
+        Filesystem::Swap | Filesystem::None => {
+            unreachable!("unsupported repair filesystem was validated")
+        }
+    };
+    let mut command = CommandSpec::elevated(program, arguments);
+    if filesystem == Filesystem::Ext4 {
+        command.accepted_codes = vec![0, 1, 2];
+    }
+    command
 }
 
 struct SudoSession {
@@ -1882,9 +2593,14 @@ fn authenticate_sudo(password: &[u8]) -> Result<PathBuf> {
     if output.status.success() {
         return Ok(sudo);
     }
-    let diagnostic = String::from_utf8_lossy(&output.stderr)
-        .trim()
-        .replace('\n', " ");
+    let diagnostic = [output.stderr.as_slice(), output.stdout.as_slice()]
+        .into_iter()
+        .filter_map(|bytes| {
+            let text = String::from_utf8_lossy(bytes).trim().replace('\n', " ");
+            (!text.is_empty()).then_some(text)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
     let lower = diagnostic.to_ascii_lowercase();
     if lower.contains("not in the sudoers")
         || lower.contains("not allowed to run sudo")
@@ -1957,9 +2673,14 @@ fn run_command(
     if spec.accepted_codes.contains(&code) {
         return Ok(output.stdout);
     }
-    let diagnostic = String::from_utf8_lossy(&output.stderr)
-        .trim()
-        .replace('\n', " ");
+    let diagnostic = [output.stderr.as_slice(), output.stdout.as_slice()]
+        .into_iter()
+        .filter_map(|bytes| {
+            let text = String::from_utf8_lossy(bytes).trim().replace('\n', " ");
+            (!text.is_empty()).then_some(text)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
     Err(MinfmError::Message(format!(
         "{} failed{}",
         spec.program.to_string_lossy(),
@@ -1969,6 +2690,58 @@ fn run_command(
             format!(": {diagnostic}")
         }
     )))
+}
+
+fn run_command_with_secret<const N: usize>(
+    program: &str,
+    arguments: [OsString; N],
+    secret: &[u8],
+    use_sudo: bool,
+) -> Result<()> {
+    let requested = trusted_program(&OsString::from(program))?;
+    let (executable, arguments) = if use_sudo {
+        let sudo = trusted_program(&OsString::from("sudo"))?;
+        let mut elevated = vec![
+            OsString::from("--non-interactive"),
+            OsString::from("--"),
+            requested.into_os_string(),
+        ];
+        elevated.extend(arguments);
+        (sudo.into_os_string(), elevated)
+    } else {
+        (requested.into_os_string(), arguments.into_iter().collect())
+    };
+    let mut child = Command::new(&executable)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| crate::error::io_error(format!("could not run {program}"), error))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| MinfmError::Message("could not open the encryption key pipe".into()))?
+        .write_all(secret)
+        .map_err(|error| crate::error::io_error("could not send the encryption key", error))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| crate::error::io_error(format!("could not finish {program}"), error))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let diagnostic = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .replace('\n', " ");
+        Err(MinfmError::Message(format!(
+            "{program} failed{}",
+            if diagnostic.is_empty() {
+                format!(" with status {}", output.status)
+            } else {
+                format!(": {diagnostic}")
+            }
+        )))
+    }
 }
 
 fn write_new_backup(destination: &Path, contents: &[u8]) -> Result<()> {
@@ -1982,210 +2755,6 @@ fn write_new_backup(destination: &Path, contents: &[u8]) -> Result<()> {
     file.write_all(contents)
         .and_then(|()| file.sync_all())
         .map_err(|error| crate::error::io_error("could not save partition-table backup", error))
-}
-
-pub fn probe_nvme_erase_capabilities(
-    device: &BlockDevice,
-    administrator_password: Option<&[u8]>,
-) -> Result<NvmeEraseCapabilities> {
-    let controller = nvme_controller_path(device)?;
-    let use_sudo = administrator_authentication_required();
-    let sudo_session = if use_sudo {
-        Some(SudoSession {
-            program: authenticate_sudo(administrator_password.ok_or_else(|| {
-                MinfmError::Message("administrator authentication is required".into())
-            })?)?,
-        })
-    } else {
-        None
-    };
-    let identify = run_command(
-        &CommandSpec::elevated(
-            "nvme",
-            [
-                OsString::from("id-ctrl"),
-                controller.as_os_str().to_owned(),
-                OsString::from("--output-format=json"),
-            ],
-        ),
-        use_sudo,
-        administrator_password,
-    )?;
-    let sanitize_log = run_command(
-        &CommandSpec::elevated(
-            "nvme",
-            [
-                OsString::from("sanitize-log"),
-                controller.into_os_string(),
-                OsString::from("--raw-binary"),
-            ],
-        ),
-        use_sudo,
-        administrator_password,
-    )
-    .ok()
-    .and_then(|output| nvme_sanitize_status(&output).ok());
-    drop(sudo_session);
-    let sanitize_failed = sanitize_log == Some(NvmeSanitizeStatus::Failed);
-    nvme_capabilities_from_identify(&identify, sanitize_failed)
-}
-
-fn nvme_capabilities_from_identify(
-    identify_json: &[u8],
-    sanitize_failed: bool,
-) -> Result<NvmeEraseCapabilities> {
-    let sanicap = parse_json_integer(identify_json, "sanicap").unwrap_or(0);
-    let oacs = parse_json_integer(identify_json, "oacs").unwrap_or(0);
-    let fna = parse_json_integer(identify_json, "fna").unwrap_or(0);
-    let mut methods = Vec::new();
-    if sanicap & 0b010 != 0 {
-        methods.push(NvmeEraseMethod::SanitizeBlockErase);
-    }
-    if sanicap & 0b001 != 0 {
-        methods.push(NvmeEraseMethod::SanitizeCryptoErase);
-    }
-    if sanicap & 0b100 != 0 {
-        methods.push(NvmeEraseMethod::SanitizeOverwrite);
-    }
-    if oacs & 0b010 != 0 {
-        methods.push(NvmeEraseMethod::FormatUserDataErase);
-        if fna & 0b100 != 0 {
-            methods.push(NvmeEraseMethod::FormatCryptoErase);
-        }
-    }
-    if sanitize_failed {
-        methods.push(NvmeEraseMethod::ExitFailureMode);
-    }
-    if methods.is_empty() {
-        return Err(MinfmError::Message(
-            "This NVMe drive reports no supported Sanitize or secure Format erase method. No erase command was started."
-                .into(),
-        ));
-    }
-    Ok(NvmeEraseCapabilities {
-        methods,
-        sanitize_failed,
-    })
-}
-
-fn nvme_sanitize_command(
-    action: &PartitionAction,
-    inventory: &PartitionInventory,
-    identify_json: &[u8],
-) -> Result<CommandSpec> {
-    let target = matching_entry(inventory, action.target())?;
-    let controller = nvme_controller_path(&target.device)?;
-    let PartitionAction::NvmeErase { method, .. } = action else {
-        return Err(MinfmError::Message("expected an NVMe erase action".into()));
-    };
-    if *method != NvmeEraseMethod::ExitFailureMode {
-        let capabilities = nvme_capabilities_from_identify(identify_json, false)?;
-        if !capabilities.methods.contains(method) {
-            return Err(MinfmError::Message(format!(
-                "{} is no longer reported by this NVMe controller; no erase command was started",
-                method.name()
-            )));
-        }
-    }
-    let sanact = method.sanitize_action().ok_or_else(|| {
-        MinfmError::Message("the selected NVMe method is not a Sanitize command".into())
-    })?;
-    Ok(CommandSpec::elevated(
-        "nvme",
-        [
-            OsString::from("sanitize"),
-            controller.into_os_string(),
-            OsString::from("--sanact"),
-            OsString::from(sanact),
-        ],
-    ))
-}
-
-fn nvme_format_command(
-    action: &PartitionAction,
-    inventory: &PartitionInventory,
-    identify_json: &[u8],
-) -> Result<CommandSpec> {
-    let target = matching_entry(inventory, action.target())?;
-    let PartitionAction::NvmeErase { method, .. } = action else {
-        return Err(MinfmError::Message("expected an NVMe erase action".into()));
-    };
-    let capabilities = nvme_capabilities_from_identify(identify_json, false)?;
-    if !capabilities.methods.contains(method) {
-        return Err(MinfmError::Message(format!(
-            "{} is no longer reported by this NVMe controller; no erase command was started",
-            method.name()
-        )));
-    }
-    let secure_erase = method.format_secure_erase().ok_or_else(|| {
-        MinfmError::Message("the selected NVMe method is not a Format command".into())
-    })?;
-    Ok(CommandSpec::elevated(
-        "nvme",
-        [
-            OsString::from("format"),
-            target.device.path.as_os_str().to_owned(),
-            OsString::from("--ses"),
-            OsString::from(secure_erase),
-        ],
-    ))
-}
-
-fn nvme_sanitize_log_command(
-    action: &PartitionAction,
-    inventory: &PartitionInventory,
-) -> Result<CommandSpec> {
-    let target = matching_entry(inventory, action.target())?;
-    Ok(CommandSpec::elevated(
-        "nvme",
-        [
-            OsString::from("sanitize-log"),
-            nvme_controller_path(&target.device)?.into_os_string(),
-            OsString::from("--raw-binary"),
-        ],
-    ))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NvmeSanitizeStatus {
-    NeverRun,
-    Complete,
-    InProgress,
-    Failed,
-}
-
-fn nvme_sanitize_status(log: &[u8]) -> Result<NvmeSanitizeStatus> {
-    if log.len() < 4 {
-        return Err(MinfmError::Message(
-            "NVMe controller returned an incomplete Sanitize status log".into(),
-        ));
-    }
-    match u16::from_le_bytes([log[2], log[3]]) & 0b111 {
-        0 => Ok(NvmeSanitizeStatus::NeverRun),
-        1 | 4 => Ok(NvmeSanitizeStatus::Complete),
-        2 => Ok(NvmeSanitizeStatus::InProgress),
-        3 => Ok(NvmeSanitizeStatus::Failed),
-        _ => Err(MinfmError::Message(
-            "NVMe controller returned an unknown Sanitize status".into(),
-        )),
-    }
-}
-
-fn parse_json_integer(document: &[u8], key: &str) -> Option<u64> {
-    let text = std::str::from_utf8(document).ok()?;
-    let key = format!("\"{key}\"");
-    let tail = text.split_once(&key)?.1;
-    let value = tail.split_once(':')?.1.trim_start();
-    let token = value
-        .trim_start_matches('"')
-        .split(|character: char| {
-            character == '"' || character == ',' || character == '}' || character.is_whitespace()
-        })
-        .next()?;
-    token.strip_prefix("0x").map_or_else(
-        || token.parse().ok(),
-        |hex| u64::from_str_radix(hex, 16).ok(),
-    )
 }
 
 fn sudo_command_arguments(program: OsString, arguments: &[OsString]) -> Vec<OsString> {
@@ -2436,152 +3005,6 @@ mod tests {
     }
 
     #[test]
-    fn hdd_wipe_is_limited_to_rotational_disks_and_has_a_final_zero_pass() {
-        let fixture = "PATH=\"/dev/sdz\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" PTTYPE=\"gpt\" LOG-SEC=\"512\" MODEL=\"Hard Disk\" RO=\"0\" ROTA=\"1\" TRAN=\"sata\" MAJ:MIN=\"65:144\"\n";
-        let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
-        let action = PartitionAction::HddWipe {
-            disk: identity(&inventory, "/dev/sdz"),
-            passes: 3,
-        };
-        validate_action(&action, &inventory).unwrap();
-        let plan = command_plan(&action, &inventory).unwrap();
-        assert_eq!(plan[0].program, OsString::from("shred"));
-        assert_eq!(
-            arguments(&plan[0]),
-            ["--verbose", "--iterations", "3", "--zero", "/dev/sdz"]
-        );
-
-        let flash = fixture.replace("Hard Disk", "USB Flash Disk");
-        let flash = PartitionInventory::from_blocks(block::parse_lsblk(&flash, &[]).unwrap());
-        assert!(validate_action(&action, &flash)
-            .unwrap_err()
-            .to_string()
-            .contains("rotational HDD"));
-    }
-
-    #[test]
-    fn whole_disk_wipe_rejects_active_mapped_descendants() {
-        let fixture = concat!(
-            "PATH=\"/dev/sdz\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" PTTYPE=\"gpt\" LOG-SEC=\"512\" MODEL=\"Hard Disk\" RO=\"0\" ROTA=\"1\" TRAN=\"sata\" MAJ:MIN=\"65:144\"\n",
-            "PATH=\"/dev/sdz1\" TYPE=\"part\" SIZE=\"104857600\" FSTYPE=\"crypto_LUKS\" MOUNTPOINTS=\"\" PKNAME=\"sdz\" PARTN=\"1\" START=\"2048\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"1\" MAJ:MIN=\"65:145\"\n",
-            "PATH=\"/dev/mapper/open-volume\" TYPE=\"crypt\" SIZE=\"100000000\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"sdz1\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" MAJ:MIN=\"253:0\"\n",
-        );
-        let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
-        let action = PartitionAction::HddWipe {
-            disk: identity(&inventory, "/dev/sdz"),
-            passes: 1,
-        };
-        let error = validate_action(&action, &inventory).unwrap_err();
-        assert!(error.to_string().contains("active crypt mapping"));
-    }
-
-    #[test]
-    fn nvme_erase_uses_reported_sanitize_capabilities_without_force() {
-        let fixture = "PATH=\"/dev/nvme0n1\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" PTTYPE=\"gpt\" LOG-SEC=\"512\" MODEL=\"NVMe Disk\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:0\"\n";
-        let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
-        let action = PartitionAction::NvmeErase {
-            disk: identity(&inventory, "/dev/nvme0n1"),
-            method: NvmeEraseMethod::SanitizeBlockErase,
-        };
-        validate_action(&action, &inventory).unwrap();
-        let identify = command_plan(&action, &inventory).unwrap();
-        assert_eq!(
-            arguments(&identify[0]),
-            ["id-ctrl", "/dev/nvme0", "--output-format=json"]
-        );
-
-        let sanitize = nvme_sanitize_command(&action, &inventory, br#"{"sanicap": 2}"#).unwrap();
-        assert_eq!(
-            arguments(&sanitize),
-            ["sanitize", "/dev/nvme0", "--sanact", "2"]
-        );
-        assert!(!arguments(&sanitize).contains(&"--force".to_string()));
-        assert!(nvme_sanitize_command(&action, &inventory, br#"{"sanicap": 0}"#).is_err());
-
-        let log = nvme_sanitize_log_command(&action, &inventory).unwrap();
-        assert_eq!(
-            arguments(&log),
-            ["sanitize-log", "/dev/nvme0", "--raw-binary"]
-        );
-        assert_eq!(
-            nvme_sanitize_status(&[0xff, 0xff, 2, 0]).unwrap(),
-            NvmeSanitizeStatus::InProgress
-        );
-        assert_eq!(
-            nvme_sanitize_status(&[0xff, 0xff, 1, 0]).unwrap(),
-            NvmeSanitizeStatus::Complete
-        );
-        assert_eq!(
-            nvme_sanitize_status(&[0xff, 0xff, 3, 0]).unwrap(),
-            NvmeSanitizeStatus::Failed
-        );
-        assert!(nvme_sanitize_status(&[0xff]).is_err());
-    }
-
-    #[test]
-    fn nvme_capabilities_list_each_reported_method_and_failure_recovery() {
-        let capabilities =
-            nvme_capabilities_from_identify(br#"{"sanicap":7,"oacs":2,"fna":4}"#, true).unwrap();
-        assert_eq!(
-            capabilities.methods,
-            vec![
-                NvmeEraseMethod::SanitizeBlockErase,
-                NvmeEraseMethod::SanitizeCryptoErase,
-                NvmeEraseMethod::SanitizeOverwrite,
-                NvmeEraseMethod::FormatUserDataErase,
-                NvmeEraseMethod::FormatCryptoErase,
-                NvmeEraseMethod::ExitFailureMode,
-            ]
-        );
-        assert!(capabilities.sanitize_failed);
-
-        let format_only =
-            nvme_capabilities_from_identify(br#"{"sanicap":0,"oacs":2,"fna":0}"#, false).unwrap();
-        assert_eq!(
-            format_only.methods,
-            vec![NvmeEraseMethod::FormatUserDataErase]
-        );
-        assert!(
-            nvme_capabilities_from_identify(br#"{"sanicap":0,"oacs":0,"fna":0}"#, false).is_err()
-        );
-    }
-
-    #[test]
-    fn nvme_format_is_namespace_scoped_and_never_forced() {
-        let fixture = concat!(
-            "PATH=\"/dev/nvme0n1\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:0\"\n",
-            "PATH=\"/dev/nvme0n2\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:1\"\n",
-        );
-        let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
-        let action = PartitionAction::NvmeErase {
-            disk: identity(&inventory, "/dev/nvme0n1"),
-            method: NvmeEraseMethod::FormatCryptoErase,
-        };
-        validate_action(&action, &inventory).unwrap();
-        let format =
-            nvme_format_command(&action, &inventory, br#"{"sanicap":0,"oacs":2,"fna":4}"#).unwrap();
-        assert_eq!(arguments(&format), ["format", "/dev/nvme0n1", "--ses", "2"]);
-        assert!(!arguments(&format).contains(&"--force".to_string()));
-    }
-
-    #[test]
-    fn nvme_erase_rejects_controllers_with_an_unselected_namespace() {
-        let fixture = concat!(
-            "PATH=\"/dev/nvme0n1\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:0\"\n",
-            "PATH=\"/dev/nvme0n2\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:1\"\n",
-        );
-        let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
-        let action = PartitionAction::NvmeErase {
-            disk: identity(&inventory, "/dev/nvme0n1"),
-            method: NvmeEraseMethod::SanitizeBlockErase,
-        };
-        assert!(validate_action(&action, &inventory)
-            .unwrap_err()
-            .to_string()
-            .contains("multiple namespaces"));
-    }
-
-    #[test]
     fn backup_creation_never_overwrites_an_existing_file() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("table.sfdisk");
@@ -2597,6 +3020,129 @@ mod tests {
         assert!(validate_partition_type("0fc63daf-8483-4772-8e79-3d69d8477de4").is_ok());
         assert!(validate_partition_type("linux").is_err());
         assert!(validate_partition_type("83;reboot").is_err());
+    }
+
+    #[test]
+    fn smart_and_drive_settings_use_explicit_safe_arguments() {
+        let inventory = operation_inventory(&[]);
+        let disk = identity(&inventory, "/dev/sdb");
+        let report = command_plan(
+            &PartitionAction::SmartReport { disk: disk.clone() },
+            &inventory,
+        )
+        .unwrap();
+        assert_eq!(report[0].program, "smartctl");
+        assert_eq!(arguments(&report[0]), ["--all", "/dev/sdb"]);
+
+        let test = command_plan(
+            &PartitionAction::SmartTest {
+                disk: disk.clone(),
+                extended: true,
+            },
+            &inventory,
+        )
+        .unwrap();
+        assert_eq!(arguments(&test[0]), ["--test", "long", "/dev/sdb"]);
+        assert!(test[0].accepted_codes.contains(&8));
+        assert!(test[0].accepted_codes.contains(&128));
+        assert!(!test[0].accepted_codes.contains(&1));
+
+        let cache = command_plan(
+            &PartitionAction::DriveSetting {
+                disk,
+                setting: DriveSetting::WriteCache(false),
+            },
+            &inventory,
+        )
+        .unwrap();
+        assert_eq!(cache[0].program, "hdparm");
+        assert_eq!(arguments(&cache[0]), ["-W0", "/dev/sdb"]);
+    }
+
+    #[test]
+    fn persistent_options_replace_only_the_selected_uuid() {
+        let current = concat!(
+            "# keep this comment\n",
+            "UUID=old /srv/old ext4 defaults 0 2\n",
+            "UUID=keep /srv/keep ext4 defaults 0 2\n",
+        );
+        let updated =
+            replace_config_entry(current, "old", "UUID=old\t/srv/new\tauto\tnofail\t0\t0");
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("UUID=old\t/srv/new"));
+        assert!(updated.contains("UUID=keep /srv/keep"));
+        assert!(!updated.contains("/srv/old"));
+    }
+
+    #[test]
+    fn persistent_option_fields_reject_whitespace_and_shell_syntax() {
+        assert!(validate_option_field("defaults,nofail").is_ok());
+        assert!(validate_option_field("x-systemd.device-timeout=10s").is_ok());
+        assert!(validate_option_field("defaults;reboot").is_err());
+        assert!(validate_option_field("defaults nofail").is_err());
+    }
+
+    #[test]
+    fn smart_report_is_reduced_to_useful_health_fields() {
+        let report = concat!(
+            "smartctl 7.4\n",
+            "Device Model: Test Disk\n",
+            "Serial Number: SECRET-SERIAL\n",
+            "SMART overall-health self-assessment test result: PASSED\n",
+            "190 Airflow_Temperature_Cel 0x0022 070 050 045 Old_age Always - 30\n",
+            "A very long unrelated diagnostic line\n",
+        );
+        let summary = summarize_smart_report(report);
+        assert!(summary.contains("Device Model: Test Disk"));
+        assert!(summary.contains("PASSED"));
+        assert!(summary.contains("Airflow_Temperature"));
+        assert!(!summary.contains("unrelated diagnostic"));
+
+        let complete = complete_smart_report(report);
+        assert!(complete.contains("Summary"));
+        assert!(complete.contains("Full report"));
+        assert!(complete.contains("unrelated diagnostic"));
+    }
+
+    #[test]
+    fn active_smart_tests_are_reported_instead_of_treated_as_failures() {
+        let nvme_report = concat!(
+            "SMART overall-health self-assessment test result: PASSED\n",
+            "Self-test status: Extended self-test in progress (68% completed)\n",
+        );
+        assert!(smart_self_test_running(nvme_report));
+        assert!(!smart_self_test_running(
+            "Self-test status: No self-test in progress"
+        ));
+        assert!(smart_test_already_running_error(
+            "smartctl failed: Can't start self-test without aborting current test (68% completed)"
+        ));
+        let summary = summarize_smart_report(nvme_report);
+        assert!(summary.contains("68% completed"));
+    }
+
+    #[test]
+    fn luks_passphrase_action_validates_and_redacts_both_keys() {
+        let fixture = "PATH=\"/dev/sdb1\" TYPE=\"part\" SIZE=\"104857600\" FSTYPE=\"crypto_LUKS\" UUID=\"luks-id\" MOUNTPOINTS=\"\" PKNAME=\"\" PARTN=\"1\" START=\"2048\" LOG-SEC=\"512\" RO=\"0\" MAJ:MIN=\"8:17\"\n";
+        let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
+        let mut old = SecretInput::default();
+        let mut new = SecretInput::default();
+        for character in "old secret".chars() {
+            old.push(character);
+        }
+        for character in "new secret".chars() {
+            new.push(character);
+        }
+        let action = PartitionAction::ChangeLuksPassphrase {
+            target: identity(&inventory, "/dev/sdb1"),
+            old,
+            new,
+        };
+        validate_action(&action, &inventory).unwrap();
+        let rendered = format!("{action:?}");
+        assert!(!rendered.contains("old secret"));
+        assert!(!rendered.contains("new secret"));
+        assert!(rendered.matches("[REDACTED]").count() >= 2);
     }
 
     #[test]
@@ -2660,7 +3206,11 @@ mod tests {
             .unwrap()
             .device
             .major_minor = Some("8:99".into());
-        let action = PartitionAction::WipeSignatures { target };
+        let action = PartitionAction::Format {
+            target,
+            filesystem: Filesystem::Ext4,
+            label: None,
+        };
         assert!(validate_action(&action, &changed)
             .unwrap_err()
             .to_string()
@@ -2749,6 +3299,7 @@ mod tests {
         let action = PartitionAction::CreateTable {
             disk: identity(&inventory, "/dev/sdb"),
             table: PartitionTable::Gpt,
+            overwrite: false,
         };
         validate_action(&action, &inventory).unwrap();
         let plan = command_plan(&action, &inventory).unwrap();
@@ -2769,6 +3320,7 @@ mod tests {
         let inventory = operation_inventory(&[]);
         let action = PartitionAction::EraseDisk {
             disk: identity(&inventory, "/dev/sdb"),
+            overwrite: false,
         };
         validate_action(&action, &inventory).unwrap();
         let plan = command_plan(&action, &inventory).unwrap();
@@ -2789,6 +3341,7 @@ mod tests {
         let action = PartitionAction::CreateTable {
             disk: identity(&inventory, "/dev/sdb"),
             table: PartitionTable::Gpt,
+            overwrite: false,
         };
         let error = verify_final_state(&action, &inventory).unwrap_err();
         assert!(error.to_string().contains("still reports old partition"));
@@ -2802,6 +3355,7 @@ mod tests {
             PartitionInventory::from_blocks(block::parse_lsblk(empty_fixture, &[]).unwrap());
         let erase = PartitionAction::EraseDisk {
             disk: identity(&empty, "/dev/sdb"),
+            overwrite: false,
         };
         verify_final_state(&erase, &empty).unwrap();
 
@@ -2859,10 +3413,17 @@ mod tests {
                 PartitionAction::CreateTable {
                     disk: disk.clone(),
                     table: PartitionTable::Gpt,
+                    overwrite: false,
                 },
                 "parted",
             ),
-            (PartitionAction::EraseDisk { disk: disk.clone() }, "wipefs"),
+            (
+                PartitionAction::EraseDisk {
+                    disk: disk.clone(),
+                    overwrite: false,
+                },
+                "wipefs",
+            ),
             (
                 PartitionAction::CreatePartition {
                     disk: disk.clone(),
@@ -2913,12 +3474,6 @@ mod tests {
                 "e2fsck",
             ),
             (
-                PartitionAction::WipeSignatures {
-                    target: target.clone(),
-                },
-                "wipefs",
-            ),
-            (
                 PartitionAction::SetFlag {
                     target: target.clone(),
                     disk: disk.clone(),
@@ -2935,7 +3490,6 @@ mod tests {
                 },
                 "sfdisk",
             ),
-            (PartitionAction::HddWipe { disk, passes: 3 }, "shred"),
         ];
         for (action, expected_program) in cases {
             let plan = command_plan(&action, &inventory).unwrap();

@@ -25,11 +25,14 @@ pub struct LuksDevice {
     pub system_protected: bool,
     pub ejectable: bool,
     pub eject_blocked: bool,
+    pub kind: String,
+    pub filesystem: Option<String>,
+    pub encrypted: bool,
 }
 
 impl LuksDevice {
     pub fn is_locked(&self) -> bool {
-        self.mapping.is_none()
+        self.encrypted && self.mapping.is_none()
     }
 
     pub fn is_mounted(&self) -> bool {
@@ -37,18 +40,30 @@ impl LuksDevice {
     }
 
     pub fn state_text(&self) -> &'static str {
-        if self.is_locked() {
+        if self.encrypted && self.is_locked() {
             "locked"
         } else if self.is_mounted() {
             "mounted"
-        } else {
+        } else if self.encrypted {
             "unlocked"
+        } else if self.filesystem.is_some() {
+            "unmounted"
+        } else {
+            "available"
         }
     }
 }
 
 #[derive(Clone, Default)]
 pub struct SecretInput(Vec<u8>);
+
+impl PartialEq for SecretInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for SecretInput {}
 
 impl SecretInput {
     pub fn push(&mut self, character: char) {
@@ -104,6 +119,12 @@ pub enum LuksAction {
     },
     Mount {
         mapping: PathBuf,
+    },
+    MountFilesystem {
+        source: PathBuf,
+    },
+    UnmountFilesystem {
+        source: PathBuf,
     },
     UnmountAndLock {
         source: PathBuf,
@@ -200,6 +221,24 @@ pub fn execute_with_progress(
                 mountpoint,
             })
         }
+        LuksAction::MountFilesystem { source } => {
+            report_phase("Mounting filesystem");
+            run_udisks(["mount", "--block-device"], source)?;
+            report_phase("Confirming mount");
+            let mountpoint = wait_for_device(source, |device| device.mountpoints.first().cloned());
+            Ok(LuksOutcome {
+                message: format!("Mounted {}", source.display()),
+                mountpoint,
+            })
+        }
+        LuksAction::UnmountFilesystem { source } => {
+            report_phase("Unmounting filesystem");
+            run_udisks(["unmount", "--block-device"], source)?;
+            Ok(LuksOutcome {
+                message: format!("Unmounted {}", source.display()),
+                mountpoint: None,
+            })
+        }
         LuksAction::UnmountAndLock { source, mapping } => {
             report_phase("Unmounting volume");
             run_udisks(["unmount", "--block-device"], mapping)?;
@@ -240,6 +279,9 @@ pub fn execute_with_progress(
                 }
                 report_phase("Locking encrypted volume");
                 run_udisks(["lock", "--block-device"], &device.source)?;
+            } else if device.is_mounted() {
+                report_phase("Unmounting filesystem");
+                run_udisks(["unmount", "--block-device"], &device.source)?;
             }
             report_phase("Confirming drive state");
             let refreshed = discover()?
@@ -272,6 +314,8 @@ fn ensure_action_allowed(action: &LuksAction) -> Result<()> {
     let device = match action {
         LuksAction::UnlockAndMount { source, .. }
         | LuksAction::UnmountAndLock { source, .. }
+        | LuksAction::MountFilesystem { source }
+        | LuksAction::UnmountFilesystem { source }
         | LuksAction::Eject { source, .. } => {
             devices.iter().find(|device| device.source == *source)
         }
@@ -286,6 +330,26 @@ fn ensure_action_allowed(action: &LuksAction) -> Result<()> {
         return Err(MinfmError::Message(
             "disk actions on a protected system device are disabled".into(),
         ));
+    }
+    match action {
+        LuksAction::MountFilesystem { .. } if device.encrypted => {
+            return Err(MinfmError::Message(
+                "use the encrypted-volume unlock action".into(),
+            ));
+        }
+        LuksAction::MountFilesystem { .. }
+            if device.filesystem.is_none() || device.is_mounted() =>
+        {
+            return Err(MinfmError::Message(
+                "the selected filesystem cannot be mounted in its current state".into(),
+            ));
+        }
+        LuksAction::UnmountFilesystem { .. } if device.encrypted || !device.is_mounted() => {
+            return Err(MinfmError::Message(
+                "the selected filesystem cannot be unmounted in its current state".into(),
+            ));
+        }
+        _ => {}
     }
     if let LuksAction::Eject { drive, .. } = action {
         if !device.ejectable || device.drive != *drive {
@@ -426,20 +490,27 @@ fn parse_lsblk_with_protected(
 
     let protected = protected_record_names(&records, protected_sources);
     let mut devices = Vec::new();
-    for encrypted in records
-        .iter()
-        .filter(|record| record.filesystem == "crypto_LUKS")
-    {
+    for encrypted in records.iter().filter(|record| {
+        matches!(
+            record.kind.as_str(),
+            "disk" | "part" | "lvm" | "raid" | "md"
+        )
+    }) {
         let source_name = encrypted
             .path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mapping = records.iter().find(|record| {
-            record.kind == "crypt"
-                && (record.parent == encrypted.path.to_string_lossy()
-                    || record.parent == source_name)
-        });
+        let is_encrypted = encrypted.filesystem == "crypto_LUKS";
+        let mapping = is_encrypted
+            .then(|| {
+                records.iter().find(|record| {
+                    record.kind == "crypt"
+                        && (record.parent == encrypted.path.to_string_lossy()
+                            || record.parent == source_name)
+                })
+            })
+            .flatten();
         let drive = physical_drive(&records, encrypted);
         let drive_record = records.iter().find(|record| record.path == drive);
         let ejectable =
@@ -458,11 +529,14 @@ fn parse_lsblk_with_protected(
             mapping: mapping.map(|record| record.path.clone()),
             mountpoints: mapping
                 .map(|record| record.mountpoints.clone())
-                .unwrap_or_default(),
+                .unwrap_or_else(|| encrypted.mountpoints.clone()),
             system_protected: protected.contains(&record_name(&encrypted.path))
                 || mapping.is_some_and(|record| protected.contains(&record_name(&record.path))),
             ejectable,
             eject_blocked,
+            kind: encrypted.kind.clone(),
+            filesystem: (!encrypted.filesystem.is_empty()).then(|| encrypted.filesystem.clone()),
+            encrypted: is_encrypted,
         });
     }
     devices.sort_by(|left, right| left.source.cmp(&right.source));
@@ -576,6 +650,20 @@ mod tests {
             PathBuf::from("/run/media/user/Vault")
         );
         assert_eq!(devices[1].state_text(), "locked");
+    }
+
+    #[test]
+    fn general_inventory_includes_plain_disks_and_filesystems() {
+        let fixture = concat!(
+            "PATH=\"/dev/nvme0n1\" TYPE=\"disk\" FSTYPE=\"\" MOUNTPOINTS=\"\" SIZE=\"500000\" LABEL=\"\" PKNAME=\"\" RM=\"0\" TRAN=\"nvme\"\n",
+            "PATH=\"/dev/nvme0n1p1\" TYPE=\"part\" FSTYPE=\"ext4\" MOUNTPOINTS=\"/run/media/user/data\" SIZE=\"499000\" LABEL=\"Data\" PKNAME=\"/dev/nvme0n1\" RM=\"0\" TRAN=\"nvme\"\n",
+        );
+        let devices = parse_lsblk(fixture).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].kind, "disk");
+        assert!(!devices[0].encrypted);
+        assert_eq!(devices[1].filesystem.as_deref(), Some("ext4"));
+        assert_eq!(devices[1].state_text(), "mounted");
     }
 
     #[test]
