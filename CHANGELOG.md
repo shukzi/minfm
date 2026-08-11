@@ -1,5 +1,19 @@
 # minfm changelog
 
+## v0.5.3
+
+### Added
+
+- The `M` launcher now reports when an optional tool is unavailable before it
+  is opened.
+
+### Fixed
+
+- Device Manager and Network Shares now show clearer messages when their system
+  integration is unavailable, including the packages required to use them.
+- README installation guidance now separates the quick-start commands from the
+  detailed installer and optional-tool information.
+
 ## v0.5.2
 
 ### Fixed
