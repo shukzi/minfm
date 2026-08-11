@@ -37,6 +37,11 @@ esac
     let mut permissions = fs::metadata(&curl).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&curl, permissions).unwrap();
+    let fc_cache = fake_bin.join("fc-cache");
+    fs::write(&fc_cache, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&fc_cache).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fc_cache, permissions).unwrap();
 
     let path = format!("{}:/usr/bin:/bin", fake_bin.display());
     let output = Command::new("/bin/sh")
@@ -65,6 +70,17 @@ esac
         .to_string_lossy()
         .starts_with(".minfm-install.")));
     assert!(temp.path().join(".config/minfm").is_dir());
+    assert_eq!(
+        fs::read(temp.path().join(".local/share/fonts/minfm/minfm-icons.ttf")).unwrap(),
+        b"fake-minfm\n"
+    );
+    assert!(fs::read_dir(temp.path().join(".local/share/fonts/minfm"))
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".minfm-font-install.")));
     assert_eq!(
         fs::read_to_string(config).unwrap(),
         "[icons]\ntheme = 'nerd-font'\n"

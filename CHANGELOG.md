@@ -1,5 +1,22 @@
 # minfm changelog
 
+## v0.4.1
+
+### Added
+
+- Installation and updates: install the symbol font used by minfm's project
+  icons, verify its checksum, and refresh the user font cache.
+
+### Fixed
+
+- Icon defaults: use the approved rounded monochrome set unconditionally instead
+  of selecting the letter-style fallback when no configuration exists.
+
+### Changed
+
+- Icon configuration: remove theme selection, preserve per-icon overrides, and
+  atomically remove obsolete `theme` entries from older configuration files.
+
 ## v0.4.0
 
 ### Added

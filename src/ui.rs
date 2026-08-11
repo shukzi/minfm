@@ -2859,7 +2859,7 @@ mod performance_tests {
         let text = rendered_text(&terminal);
         assert!(text.contains("F2 Tools"));
         assert!(text.contains("F3 Shares"));
-        assert!(text.contains("▤ F4"));
+        assert!(text.contains("󰋊 F4"));
         assert!(!text.contains("M Tools"));
 
         app.mode = AppMode::Help;
@@ -2886,16 +2886,18 @@ mod performance_tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|frame| draw(frame, &app)).unwrap();
             let text = rendered_text(&terminal);
-            assert!(text.contains('␡'), "missing trash action at {width}");
-            assert!(text.contains('ⓘ'), "missing info action at {width}");
-            assert!(text.contains('▤'), "missing partitions action at {width}");
+            assert!(text.contains('󰩹'), "missing trash action at {width}");
+            assert!(text.contains('󰋼'), "missing info action at {width}");
+            assert!(text.contains('󰋊'), "missing partitions action at {width}");
         }
     }
 
     #[test]
-    fn header_actions_follow_the_configured_icon_theme() {
+    fn header_actions_follow_configured_icon_overrides() {
         let temp = tempfile::tempdir().unwrap();
-        let config = toml::from_str("[icons]\ntheme = 'nerd-font'\n").unwrap();
+        let config =
+            toml::from_str("[icons.overrides]\ntrash = 'X'\ninfo = 'Y'\npartitions = 'Z'\n")
+                .unwrap();
         let app = App::new(
             temp.path().to_path_buf(),
             ConfigLoad::Valid {
@@ -2908,10 +2910,10 @@ mod performance_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = rendered_text(&terminal);
-        assert!(text.contains('󰩹'));
-        assert!(text.contains('󰋼'));
-        assert!(text.contains('󰋊'));
-        assert!(!text.contains('ⓘ'));
+        assert!(text.contains('X'));
+        assert!(text.contains('Y'));
+        assert!(text.contains('Z'));
+        assert!(!text.contains('󰋼'));
     }
 
     #[test]

@@ -10,6 +10,9 @@ fi
 binary_name="minfm-linux-x86_64"
 binary_url="${release_base}/${binary_name}"
 checksum_url="${release_base}/${binary_name}.sha256"
+font_name="minfm-icons.ttf"
+font_url="${release_base}/${font_name}"
+font_checksum_url="${release_base}/${font_name}.sha256"
 
 if ! command -v curl >/dev/null 2>&1; then
     echo "minfm installer requires curl." >&2
@@ -18,6 +21,11 @@ fi
 
 if ! command -v sha256sum >/dev/null 2>&1; then
     echo "minfm installer requires sha256sum (usually provided by coreutils)." >&2
+    exit 1
+fi
+
+if ! command -v fc-cache >/dev/null 2>&1; then
+    echo "minfm installer requires fc-cache (provided by fontconfig) for its icon font." >&2
     exit 1
 fi
 
@@ -30,10 +38,14 @@ fi
 
 temp_dir=$(mktemp -d)
 staged_binary=""
+staged_font=""
 cleanup() {
     rm -rf "$temp_dir"
     if [ -n "$staged_binary" ]; then
         rm -f "$staged_binary"
+    fi
+    if [ -n "$staged_font" ]; then
+        rm -f "$staged_font"
     fi
 }
 trap cleanup EXIT HUP INT TERM
@@ -41,24 +53,38 @@ trap cleanup EXIT HUP INT TERM
 echo "Downloading minfm static binary..."
 curl --proto '=https' --tlsv1.2 -fsSL "$binary_url" -o "$temp_dir/$binary_name"
 curl --proto '=https' --tlsv1.2 -fsSL "$checksum_url" -o "$temp_dir/$binary_name.sha256"
+curl --proto '=https' --tlsv1.2 -fsSL "$font_url" -o "$temp_dir/$font_name"
+curl --proto '=https' --tlsv1.2 -fsSL "$font_checksum_url" -o "$temp_dir/$font_name.sha256"
 
-expected=$(awk 'NF >= 1 { print $1; exit }' "$temp_dir/$binary_name.sha256")
-if [ "${#expected}" -ne 64 ]; then
-    echo "The downloaded checksum has an invalid format." >&2
-    exit 1
-fi
-printf '%s  %s\n' "$expected" "$temp_dir/$binary_name" | sha256sum --check --status -
+verify_download() {
+    expected=$(awk 'NF >= 1 { print $1; exit }' "$2")
+    if [ "${#expected}" -ne 64 ]; then
+        echo "The downloaded checksum for $1 has an invalid format." >&2
+        exit 1
+    fi
+    printf '%s  %s\n' "$expected" "$1" | sha256sum --check --status -
+}
+verify_download "$temp_dir/$binary_name" "$temp_dir/$binary_name.sha256"
+verify_download "$temp_dir/$font_name" "$temp_dir/$font_name.sha256"
 
 install_dir=${XDG_BIN_HOME:-${HOME}/.local/bin}
 config_dir=${XDG_CONFIG_HOME:-${HOME}/.config}/minfm
-mkdir -p "$install_dir" "$config_dir"
+font_dir=${XDG_DATA_HOME:-${HOME}/.local/share}/fonts/minfm
+mkdir -p "$install_dir" "$config_dir" "$font_dir"
 staged_binary=$(mktemp "$install_dir/.minfm-install.XXXXXX")
+staged_font=$(mktemp "$font_dir/.minfm-font-install.XXXXXX")
 cp "$temp_dir/$binary_name" "$staged_binary"
+cp "$temp_dir/$font_name" "$staged_font"
 chmod 0755 "$staged_binary"
+chmod 0644 "$staged_font"
+mv "$staged_font" "$font_dir/$font_name"
+staged_font=""
+fc-cache -f "$font_dir"
 mv "$staged_binary" "$install_dir/minfm"
 staged_binary=""
 
 echo "Installed minfm to $install_dir/minfm"
+echo "Installed minfm icon font to $font_dir/$font_name"
 echo "Configuration directory: $config_dir"
 if ! command -v minfm >/dev/null 2>&1; then
     echo "If needed, add $install_dir to PATH, then run: minfm"

@@ -1,7 +1,7 @@
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    config::{IconConfig, IconTheme},
+    config::IconConfig,
     entry::{EntryKind, FileEntry},
 };
 
@@ -22,25 +22,7 @@ struct ThemeIcons {
     other: &'static str,
 }
 
-const UNICODE: ThemeIcons = ThemeIcons {
-    directory_closed: "[>]",
-    directory_open: "[v]",
-    file: "[-]",
-    text: "[T]",
-    code: "[C]",
-    image: "[I]",
-    audio: "[A]",
-    video: "[V]",
-    archive: "[Z]",
-    executable: "[X]",
-    symlink: "[L]",
-    block_device: "[B]",
-    other: "[?]",
-};
-
-// Rounded, filled glyphs commonly bundled in Nerd Fonts. The Unicode theme
-// remains the safe default for terminals without Nerd Font support.
-const NERD_FONT: ThemeIcons = ThemeIcons {
+const PROJECT_ICONS: ThemeIcons = ThemeIcons {
     directory_closed: "󰉋",
     directory_open: "󰉖",
     file: "󰈙",
@@ -58,82 +40,50 @@ const NERD_FONT: ThemeIcons = ThemeIcons {
 
 pub struct Icons<'a> {
     config: &'a IconConfig,
-    theme: ThemeIcons,
 }
 
 impl<'a> Icons<'a> {
     pub fn new(config: &'a IconConfig) -> Self {
-        let theme = match config.theme {
-            IconTheme::Unicode => UNICODE,
-            IconTheme::NerdFont => NERD_FONT,
-        };
-        Self { config, theme }
+        Self { config }
     }
 
     pub fn entry(&self, entry: &FileEntry, expanded: bool) -> &str {
         match entry.kind {
             EntryKind::Directory if expanded => self.directory_open(),
             EntryKind::Directory => self.directory_closed(),
-            EntryKind::Symlink => self.resolve(&self.config.overrides.symlink, self.theme.symlink),
-            EntryKind::BlockDevice => {
-                self.resolve(&self.config.overrides.block_device, self.theme.block_device)
+            EntryKind::Symlink => {
+                self.resolve(&self.config.overrides.symlink, PROJECT_ICONS.symlink)
             }
-            EntryKind::Other => self.resolve(&self.config.overrides.other, self.theme.other),
+            EntryKind::BlockDevice => self.resolve(
+                &self.config.overrides.block_device,
+                PROJECT_ICONS.block_device,
+            ),
+            EntryKind::Other => self.resolve(&self.config.overrides.other, PROJECT_ICONS.other),
             EntryKind::File if entry.mode & 0o111 != 0 => {
-                self.resolve(&self.config.overrides.executable, self.theme.executable)
+                self.resolve(&self.config.overrides.executable, PROJECT_ICONS.executable)
             }
             EntryKind::File => self.file_icon(entry),
         }
     }
 
     pub fn header_trash(&self) -> &str {
-        self.resolve(
-            &self.config.overrides.trash,
-            match self.config.theme {
-                IconTheme::Unicode => "␡",
-                IconTheme::NerdFont => "󰩹",
-            },
-        )
+        self.resolve(&self.config.overrides.trash, "󰩹")
     }
 
     pub fn header_info(&self) -> &str {
-        self.resolve(
-            &self.config.overrides.info,
-            match self.config.theme {
-                IconTheme::Unicode => "ⓘ",
-                IconTheme::NerdFont => "󰋼",
-            },
-        )
+        self.resolve(&self.config.overrides.info, "󰋼")
     }
 
     pub fn header_devices(&self) -> &str {
-        self.resolve(
-            &self.config.overrides.devices,
-            match self.config.theme {
-                IconTheme::Unicode => "▣",
-                IconTheme::NerdFont => "󰍹",
-            },
-        )
+        self.resolve(&self.config.overrides.devices, "󰍹")
     }
 
     pub fn header_partitions(&self) -> &str {
-        self.resolve(
-            &self.config.overrides.partitions,
-            match self.config.theme {
-                IconTheme::Unicode => "▤",
-                IconTheme::NerdFont => "󰋊",
-            },
-        )
+        self.resolve(&self.config.overrides.partitions, "󰋊")
     }
 
     pub fn header_sort(&self) -> &str {
-        self.resolve(
-            &self.config.overrides.sort,
-            match self.config.theme {
-                IconTheme::Unicode => "⇅",
-                IconTheme::NerdFont => "󰒺",
-            },
-        )
+        self.resolve(&self.config.overrides.sort, "󰒺")
     }
 
     pub fn slot(icon: &str) -> String {
@@ -144,14 +94,14 @@ impl<'a> Icons<'a> {
     fn directory_closed(&self) -> &str {
         self.resolve(
             &self.config.overrides.directory_closed,
-            self.theme.directory_closed,
+            PROJECT_ICONS.directory_closed,
         )
     }
 
     fn directory_open(&self) -> &str {
         self.resolve(
             &self.config.overrides.directory_open,
-            self.theme.directory_open,
+            PROJECT_ICONS.directory_open,
         )
     }
 
@@ -163,26 +113,26 @@ impl<'a> Icons<'a> {
             .map(str::to_ascii_lowercase);
         match extension.as_deref() {
             Some("txt" | "md" | "markdown" | "rst" | "pdf" | "doc" | "docx" | "odt") => {
-                self.resolve(&self.config.overrides.text, self.theme.text)
+                self.resolve(&self.config.overrides.text, PROJECT_ICONS.text)
             }
             Some(
                 "rs" | "c" | "h" | "cc" | "cpp" | "hpp" | "go" | "java" | "kt" | "kts" | "py"
                 | "rb" | "php" | "lua" | "sh" | "bash" | "zsh" | "fish" | "js" | "jsx" | "ts"
                 | "tsx" | "html" | "css" | "sql" | "toml" | "yaml" | "yml" | "json" | "xml",
-            ) => self.resolve(&self.config.overrides.code, self.theme.code),
+            ) => self.resolve(&self.config.overrides.code, PROJECT_ICONS.code),
             Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff") => {
-                self.resolve(&self.config.overrides.image, self.theme.image)
+                self.resolve(&self.config.overrides.image, PROJECT_ICONS.image)
             }
             Some("mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "opus") => {
-                self.resolve(&self.config.overrides.audio, self.theme.audio)
+                self.resolve(&self.config.overrides.audio, PROJECT_ICONS.audio)
             }
             Some("mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v") => {
-                self.resolve(&self.config.overrides.video, self.theme.video)
+                self.resolve(&self.config.overrides.video, PROJECT_ICONS.video)
             }
             Some("zip" | "tar" | "gz" | "bz2" | "xz" | "zst" | "7z" | "rar") => {
-                self.resolve(&self.config.overrides.archive, self.theme.archive)
+                self.resolve(&self.config.overrides.archive, PROJECT_ICONS.archive)
             }
-            _ => self.resolve(&self.config.overrides.file, self.theme.file),
+            _ => self.resolve(&self.config.overrides.file, PROJECT_ICONS.file),
         }
     }
 
@@ -211,55 +161,54 @@ mod tests {
     }
 
     #[test]
-    fn unicode_icons_cover_only_file_manager_categories() {
+    fn project_icons_cover_only_file_manager_categories() {
         let config = IconConfig::default();
         let icons = Icons::new(&config);
         assert_eq!(
             icons.entry(&entry("folder", EntryKind::Directory, 0), false),
-            "[>]"
+            "󰉋"
         );
         assert_eq!(
             icons.entry(&entry("folder", EntryKind::Directory, 0), true),
-            "[v]"
+            "󰉖"
         );
         assert_eq!(
             icons.entry(&entry("notes.md", EntryKind::File, 0), false),
-            "[T]"
+            "󰈙"
         );
         assert_eq!(
             icons.entry(&entry("main.rs", EntryKind::File, 0), false),
-            "[C]"
+            "󰅩"
         );
         assert_eq!(
             icons.entry(&entry("photo.png", EntryKind::File, 0), false),
-            "[I]"
+            "󰋩"
         );
         assert_eq!(
             icons.entry(&entry("song.flac", EntryKind::File, 0), false),
-            "[A]"
+            "󰎆"
         );
         assert_eq!(
             icons.entry(&entry("movie.mkv", EntryKind::File, 0), false),
-            "[V]"
+            "󰕧"
         );
         assert_eq!(
             icons.entry(&entry("backup.tar", EntryKind::File, 0), false),
-            "[Z]"
+            "󰏗"
         );
         assert_eq!(
             icons.entry(&entry("run", EntryKind::File, 0o755), false),
-            "[X]"
+            "󰆍"
         );
         assert_eq!(
             icons.entry(&entry("link", EntryKind::Symlink, 0), false),
-            "[L]"
+            "󰌷"
         );
     }
 
     #[test]
-    fn nerd_font_theme_and_overrides_are_resolved_centrally() {
+    fn overrides_are_resolved_centrally() {
         let config = IconConfig {
-            theme: IconTheme::NerdFont,
             overrides: IconOverrides {
                 directory_closed: Some("D".into()),
                 trash: Some("X".into()),
