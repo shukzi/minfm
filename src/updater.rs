@@ -9,6 +9,7 @@ use std::{
 
 const REPOSITORY: &str = "shukzi/minfm";
 const BINARY_ASSET: &str = "minfm-linux-x86_64";
+const ICON_FONT_ASSET: &str = "minfm-icons.ttf";
 
 #[derive(Debug)]
 pub enum CheckOutcome {
@@ -70,16 +71,36 @@ pub fn install(version: &str, executable: &Path) -> Result<(), String> {
     if parse_version_tag(version).is_none() {
         return Err("The release version returned by GitHub is invalid".into());
     }
-    if !command_available("curl") || !command_available("sha256sum") {
-        return Err("Updating requires curl and sha256sum".into());
+    if !command_available("curl")
+        || !command_available("sha256sum")
+        || !command_available("fc-cache")
+    {
+        return Err("Updating requires curl, sha256sum, and fc-cache (fontconfig)".into());
     }
     let parent = executable
         .parent()
         .ok_or_else(|| "The installed binary has no parent directory".to_string())?;
     let (temporary, checksum) = unique_temporary_paths(parent)?;
-    let result = install_inner(version, executable, &temporary, &checksum);
+    let font = icon_font_path()?;
+    let font_parent = font
+        .parent()
+        .ok_or_else(|| "The icon font has no parent directory".to_string())?;
+    fs::create_dir_all(font_parent)
+        .map_err(|error| format!("Could not create icon font directory: {error}"))?;
+    let (temporary_font, font_checksum) = unique_temporary_paths(font_parent)?;
+    let result = install_inner(
+        version,
+        executable,
+        &temporary,
+        &checksum,
+        &font,
+        &temporary_font,
+        &font_checksum,
+    );
     let _ = fs::remove_file(&temporary);
     let _ = fs::remove_file(&checksum);
+    let _ = fs::remove_file(&temporary_font);
+    let _ = fs::remove_file(&font_checksum);
     result
 }
 
@@ -88,6 +109,9 @@ fn install_inner(
     executable: &Path,
     temporary: &Path,
     checksum: &Path,
+    font: &Path,
+    temporary_font: &Path,
+    font_checksum: &Path,
 ) -> Result<(), String> {
     let release = format!("https://github.com/{REPOSITORY}/releases/download/{version}");
     download(
@@ -100,18 +124,63 @@ fn install_inner(
         checksum,
         Duration::from_secs(30),
     )?;
+    download(
+        &format!("{release}/{ICON_FONT_ASSET}"),
+        temporary_font,
+        Duration::from_secs(120),
+    )?;
+    download(
+        &format!("{release}/{ICON_FONT_ASSET}.sha256"),
+        font_checksum,
+        Duration::from_secs(30),
+    )?;
     verify_checksum(temporary, checksum)?;
+    verify_checksum(temporary_font, font_checksum)?;
     fs::set_permissions(temporary, fs::Permissions::from_mode(0o755))
         .map_err(|error| format!("Could not set update permissions: {error}"))?;
+    fs::set_permissions(temporary_font, fs::Permissions::from_mode(0o644))
+        .map_err(|error| format!("Could not set icon font permissions: {error}"))?;
     File::open(temporary)
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("Could not sync the downloaded update: {error}"))?;
+    File::open(temporary_font)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Could not sync the downloaded icon font: {error}"))?;
+    fs::rename(temporary_font, font)
+        .map_err(|error| format!("Could not replace {}: {error}", font.display()))?;
+    refresh_font_cache(
+        font.parent()
+            .ok_or_else(|| "The icon font has no parent directory".to_string())?,
+    )?;
     fs::rename(temporary, executable)
         .map_err(|error| format!("Could not replace {}: {error}", executable.display()))?;
     if let Some(parent) = executable.parent() {
         let _ = File::open(parent).and_then(|directory| directory.sync_all());
     }
     Ok(())
+}
+
+fn icon_font_path() -> Result<PathBuf, String> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .ok_or_else(|| {
+            "Could not determine the user data directory for the icon font".to_string()
+        })?;
+    Ok(data_home.join("fonts/minfm").join(ICON_FONT_ASSET))
+}
+
+fn refresh_font_cache(font_directory: &Path) -> Result<(), String> {
+    let status = Command::new("fc-cache")
+        .arg("-f")
+        .arg(font_directory)
+        .status()
+        .map_err(|error| format!("Could not start fc-cache: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("fc-cache failed with status {status}"))
+    }
 }
 
 fn download(url: &str, destination: &Path, timeout: Duration) -> Result<(), String> {

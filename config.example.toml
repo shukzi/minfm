@@ -7,11 +7,6 @@ show_size = true
 show_permissions = true
 show_modified = true
 
-# "unicode" works with ordinary terminal fonts. Choose "nerd-font" only when
-# your terminal is already configured to use a Nerd Font.
-[icons]
-theme = "unicode"
-
 # Override only the symbols you want to change. Each value must occupy one to
 # three terminal cells. Available names are: directory_closed, directory_open,
 # file, text, code, image, audio, video, archive, executable, symlink,

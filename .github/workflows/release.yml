@@ -10,6 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  ICON_FONT_VERSION: "3.5.0"
+  ICON_FONT_ARCHIVE_SHA256: "b7ef2283462b435f1fe91d729dc412d5dbe34269dd2c7f4e1d803e4105c8d883"
 
 jobs:
   release:
@@ -26,7 +28,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.88.0
+          toolchain: 1.97.1
           targets: x86_64-unknown-linux-musl
 
       - name: Verify release version
@@ -48,6 +50,20 @@ jobs:
           cd release
           sha256sum minfm-linux-x86_64 > minfm-linux-x86_64.sha256
 
+      - name: Package verified icon font
+        run: |
+          archive="NerdFontsSymbolsOnly.tar.xz"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/ryanoasis/nerd-fonts/releases/download/v${ICON_FONT_VERSION}/${archive}" \
+            -o "$archive"
+          printf '%s  %s\n' "$ICON_FONT_ARCHIVE_SHA256" "$archive" | sha256sum --check --status -
+          mkdir icon-font
+          tar -xJf "$archive" -C icon-font SymbolsNerdFontMono-Regular.ttf
+          cp icon-font/SymbolsNerdFontMono-Regular.ttf release/minfm-icons.ttf
+          cp licenses/minfm-icons-font.txt release/minfm-icons-LICENSE.txt
+          cd release
+          sha256sum minfm-icons.ttf > minfm-icons.ttf.sha256
+
       - name: Extract release notes
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
@@ -68,3 +84,6 @@ jobs:
           files: |
             release/minfm-linux-x86_64
             release/minfm-linux-x86_64.sha256
+            release/minfm-icons.ttf
+            release/minfm-icons.ttf.sha256
+            release/minfm-icons-LICENSE.txt

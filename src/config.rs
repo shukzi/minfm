@@ -18,18 +18,9 @@ pub struct Config {
     pub hotkeys: Box<HotkeyConfig>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum IconTheme {
-    #[default]
-    Unicode,
-    NerdFont,
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IconConfig {
-    pub theme: IconTheme,
     pub overrides: IconOverrides,
 }
 
@@ -574,32 +565,44 @@ pub fn load() -> ConfigLoad {
 
 pub fn load_from(path: PathBuf) -> ConfigLoad {
     match fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(config) => match config
-                .icons
-                .validate()
-                .and_then(|()| config.hotkeys.validate())
-            {
-                Ok(()) => {
-                    if let Some(migrated) = migrate_legacy_apps_hotkey(&text) {
-                        if let Err(error) = replace_config_atomically(&path, migrated.as_bytes()) {
-                            return ConfigLoad::Invalid {
-                                path,
-                                error: format!(
-                                    "could not migrate hotkey 'apps' to 'tools': {error}"
-                                ),
-                            };
+        Ok(text) => {
+            let mut migrated = text.clone();
+            let mut migration_needed = false;
+            if let Some(updated) = migrate_legacy_apps_hotkey(&migrated) {
+                migrated = updated;
+                migration_needed = true;
+            }
+            if let Some(updated) = migrate_legacy_icon_theme(&migrated) {
+                migrated = updated;
+                migration_needed = true;
+            }
+            match toml::from_str::<Config>(&migrated) {
+                Ok(config) => match config
+                    .icons
+                    .validate()
+                    .and_then(|()| config.hotkeys.validate())
+                {
+                    Ok(()) => {
+                        if migration_needed {
+                            if let Err(error) =
+                                replace_config_atomically(&path, migrated.as_bytes())
+                            {
+                                return ConfigLoad::Invalid {
+                                    path,
+                                    error: format!("could not migrate configuration: {error}"),
+                                };
+                            }
                         }
+                        ConfigLoad::Valid { config, path }
                     }
-                    ConfigLoad::Valid { config, path }
-                }
-                Err(error) => ConfigLoad::Invalid { path, error },
-            },
-            Err(error) => ConfigLoad::Invalid {
-                path,
-                error: error.to_string(),
-            },
-        },
+                    Err(error) => ConfigLoad::Invalid { path, error },
+                },
+                Err(error) => ConfigLoad::Invalid {
+                    path,
+                    error: error.to_string(),
+                },
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ConfigLoad::Valid {
             config: Config::default(),
             path,
@@ -629,6 +632,29 @@ fn migrate_legacy_apps_hotkey(text: &str) -> Option<String> {
                     migrated.push_str(&line[..key_start]);
                     migrated.push_str("tools");
                     migrated.push_str(&line[key_start + "apps".len()..]);
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        migrated.push_str(line);
+    }
+    changed.then_some(migrated)
+}
+
+fn migrate_legacy_icon_theme(text: &str) -> Option<String> {
+    let mut in_icons = false;
+    let mut changed = false;
+    let mut migrated = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let declaration = trimmed.split('#').next().unwrap_or_default().trim();
+        if declaration.starts_with('[') {
+            in_icons = declaration == "[icons]";
+        }
+        if in_icons {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                if key.trim() == "theme" {
                     changed = true;
                     continue;
                 }
@@ -678,7 +704,7 @@ mod tests {
         };
         assert_eq!(config.open.opener, "xdg-open");
         assert_eq!(config.open.editor, "xdg-open");
-        assert_eq!(config.icons.theme, IconTheme::Unicode);
+        assert!(config.icons.overrides.file.is_none());
         config.hotkeys.validate().unwrap();
     }
 
@@ -707,16 +733,14 @@ mod tests {
         assert_eq!(config.open.opener, "xdg-open");
         assert!(config.behavior.verify_copies);
         assert_eq!(config.hotkeys.tools.display(), "M");
-        assert_eq!(config.icons.theme, IconTheme::Unicode);
+        assert!(config.icons.overrides.file.is_none());
     }
 
     #[test]
-    fn icon_theme_and_focused_overrides_parse() {
-        let config = toml::from_str::<Config>(
-            "[icons]\ntheme = 'nerd-font'\n[icons.overrides]\ndirectory_closed = 'D'\nsort = 'S'\n",
-        )
-        .unwrap();
-        assert_eq!(config.icons.theme, IconTheme::NerdFont);
+    fn focused_icon_overrides_parse() {
+        let config =
+            toml::from_str::<Config>("[icons.overrides]\ndirectory_closed = 'D'\nsort = 'S'\n")
+                .unwrap();
         assert_eq!(
             config.icons.overrides.directory_closed.as_deref(),
             Some("D")
@@ -779,6 +803,26 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
             "# keep this comment\n[ui]\nshow_hidden = true\n\n[hotkeys]\ntools = 'F2' # custom tool key\nquit = 'Q'\n"
+        );
+    }
+
+    #[test]
+    fn legacy_icon_theme_is_removed_without_changing_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\n[icons]\ntheme = 'unicode'\n\n[icons.overrides]\nfile = 'F'\n",
+        )
+        .unwrap();
+
+        let ConfigLoad::Valid { config, .. } = load_from(path.clone()) else {
+            panic!("legacy icon configuration must migrate successfully");
+        };
+        assert_eq!(config.icons.overrides.file.as_deref(), Some("F"));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "# keep this comment\n[icons]\n\n[icons.overrides]\nfile = 'F'\n"
         );
     }
 

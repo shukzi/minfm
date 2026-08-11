@@ -20,7 +20,7 @@ functionality.
 - **Files:** Create, rename, cut, copy, paste, and open files with a preferred text editor or default application
 - **Selection:** Multi-entry selection
 - **Display:** File size, permissions, and modification time
-- **Icons:** Font-independent Unicode by default, with an optional Nerd Font theme and per-icon overrides
+- **Icons:** Rounded monochrome icons with focused per-icon overrides
 - **Sorting:** Sort by name, extension, size, type, permissions, or modification time
 - **Trash:** Recoverable trash, second-precise timestamps, and permanent deletion from the trash
 - **Devices:** Integrated in-TUI disk manager with LUKS unlock, mount, unmount, lock, and safe eject
@@ -58,6 +58,7 @@ The installer writes to:
 ```text
 ~/.local/bin/minfm        installed binary
 ~/.config/minfm/          user configuration directory
+~/.local/share/fonts/minfm/  icon font
 ```
 
 The installer downloads into a temporary directory, verifies the checksum,
@@ -65,11 +66,9 @@ installs the binary to `~/.local/bin/minfm`, and creates `~/.config/minfm/` if
 needed. It does not modify the source directory or overwrite an existing
 `~/.config/minfm/config.toml` file.
 
-The default icon theme uses ordinary Unicode and needs no font package. The
-installer therefore does not install or change terminal fonts. Users who
-already run a [Nerd Font](https://www.nerdfonts.com/) can opt into the richer
-theme in their configuration. Reinstalling or updating minfm preserves that
-choice and every icon override because updates replace only the binary.
+The installer supplies the symbol font required by minfm's rounded monochrome
+icons and refreshes the user's font cache. It does not change the terminal's
+primary text font. Reinstalling or updating minfm preserves every icon override.
 
 The basic file manager needs only a Linux terminal and the installed binary.
 The single install command above handles the rest: it installs minfm, checks the
@@ -82,6 +81,7 @@ These are the packages minfm checks for and may offer to install:
 
 | Capability | Fedora | Debian/Ubuntu | Arch Linux |
 | --- | --- | --- | --- |
+| Icon rendering | `fontconfig` | `fontconfig` | `fontconfig` |
 | Open files with the desktop default | `xdg-utils` | `xdg-utils` | `xdg-utils` |
 | Devices and LUKS | `util-linux`, `udisks2`, `cryptsetup` | `util-linux`, `udisks2`, `cryptsetup` | `util-linux`, `udisks2`, `cryptsetup` |
 | Samba shares and saved credentials | `gvfs-smb`, `libsecret` | `gvfs-backends`, `libsecret-tools` | `gvfs-smb`, `libsecret` |
@@ -99,17 +99,19 @@ Remove the minfm binary and its configuration data:
 ```sh
 rm -f ~/.local/bin/minfm
 rm -rf ~/.config/minfm
+rm -rf ~/.local/share/fonts/minfm
+fc-cache -f
 ```
 
 This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.4.0` in
+Pin both the installer and release asset to the same tag. Replace `v0.4.1` in
 both places with the version you want:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.4.0/install.sh | MINFM_VERSION=v0.4.0 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.4.1/install.sh | MINFM_VERSION=v0.4.1 sh
 minfm
 ```
 
@@ -136,17 +138,9 @@ dialogs always retain a predictable safe way to navigate, apply, or cancel.
 Bindings that conflict in the same screen are rejected with a configuration
 error instead of producing ambiguous behavior.
 
-Icons are selected independently from hotkeys. The reliable default is:
-
-```toml
-[icons]
-theme = "unicode"
-```
-
-To use the bundled Nerd Font symbols, change the value to `"nerd-font"` after
-configuring your terminal to use a Nerd Font. This theme uses rounded, filled
-monochrome glyphs adapted to minfm's file, directory, device, and action roles.
-Individual project icons can be changed under `[icons.overrides]`; see
+minfm uses one rounded, filled monochrome icon set adapted to its file,
+directory, device, and action roles. Individual project icons can be changed
+under `[icons.overrides]`; see
 [config.example.toml](config.example.toml) for the complete, deliberately small
 set. Overrides must be printable and one to three terminal cells wide so browser
 columns remain aligned.
