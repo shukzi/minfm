@@ -725,8 +725,35 @@ pub fn execute(
     } else if matches!(action, PartitionAction::SmartReport { .. }) {
         report_phase("Reading SMART health data");
         let output = run_command(&commands[0], use_sudo, administrator_password)?;
-        let report = summarize_smart_report(&String::from_utf8_lossy(&output));
+        let report = complete_smart_report(&String::from_utf8_lossy(&output));
         return Ok(report);
+    } else if matches!(action, PartitionAction::SmartTest { .. }) {
+        let report_command = smart_report_command(action.target());
+        report_phase("Checking current SMART test status");
+        let current_output = run_command(&report_command, use_sudo, administrator_password)?;
+        let current_report = String::from_utf8_lossy(&current_output);
+        if smart_self_test_running(&current_report) {
+            return Ok(format!(
+                "A SMART self-test is already running.\n\n{}",
+                complete_smart_report(&current_report)
+            ));
+        }
+        report_phase("Starting SMART self-test");
+        if let Err(error) = run_command(&commands[0], use_sudo, administrator_password) {
+            if !smart_test_already_running_error(&error.to_string()) {
+                return Err(error);
+            }
+            report_phase("Reading active SMART test status");
+            let output = run_command(&report_command, use_sudo, administrator_password)?;
+            return Ok(format!(
+                "A SMART self-test is already running.\n\n{}",
+                complete_smart_report(&String::from_utf8_lossy(&output))
+            ));
+        }
+        report_phase("Reading SMART test status");
+        let output = run_command(&report_command, use_sudo, administrator_password)?;
+        let report = complete_smart_report(&String::from_utf8_lossy(&output));
+        return Ok(format!("{} started.\n\n{}", action.title(), report));
     } else {
         for command in commands {
             report_phase(command_phase(&command));
@@ -757,7 +784,7 @@ pub fn execute(
 }
 
 fn summarize_smart_report(report: &str) -> String {
-    const FIELDS: [&str; 13] = [
+    const FIELDS: [&str; 14] = [
         "Device Model",
         "Model Number",
         "Serial Number",
@@ -771,6 +798,7 @@ fn summarize_smart_report(report: &str) -> String {
         "Percentage Used",
         "Power_On_Hours",
         "Self-test execution status",
+        "Self-test status",
     ];
     let mut lines = report
         .lines()
@@ -785,6 +813,40 @@ fn summarize_smart_report(report: &str) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+fn smart_report_command(target: &DeviceIdentity) -> CommandSpec {
+    CommandSpec {
+        program: "smartctl".into(),
+        arguments: vec!["--all".into(), target.path.as_os_str().to_os_string()],
+        elevated: true,
+        accepted_codes: (0..=255).filter(|code| code & 0b111 == 0).collect(),
+    }
+}
+
+fn smart_self_test_running(report: &str) -> bool {
+    report.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("self-test")
+            && line.contains("in progress")
+            && !line.contains("no self-test in progress")
+            && !line.contains("not in progress")
+    })
+}
+
+fn smart_test_already_running_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("can't start self-test without aborting current test")
+        || error.contains("cannot start self-test without aborting current test")
+}
+
+fn complete_smart_report(report: &str) -> String {
+    let report = report.trim();
+    if report.is_empty() {
+        return "smartctl returned an empty report.".into();
+    }
+    let summary = summarize_smart_report(report);
+    format!("Summary\n{summary}\n\nFull report\n{report}")
 }
 
 struct PrivatePipeDir(PathBuf);
@@ -1800,14 +1862,20 @@ fn command_plan(
             command.accepted_codes = (0..=255).filter(|code| code & 0b111 == 0).collect();
             vec![command]
         }
-        PartitionAction::SmartTest { extended, .. } => vec![CommandSpec::elevated(
-            "smartctl",
-            [
-                OsString::from("--test"),
-                OsString::from(if *extended { "long" } else { "short" }),
-                path(),
-            ],
-        )],
+        PartitionAction::SmartTest { extended, .. } => {
+            let mut command = CommandSpec::elevated(
+                "smartctl",
+                [
+                    OsString::from("--test"),
+                    OsString::from(if *extended { "long" } else { "short" }),
+                    path(),
+                ],
+            );
+            // Health findings use the upper exit bits and do not mean that
+            // starting the self-test failed.
+            command.accepted_codes = (0..=255).filter(|code| code & 0b111 == 0).collect();
+            vec![command]
+        }
         PartitionAction::DriveSetting { setting, .. } => {
             let argument = match setting {
                 DriveSetting::Standby(value) => format!("-S{value}"),
@@ -2975,6 +3043,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(arguments(&test[0]), ["--test", "long", "/dev/sdb"]);
+        assert!(test[0].accepted_codes.contains(&8));
+        assert!(test[0].accepted_codes.contains(&128));
+        assert!(!test[0].accepted_codes.contains(&1));
 
         let cache = command_plan(
             &PartitionAction::DriveSetting {
@@ -3026,6 +3097,28 @@ mod tests {
         assert!(summary.contains("PASSED"));
         assert!(summary.contains("Airflow_Temperature"));
         assert!(!summary.contains("unrelated diagnostic"));
+
+        let complete = complete_smart_report(report);
+        assert!(complete.contains("Summary"));
+        assert!(complete.contains("Full report"));
+        assert!(complete.contains("unrelated diagnostic"));
+    }
+
+    #[test]
+    fn active_smart_tests_are_reported_instead_of_treated_as_failures() {
+        let nvme_report = concat!(
+            "SMART overall-health self-assessment test result: PASSED\n",
+            "Self-test status: Extended self-test in progress (68% completed)\n",
+        );
+        assert!(smart_self_test_running(nvme_report));
+        assert!(!smart_self_test_running(
+            "Self-test status: No self-test in progress"
+        ));
+        assert!(smart_test_already_running_error(
+            "smartctl failed: Can't start self-test without aborting current test (68% completed)"
+        ));
+        let summary = summarize_smart_report(nvme_report);
+        assert!(summary.contains("68% completed"));
     }
 
     #[test]

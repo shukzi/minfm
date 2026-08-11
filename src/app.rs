@@ -158,6 +158,11 @@ pub enum Prompt {
         title: String,
         body: String,
     },
+    SmartReport {
+        body: String,
+        scroll: u16,
+        view: PartitionView,
+    },
     OpenError {
         body: String,
         config_error: Option<(PathBuf, String)>,
@@ -1487,7 +1492,25 @@ impl App {
                     .map(|entry| entry.device.path.clone());
                 match result {
                     Ok(message) => {
-                        self.set_notice(format!("{message} in {}", format_elapsed(elapsed)));
+                        if retry_action.as_ref().is_some_and(|action| {
+                            matches!(
+                                action,
+                                PartitionAction::SmartTest { .. }
+                                    | PartitionAction::SmartReport { .. }
+                            )
+                        }) {
+                            self.mode = AppMode::Prompt(Prompt::SmartReport {
+                                body: format!(
+                                    "{message}\n\nCompleted in {}",
+                                    format_elapsed(elapsed)
+                                ),
+                                scroll: 0,
+                                view,
+                            });
+                            return true;
+                        } else {
+                            self.set_notice(format!("{message} in {}", format_elapsed(elapsed)));
+                        }
                     }
                     Err(crate::error::MinfmError::IncorrectPassphrase) => {
                         if let Some(action) = retry_action {
@@ -2217,6 +2240,30 @@ impl App {
                     return AppMode::Browser;
                 }
             }
+            Prompt::SmartReport { body, scroll, view } => match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    let selected_path = view
+                        .entries
+                        .get(view.selected)
+                        .map(|entry| entry.device.path.clone());
+                    let view = view.clone();
+                    self.start_partition_refresh(selected_path);
+                    return AppMode::Partitions(view);
+                }
+                KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    *scroll = scroll
+                        .saturating_add(1)
+                        .min(smart_report_scroll_limit(body));
+                }
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(8),
+                KeyCode::PageDown => {
+                    *scroll = scroll
+                        .saturating_add(8)
+                        .min(smart_report_scroll_limit(body));
+                }
+                _ => {}
+            },
             Prompt::OpenError { config_error, .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     return if let Some((path, error)) = config_error.take() {
@@ -3445,14 +3492,32 @@ impl App {
         }
         if matches!(
             task,
+            PartitionTask::SmartReport
+                | PartitionTask::SmartShortTest
+                | PartitionTask::SmartExtendedTest
+        ) {
+            return match self.partition_action_from_input(&view, task, "") {
+                Ok(action) => {
+                    if let Err(error) = partition::validate_snapshot(&action, &view.entries) {
+                        self.set_notice(error.to_string());
+                        AppMode::Partitions(view)
+                    } else {
+                        self.authorize_partition_operation(action, view)
+                    }
+                }
+                Err(error) => {
+                    self.set_notice(error);
+                    AppMode::Partitions(view)
+                }
+            };
+        }
+        if matches!(
+            task,
             PartitionTask::Mount
                 | PartitionTask::Unmount
                 | PartitionTask::Delete
                 | PartitionTask::Check
                 | PartitionTask::Repair
-                | PartitionTask::SmartReport
-                | PartitionTask::SmartShortTest
-                | PartitionTask::SmartExtendedTest
         ) {
             match self.partition_action_from_input(&view, task, "") {
                 Ok(action) => {
@@ -5518,6 +5583,14 @@ pub(crate) fn format_elapsed(duration: Duration) -> String {
     }
 }
 
+fn smart_report_scroll_limit(body: &str) -> u16 {
+    const VISIBLE_REPORT_LINES: usize = 17;
+    body.lines()
+        .count()
+        .saturating_sub(VISIBLE_REPORT_LINES)
+        .min(u16::MAX as usize) as u16
+}
+
 fn trash_targets(view: &TrashView) -> Vec<TrashEntry> {
     let marked = view
         .entries
@@ -7419,6 +7492,69 @@ mod tests {
             }) if input.is_empty() && error.contains("failed")
         ));
         assert!(app.partition_operation.is_none());
+    }
+
+    #[test]
+    fn every_smart_action_opens_a_scrollable_report_and_returns_to_devices() {
+        let temp = tempfile::tempdir().unwrap();
+        for action_kind in 0..3 {
+            let mut app = test_app(temp.path());
+            let mut view = partition_test_view();
+            view.selected = 0;
+            let disk = DeviceIdentity::from_entry(&view.entries[0]).unwrap();
+            let action = match action_kind {
+                0 => PartitionAction::SmartReport { disk },
+                1 => PartitionAction::SmartTest {
+                    disk,
+                    extended: false,
+                },
+                _ => PartitionAction::SmartTest {
+                    disk,
+                    extended: true,
+                },
+            };
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let report = (1..=30)
+                .map(|line| format!("SMART report line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            sender.send(PartitionUpdate::Finished(Ok(report))).unwrap();
+            app.partition_return_view = Some(view);
+            app.partition_operation = Some(RunningPartitionOperation {
+                receiver,
+                started_at: Instant::now(),
+                action,
+            });
+
+            assert!(app.poll_partition_operation());
+            assert!(matches!(
+                app.mode,
+                AppMode::Prompt(Prompt::SmartReport {
+                    ref body,
+                    scroll: 0,
+                    ..
+                }) if body.contains("SMART report line 30")
+            ));
+
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert!(matches!(
+                app.mode,
+                AppMode::Prompt(Prompt::SmartReport { scroll: 1, .. })
+            ));
+            for _ in 0..10 {
+                app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            }
+            assert!(matches!(
+                app.mode,
+                AppMode::Prompt(Prompt::SmartReport {
+                    ref body,
+                    scroll,
+                    ..
+                }) if scroll == smart_report_scroll_limit(body)
+            ));
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::Partitions(_)));
+        }
     }
 
     #[test]

@@ -1019,6 +1019,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
         Prompt::Message { title, body } => {
             message_modal(frame, title, body, "Enter/Esc close", 72, 12)
         }
+        Prompt::SmartReport { body, scroll, .. } => smart_report_modal(frame, body, *scroll),
         Prompt::OpenError { body, .. } => message_modal(
             frame,
             "Unable to open file",
@@ -2896,6 +2897,35 @@ fn message_modal(
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[0]);
     frame.render_widget(
         Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+}
+
+fn smart_report_modal(frame: &mut Frame, body: &str, scroll: u16) {
+    let content_lines = body.lines().count().max(1) as u16;
+    let desired_height = content_lines.saturating_add(3).clamp(6, 20);
+    let area = responsive_centered(frame.area(), 84, 70, 96, desired_height);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" SMART report ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let maximum_scroll = content_lines.saturating_sub(rows[0].height);
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(maximum_scroll), 0)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("↑/↓ scroll · PageUp/PageDown jump · Enter/Esc close")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT)),
         rows[1],

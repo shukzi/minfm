@@ -1,5 +1,17 @@
 # minfm changelog
 
+## v0.5.2
+
+### Fixed
+
+- SMART health data and short or extended self-tests now open a dedicated,
+  scrollable report instead of disappearing behind the Device Manager.
+- Active SMART self-tests are detected and reported without being interrupted
+  or incorrectly shown as failed when another test is selected.
+- SMART health-warning exit codes are treated as report findings rather than
+  command failures.
+- SMART report dialogs fit short results and stop scrolling at the final line.
+
 ## v0.5.1
 
 ### Changed
