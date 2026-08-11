@@ -4,6 +4,7 @@ mod browser_loader;
 mod config;
 mod entry;
 mod error;
+mod icons;
 mod launcher;
 mod luks;
 mod network;

@@ -47,6 +47,71 @@ pub struct PartitionInventory {
     pub entries: Vec<PartitionEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvmeEraseMethod {
+    SanitizeBlockErase,
+    SanitizeCryptoErase,
+    SanitizeOverwrite,
+    FormatUserDataErase,
+    FormatCryptoErase,
+    ExitFailureMode,
+}
+
+impl NvmeEraseMethod {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SanitizeBlockErase => "Sanitize: Block Erase",
+            Self::SanitizeCryptoErase => "Sanitize: Crypto Erase",
+            Self::SanitizeOverwrite => "Sanitize: Overwrite",
+            Self::FormatUserDataErase => "Format: User Data Erase",
+            Self::FormatCryptoErase => "Format: Cryptographic Erase",
+            Self::ExitFailureMode => "Exit Sanitize Failure Mode",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::SanitizeBlockErase => "Controller-wide media block erase",
+            Self::SanitizeCryptoErase => "Controller-wide encryption-key erase",
+            Self::SanitizeOverwrite => "Controller-wide overwrite; slow and adds flash wear",
+            Self::FormatUserDataErase => "Selected namespace only; user-data erase",
+            Self::FormatCryptoErase => "Selected namespace only; cryptographic erase",
+            Self::ExitFailureMode => "Recovery only; does not start a new erase",
+        }
+    }
+
+    fn sanitize_action(self) -> Option<&'static str> {
+        match self {
+            Self::SanitizeBlockErase => Some("2"),
+            Self::SanitizeCryptoErase => Some("4"),
+            Self::SanitizeOverwrite => Some("3"),
+            Self::ExitFailureMode => Some("1"),
+            Self::FormatUserDataErase | Self::FormatCryptoErase => None,
+        }
+    }
+
+    fn format_secure_erase(self) -> Option<&'static str> {
+        match self {
+            Self::FormatUserDataErase => Some("1"),
+            Self::FormatCryptoErase => Some("2"),
+            _ => None,
+        }
+    }
+
+    fn controller_wide_erase(self) -> bool {
+        matches!(
+            self,
+            Self::SanitizeBlockErase | Self::SanitizeCryptoErase | Self::SanitizeOverwrite
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvmeEraseCapabilities {
+    pub methods: Vec<NvmeEraseMethod>,
+    pub sanitize_failed: bool,
+}
+
 impl PartitionInventory {
     fn from_blocks(inventory: BlockInventory) -> Self {
         let mut children = HashMap::<Option<PathBuf>, Vec<BlockDevice>>::new();
@@ -330,6 +395,7 @@ pub enum PartitionAction {
     },
     NvmeErase {
         disk: DeviceIdentity,
+        method: NvmeEraseMethod,
     },
 }
 
@@ -353,7 +419,7 @@ impl PartitionAction {
             | Self::CreatePartition { disk, .. }
             | Self::BackupTable { disk, .. }
             | Self::HddWipe { disk, .. }
-            | Self::NvmeErase { disk } => disk,
+            | Self::NvmeErase { disk, .. } => disk,
         }
     }
 
@@ -376,7 +442,14 @@ impl PartitionAction {
                 | Self::Format { .. }
                 | Self::WipeSignatures { .. }
                 | Self::HddWipe { .. }
-                | Self::NvmeErase { .. }
+                | Self::NvmeErase {
+                    method: NvmeEraseMethod::SanitizeBlockErase
+                        | NvmeEraseMethod::SanitizeCryptoErase
+                        | NvmeEraseMethod::SanitizeOverwrite
+                        | NvmeEraseMethod::FormatUserDataErase
+                        | NvmeEraseMethod::FormatCryptoErase,
+                    ..
+                }
         )
     }
 
@@ -407,9 +480,13 @@ impl PartitionAction {
             Self::HddWipe { .. } => {
                 "This irreversibly overwrites the entire rotational disk multiple times."
             }
-            Self::NvmeErase { .. } => {
-                "This irreversibly erases the entire NVMe controller using a supported sanitize command."
+            Self::NvmeErase { method, .. } if *method == NvmeEraseMethod::ExitFailureMode => {
+                "This asks the controller to leave a previously reported Sanitize failure state."
             }
+            Self::NvmeErase { method, .. } if method.controller_wide_erase() => {
+                "This irreversibly erases the entire NVMe controller, including all namespaces."
+            }
+            Self::NvmeErase { .. } => "This irreversibly erases the selected NVMe namespace.",
             Self::Mount { .. } | Self::Unmount { .. } | Self::CheckFilesystem { .. } => {
                 "Proceed with this operation?"
             }
@@ -435,6 +512,9 @@ impl PartitionAction {
             Self::SetFlag { .. } => "Change partition flag",
             Self::BackupTable { .. } => "Back up partition table",
             Self::HddWipe { .. } => "Wipe HDD",
+            Self::NvmeErase { method, .. } if *method == NvmeEraseMethod::ExitFailureMode => {
+                "Recover NVMe Sanitize"
+            }
             Self::NvmeErase { .. } => "Erase NVMe",
         }
     }
@@ -506,8 +586,10 @@ impl PartitionAction {
             Self::HddWipe { passes, .. } => format!(
                 "Overwrite every addressable byte on rotational disk {path} {passes} time(s), then write zeros."
             ),
-            Self::NvmeErase { .. } => format!(
-                "Use a preferred supported NVMe Sanitize method on {path}. The controller capability is checked before erasure."
+            Self::NvmeErase { method, .. } => format!(
+                "Use {} on {path}. {}. Capabilities are checked again immediately before execution.",
+                method.name(),
+                method.description()
             ),
         }
     }
@@ -549,6 +631,10 @@ pub fn authentication_required(action: &PartitionAction) -> bool {
         )
 }
 
+pub fn administrator_authentication_required() -> bool {
+    !Uid::effective().is_root()
+}
+
 pub fn execute(
     action: &PartitionAction,
     administrator_password: Option<&[u8]>,
@@ -571,29 +657,52 @@ pub fn execute(
     } else {
         None
     };
-    if let PartitionAction::NvmeErase { .. } = action {
+    if let PartitionAction::NvmeErase { method, .. } = action {
         report_phase("Checking NVMe erase capabilities");
         let identify = run_command(&commands[0], use_sudo, administrator_password)?;
-        let sanitize = nvme_sanitize_command(action, &inventory, &identify)?;
-        report_phase("Starting controller-native NVMe erase");
-        let _ = run_command(&sanitize, use_sudo, administrator_password)?;
-        let log = nvme_sanitize_log_command(action, &inventory)?;
-        report_phase("Waiting for NVMe erase to finish");
-        loop {
-            thread::sleep(Duration::from_secs(1));
-            let output = run_command(&log, use_sudo, administrator_password)?;
-            match nvme_sanitize_status(&output)? {
-                NvmeSanitizeStatus::Complete => break,
-                NvmeSanitizeStatus::InProgress => {}
-                NvmeSanitizeStatus::Failed => {
+        if method.format_secure_erase().is_some() {
+            let format = nvme_format_command(action, &inventory, &identify)?;
+            report_phase("Starting namespace-scoped NVMe Format erase");
+            let _ = run_command(&format, use_sudo, administrator_password)?;
+        } else {
+            if *method == NvmeEraseMethod::ExitFailureMode {
+                let log = nvme_sanitize_log_command(action, &inventory)?;
+                let status = run_command(&log, use_sudo, administrator_password)?;
+                if nvme_sanitize_status(&status)? != NvmeSanitizeStatus::Failed {
                     return Err(MinfmError::Message(
-                        "the NVMe controller reports that Sanitize failed".into(),
+                        "the controller no longer reports a failed Sanitize state; recovery was not started"
+                            .into(),
                     ));
                 }
-                NvmeSanitizeStatus::NeverRun => {
-                    return Err(MinfmError::Message(
-                        "the NVMe controller did not start Sanitize".into(),
-                    ));
+            }
+            let sanitize = nvme_sanitize_command(action, &inventory, &identify)?;
+            report_phase(if *method == NvmeEraseMethod::ExitFailureMode {
+                "Exiting NVMe Sanitize failure mode"
+            } else {
+                "Starting controller-wide NVMe Sanitize"
+            });
+            let _ = run_command(&sanitize, use_sudo, administrator_password)?;
+            if *method != NvmeEraseMethod::ExitFailureMode {
+                let log = nvme_sanitize_log_command(action, &inventory)?;
+                report_phase("Waiting for NVMe Sanitize to finish");
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                    let output = run_command(&log, use_sudo, administrator_password)?;
+                    match nvme_sanitize_status(&output)? {
+                        NvmeSanitizeStatus::Complete => break,
+                        NvmeSanitizeStatus::InProgress => {}
+                        NvmeSanitizeStatus::Failed => {
+                            return Err(MinfmError::Message(
+                                "the NVMe controller reports that Sanitize failed; reopen Erase NVMe to use Exit Sanitize Failure Mode"
+                                    .into(),
+                            ));
+                        }
+                        NvmeSanitizeStatus::NeverRun => {
+                            return Err(MinfmError::Message(
+                                "the NVMe controller did not start Sanitize".into(),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -866,16 +975,18 @@ fn validate_action(action: &PartitionAction, inventory: &PartitionInventory) -> 
                 ));
             }
         }
-        PartitionAction::NvmeErase { .. } => {
+        PartitionAction::NvmeErase { method, .. } => {
             require_disk(target)?;
             require_inactive(target)?;
             require_no_mapped_descendants(target, inventory)?;
             let controller = nvme_controller_path(&target.device)?;
-            if inventory.entries.iter().any(|entry| {
-                entry.device.path != target.device.path
-                    && entry.device.is_disk()
-                    && nvme_controller_path(&entry.device).ok().as_ref() == Some(&controller)
-            }) {
+            if method.controller_wide_erase()
+                && inventory.entries.iter().any(|entry| {
+                    entry.device.path != target.device.path
+                        && entry.device.is_disk()
+                        && nvme_controller_path(&entry.device).ok().as_ref() == Some(&controller)
+                })
+            {
                 return Err(MinfmError::Message(
                     "this NVMe controller exposes multiple namespaces; controller-wide erase is disabled to avoid erasing an unselected namespace"
                         .into(),
@@ -1573,7 +1684,16 @@ fn verify_final_state(action: &PartitionAction, inventory: &PartitionInventory) 
             }
         }
         PartitionAction::SetFlag { .. } => {}
-        PartitionAction::HddWipe { disk, .. } | PartitionAction::NvmeErase { disk } => {
+        PartitionAction::HddWipe { disk, .. }
+        | PartitionAction::NvmeErase {
+            disk,
+            method:
+                NvmeEraseMethod::SanitizeBlockErase
+                | NvmeEraseMethod::SanitizeCryptoErase
+                | NvmeEraseMethod::SanitizeOverwrite
+                | NvmeEraseMethod::FormatUserDataErase
+                | NvmeEraseMethod::FormatCryptoErase,
+        } => {
             if target.device.table_type.is_some() || target.device.filesystem.is_some() {
                 return Err(MinfmError::Message(format!(
                     "{} still reports storage signatures after erasure",
@@ -1864,6 +1984,90 @@ fn write_new_backup(destination: &Path, contents: &[u8]) -> Result<()> {
         .map_err(|error| crate::error::io_error("could not save partition-table backup", error))
 }
 
+pub fn probe_nvme_erase_capabilities(
+    device: &BlockDevice,
+    administrator_password: Option<&[u8]>,
+) -> Result<NvmeEraseCapabilities> {
+    let controller = nvme_controller_path(device)?;
+    let use_sudo = administrator_authentication_required();
+    let sudo_session = if use_sudo {
+        Some(SudoSession {
+            program: authenticate_sudo(administrator_password.ok_or_else(|| {
+                MinfmError::Message("administrator authentication is required".into())
+            })?)?,
+        })
+    } else {
+        None
+    };
+    let identify = run_command(
+        &CommandSpec::elevated(
+            "nvme",
+            [
+                OsString::from("id-ctrl"),
+                controller.as_os_str().to_owned(),
+                OsString::from("--output-format=json"),
+            ],
+        ),
+        use_sudo,
+        administrator_password,
+    )?;
+    let sanitize_log = run_command(
+        &CommandSpec::elevated(
+            "nvme",
+            [
+                OsString::from("sanitize-log"),
+                controller.into_os_string(),
+                OsString::from("--raw-binary"),
+            ],
+        ),
+        use_sudo,
+        administrator_password,
+    )
+    .ok()
+    .and_then(|output| nvme_sanitize_status(&output).ok());
+    drop(sudo_session);
+    let sanitize_failed = sanitize_log == Some(NvmeSanitizeStatus::Failed);
+    nvme_capabilities_from_identify(&identify, sanitize_failed)
+}
+
+fn nvme_capabilities_from_identify(
+    identify_json: &[u8],
+    sanitize_failed: bool,
+) -> Result<NvmeEraseCapabilities> {
+    let sanicap = parse_json_integer(identify_json, "sanicap").unwrap_or(0);
+    let oacs = parse_json_integer(identify_json, "oacs").unwrap_or(0);
+    let fna = parse_json_integer(identify_json, "fna").unwrap_or(0);
+    let mut methods = Vec::new();
+    if sanicap & 0b010 != 0 {
+        methods.push(NvmeEraseMethod::SanitizeBlockErase);
+    }
+    if sanicap & 0b001 != 0 {
+        methods.push(NvmeEraseMethod::SanitizeCryptoErase);
+    }
+    if sanicap & 0b100 != 0 {
+        methods.push(NvmeEraseMethod::SanitizeOverwrite);
+    }
+    if oacs & 0b010 != 0 {
+        methods.push(NvmeEraseMethod::FormatUserDataErase);
+        if fna & 0b100 != 0 {
+            methods.push(NvmeEraseMethod::FormatCryptoErase);
+        }
+    }
+    if sanitize_failed {
+        methods.push(NvmeEraseMethod::ExitFailureMode);
+    }
+    if methods.is_empty() {
+        return Err(MinfmError::Message(
+            "This NVMe drive reports no supported Sanitize or secure Format erase method. No erase command was started."
+                .into(),
+        ));
+    }
+    Ok(NvmeEraseCapabilities {
+        methods,
+        sanitize_failed,
+    })
+}
+
 fn nvme_sanitize_command(
     action: &PartitionAction,
     inventory: &PartitionInventory,
@@ -1871,28 +2075,58 @@ fn nvme_sanitize_command(
 ) -> Result<CommandSpec> {
     let target = matching_entry(inventory, action.target())?;
     let controller = nvme_controller_path(&target.device)?;
-    let sanicap = parse_json_integer(identify_json, "sanicap").ok_or_else(|| {
-        MinfmError::Message("NVMe controller did not report usable sanitize capabilities".into())
-    })?;
-    let method = if sanicap & 0b010 != 0 {
-        "2"
-    } else if sanicap & 0b001 != 0 {
-        "4"
-    } else if sanicap & 0b100 != 0 {
-        "3"
-    } else {
-        return Err(MinfmError::Message(
-            "This NVMe controller does not support an erase method available through NVMe Sanitize (Block Erase, Crypto Erase, or Overwrite). No erase command was started."
-                .into(),
-        ));
+    let PartitionAction::NvmeErase { method, .. } = action else {
+        return Err(MinfmError::Message("expected an NVMe erase action".into()));
     };
+    if *method != NvmeEraseMethod::ExitFailureMode {
+        let capabilities = nvme_capabilities_from_identify(identify_json, false)?;
+        if !capabilities.methods.contains(method) {
+            return Err(MinfmError::Message(format!(
+                "{} is no longer reported by this NVMe controller; no erase command was started",
+                method.name()
+            )));
+        }
+    }
+    let sanact = method.sanitize_action().ok_or_else(|| {
+        MinfmError::Message("the selected NVMe method is not a Sanitize command".into())
+    })?;
     Ok(CommandSpec::elevated(
         "nvme",
         [
             OsString::from("sanitize"),
             controller.into_os_string(),
             OsString::from("--sanact"),
-            OsString::from(method),
+            OsString::from(sanact),
+        ],
+    ))
+}
+
+fn nvme_format_command(
+    action: &PartitionAction,
+    inventory: &PartitionInventory,
+    identify_json: &[u8],
+) -> Result<CommandSpec> {
+    let target = matching_entry(inventory, action.target())?;
+    let PartitionAction::NvmeErase { method, .. } = action else {
+        return Err(MinfmError::Message("expected an NVMe erase action".into()));
+    };
+    let capabilities = nvme_capabilities_from_identify(identify_json, false)?;
+    if !capabilities.methods.contains(method) {
+        return Err(MinfmError::Message(format!(
+            "{} is no longer reported by this NVMe controller; no erase command was started",
+            method.name()
+        )));
+    }
+    let secure_erase = method.format_secure_erase().ok_or_else(|| {
+        MinfmError::Message("the selected NVMe method is not a Format command".into())
+    })?;
+    Ok(CommandSpec::elevated(
+        "nvme",
+        [
+            OsString::from("format"),
+            target.device.path.as_os_str().to_owned(),
+            OsString::from("--ses"),
+            OsString::from(secure_erase),
         ],
     ))
 }
@@ -2247,6 +2481,7 @@ mod tests {
         let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
         let action = PartitionAction::NvmeErase {
             disk: identity(&inventory, "/dev/nvme0n1"),
+            method: NvmeEraseMethod::SanitizeBlockErase,
         };
         validate_action(&action, &inventory).unwrap();
         let identify = command_plan(&action, &inventory).unwrap();
@@ -2284,6 +2519,52 @@ mod tests {
     }
 
     #[test]
+    fn nvme_capabilities_list_each_reported_method_and_failure_recovery() {
+        let capabilities =
+            nvme_capabilities_from_identify(br#"{"sanicap":7,"oacs":2,"fna":4}"#, true).unwrap();
+        assert_eq!(
+            capabilities.methods,
+            vec![
+                NvmeEraseMethod::SanitizeBlockErase,
+                NvmeEraseMethod::SanitizeCryptoErase,
+                NvmeEraseMethod::SanitizeOverwrite,
+                NvmeEraseMethod::FormatUserDataErase,
+                NvmeEraseMethod::FormatCryptoErase,
+                NvmeEraseMethod::ExitFailureMode,
+            ]
+        );
+        assert!(capabilities.sanitize_failed);
+
+        let format_only =
+            nvme_capabilities_from_identify(br#"{"sanicap":0,"oacs":2,"fna":0}"#, false).unwrap();
+        assert_eq!(
+            format_only.methods,
+            vec![NvmeEraseMethod::FormatUserDataErase]
+        );
+        assert!(
+            nvme_capabilities_from_identify(br#"{"sanicap":0,"oacs":0,"fna":0}"#, false).is_err()
+        );
+    }
+
+    #[test]
+    fn nvme_format_is_namespace_scoped_and_never_forced() {
+        let fixture = concat!(
+            "PATH=\"/dev/nvme0n1\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:0\"\n",
+            "PATH=\"/dev/nvme0n2\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:1\"\n",
+        );
+        let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
+        let action = PartitionAction::NvmeErase {
+            disk: identity(&inventory, "/dev/nvme0n1"),
+            method: NvmeEraseMethod::FormatCryptoErase,
+        };
+        validate_action(&action, &inventory).unwrap();
+        let format =
+            nvme_format_command(&action, &inventory, br#"{"sanicap":0,"oacs":2,"fna":4}"#).unwrap();
+        assert_eq!(arguments(&format), ["format", "/dev/nvme0n1", "--ses", "2"]);
+        assert!(!arguments(&format).contains(&"--force".to_string()));
+    }
+
+    #[test]
     fn nvme_erase_rejects_controllers_with_an_unselected_namespace() {
         let fixture = concat!(
             "PATH=\"/dev/nvme0n1\" TYPE=\"disk\" SIZE=\"1073741824\" FSTYPE=\"\" MOUNTPOINTS=\"\" PKNAME=\"\" LOG-SEC=\"512\" RO=\"0\" ROTA=\"0\" TRAN=\"nvme\" MAJ:MIN=\"259:0\"\n",
@@ -2292,6 +2573,7 @@ mod tests {
         let inventory = PartitionInventory::from_blocks(block::parse_lsblk(fixture, &[]).unwrap());
         let action = PartitionAction::NvmeErase {
             disk: identity(&inventory, "/dev/nvme0n1"),
+            method: NvmeEraseMethod::SanitizeBlockErase,
         };
         assert!(validate_action(&action, &inventory)
             .unwrap_err()

@@ -100,6 +100,11 @@ pub enum Prompt {
         input: SecretInput,
         error: Option<String>,
     },
+    PartitionNvmeCapabilities {
+        view: PartitionView,
+        input: SecretInput,
+        error: Option<String>,
+    },
     PartitionError {
         body: String,
         view: PartitionView,
@@ -405,6 +410,10 @@ pub enum PartitionOverlay {
     FormatOptions {
         selected: usize,
     },
+    NvmeEraseOptions {
+        selected: usize,
+        methods: Vec<partition::NvmeEraseMethod>,
+    },
     DiskLayoutOptions {
         selected: usize,
     },
@@ -554,6 +563,7 @@ pub struct App {
     pub partition_refreshing: bool,
     partition_operation: Option<RunningPartitionOperation>,
     partition_return_view: Option<PartitionView>,
+    partition_return_to_apps: bool,
     selector_memory: HashMap<PathBuf, PathBuf>,
     expanded_directories: HashSet<PathBuf>,
     loaded_dir: PathBuf,
@@ -621,6 +631,7 @@ impl App {
             partition_refreshing: false,
             partition_operation: None,
             partition_return_view: None,
+            partition_return_to_apps: false,
             selector_memory: HashMap::new(),
             expanded_directories: HashSet::new(),
             loaded_dir: start.clone(),
@@ -1656,7 +1667,7 @@ impl App {
             }
         } else if hotkeys.trash_bin.matches(key) {
             return self.open_trash();
-        } else if hotkeys.apps.matches(key) {
+        } else if hotkeys.tools.matches(key) {
             return AppMode::Apps(AppsView { selected: 0 });
         } else if hotkeys.info.matches(key) {
             return AppMode::Info;
@@ -1670,6 +1681,12 @@ impl App {
             } else {
                 return self.open_devices();
             }
+        } else if hotkeys.partitions.matches(key) {
+            if self.config.behavior.read_only {
+                self.status = "Read-only mode: partition operations are disabled".into();
+            } else {
+                return self.open_partitions(false);
+            }
         } else if hotkeys.network_shares.matches(key) {
             return self.open_network();
         }
@@ -1678,7 +1695,7 @@ impl App {
 
     fn handle_apps_key(&mut self, mut view: AppsView, key: KeyEvent) -> AppMode {
         let hotkeys = self.config.hotkeys.clone();
-        if key.code == KeyCode::Esc || hotkeys.quit.matches(key) || hotkeys.apps.matches(key) {
+        if key.code == KeyCode::Esc || hotkeys.quit.matches(key) || hotkeys.tools.matches(key) {
             AppMode::Browser
         } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
             view.selected = (view.selected + 1).min(BuiltinApp::ALL.len() - 1);
@@ -1696,7 +1713,7 @@ impl App {
                     AppMode::Apps(view)
                 }
                 Some(BuiltinApp::DeviceManager) => self.open_devices(),
-                Some(BuiltinApp::PartitionManager) => self.open_partitions(),
+                Some(BuiltinApp::PartitionManager) => self.open_partitions(true),
                 Some(BuiltinApp::NetworkShares) => self.open_network(),
                 None => AppMode::Apps(view),
             }
@@ -1892,6 +1909,47 @@ impl App {
                     let password = std::mem::take(input);
                     self.start_partition_operation(action.clone(), view.clone(), Some(password));
                     return AppMode::Progress;
+                }
+                KeyCode::Backspace => {
+                    error.take();
+                    input.pop();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    error.take();
+                    input.push(character);
+                }
+                _ => {}
+            },
+            Prompt::PartitionNvmeCapabilities { view, input, error } => match key.code {
+                KeyCode::Esc => return AppMode::Partitions(view.clone()),
+                KeyCode::Enter if input.is_empty() => {
+                    *error = Some("Enter your administrator password".into());
+                }
+                KeyCode::Enter => {
+                    let Some(entry) = view.entries.get(view.selected) else {
+                        return AppMode::Partitions(view.clone());
+                    };
+                    match partition::probe_nvme_erase_capabilities(
+                        &entry.device,
+                        Some(input.expose()),
+                    ) {
+                        Ok(capabilities) => {
+                            let mut view = view.clone();
+                            view.overlay = Some(PartitionOverlay::NvmeEraseOptions {
+                                selected: 0,
+                                methods: capabilities.methods,
+                            });
+                            return AppMode::Partitions(view);
+                        }
+                        Err(crate::error::MinfmError::IncorrectPassphrase) => {
+                            *input = SecretInput::default();
+                            *error = Some("Authentication failed. Try again.".into());
+                        }
+                        Err(probe_error) => {
+                            *input = SecretInput::default();
+                            *error = Some(probe_error.to_string());
+                        }
+                    }
                 }
                 KeyCode::Backspace => {
                     error.take();
@@ -2523,7 +2581,13 @@ impl App {
             return self.handle_partition_overlay(view, overlay, key);
         }
         let hotkeys = self.config.hotkeys.clone();
-        if key.code == KeyCode::Esc || hotkeys.apps.matches(key) {
+        if key.code == KeyCode::Esc {
+            if self.partition_return_to_apps {
+                AppMode::Apps(AppsView { selected: 1 })
+            } else {
+                AppMode::Browser
+            }
+        } else if hotkeys.tools.matches(key) {
             AppMode::Apps(AppsView { selected: 1 })
         } else if hotkeys.quit.matches(key) {
             AppMode::Browser
@@ -2565,6 +2629,7 @@ impl App {
             &overlay,
             PartitionOverlay::Actions { .. }
                 | PartitionOverlay::FormatOptions { .. }
+                | PartitionOverlay::NvmeEraseOptions { .. }
                 | PartitionOverlay::DiskLayoutOptions { .. }
                 | PartitionOverlay::FreeRegionOptions { .. }
         );
@@ -2655,6 +2720,64 @@ impl App {
                 }
                 _ => {
                     view.overlay = Some(PartitionOverlay::FormatOptions { selected });
+                    AppMode::Partitions(view)
+                }
+            },
+            PartitionOverlay::NvmeEraseOptions {
+                mut selected,
+                methods,
+            } => match key.code {
+                KeyCode::Esc => {
+                    let tasks = self.partition_tasks_for_view(&view);
+                    view.overlay = Some(PartitionOverlay::Actions {
+                        selected: tasks
+                            .iter()
+                            .position(|task| *task == PartitionTask::EraseNvme)
+                            .unwrap_or(0),
+                    });
+                    AppMode::Partitions(view)
+                }
+                KeyCode::Down => {
+                    selected = (selected + 1).min(methods.len().saturating_sub(1));
+                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                    AppMode::Partitions(view)
+                }
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                    AppMode::Partitions(view)
+                }
+                KeyCode::Enter | KeyCode::Right => {
+                    let Some(method) = methods.get(selected).copied() else {
+                        view.overlay =
+                            Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                        return AppMode::Partitions(view);
+                    };
+                    match self.partition_nvme_action(&view, method) {
+                        Ok(action) => {
+                            if let Err(validation) =
+                                partition::validate_snapshot(&action, &view.entries)
+                            {
+                                self.set_notice(validation.to_string());
+                                view.overlay =
+                                    Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                            } else {
+                                view.overlay = Some(PartitionOverlay::Confirm {
+                                    action,
+                                    yes_selected: false,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            self.set_notice(error);
+                            view.overlay =
+                                Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                        }
+                    }
+                    AppMode::Partitions(view)
+                }
+                _ => {
+                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
                     AppMode::Partitions(view)
                 }
             },
@@ -2956,10 +3079,29 @@ impl App {
             view.overlay = Some(PartitionOverlay::FreeRegionOptions { selected: 0 });
             return AppMode::Partitions(view);
         }
-        if matches!(
-            task,
-            PartitionTask::Delete | PartitionTask::Check | PartitionTask::EraseNvme
-        ) {
+        if task == PartitionTask::EraseNvme {
+            let Some(entry) = view.entries.get(view.selected) else {
+                return AppMode::Partitions(view);
+            };
+            if partition::administrator_authentication_required() {
+                return AppMode::Prompt(Prompt::PartitionNvmeCapabilities {
+                    view,
+                    input: SecretInput::default(),
+                    error: None,
+                });
+            }
+            match partition::probe_nvme_erase_capabilities(&entry.device, None) {
+                Ok(capabilities) => {
+                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions {
+                        selected: 0,
+                        methods: capabilities.methods,
+                    });
+                }
+                Err(error) => self.set_notice(error.to_string()),
+            }
+            return AppMode::Partitions(view);
+        }
+        if matches!(task, PartitionTask::Delete | PartitionTask::Check) {
             match self.partition_action_from_input(&view, task, "") {
                 Ok(action) => {
                     if let Err(error) = partition::validate_snapshot(&action, &view.entries) {
@@ -3437,8 +3579,23 @@ impl App {
                     .parse()
                     .map_err(|_| "Overwrite passes must be 1, 3, or 7".to_string())?,
             }),
-            PartitionTask::EraseNvme => Ok(PartitionAction::NvmeErase { disk: target }),
+            PartitionTask::EraseNvme => {
+                Err("Choose an NVMe erase method from the capability list".into())
+            }
         }
+    }
+
+    fn partition_nvme_action(
+        &self,
+        view: &PartitionView,
+        method: partition::NvmeEraseMethod,
+    ) -> std::result::Result<PartitionAction, String> {
+        let entry = view
+            .entries
+            .get(view.selected)
+            .ok_or_else(|| "No NVMe device is selected".to_string())?;
+        let disk = DeviceIdentity::from_entry(entry).map_err(|error| error.to_string())?;
+        Ok(PartitionAction::NvmeErase { disk, method })
     }
 
     fn partition_parent_context(
@@ -4545,13 +4702,18 @@ impl App {
         self.network_operation = Some(RunningNetworkOperation { receiver });
     }
 
-    fn open_partitions(&mut self) -> AppMode {
+    fn open_partitions(&mut self, return_to_apps: bool) -> AppMode {
+        self.partition_return_to_apps = return_to_apps;
         self.start_partition_refresh(None);
         AppMode::Partitions(PartitionView {
             entries: Vec::new(),
             selected: 0,
             overlay: None,
         })
+    }
+
+    pub fn partition_returns_to_apps(&self) -> bool {
+        self.partition_return_to_apps
     }
 
     fn open_external(&mut self, editor: bool) -> AppMode {
@@ -5901,7 +6063,7 @@ mod tests {
     fn configured_app_hotkey_replaces_the_default() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(temp.path());
-        app.config = toml::from_str("[hotkeys]\napps = 'F2'\n").unwrap();
+        app.config = toml::from_str("[hotkeys]\ntools = 'F2'\n").unwrap();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
         assert!(matches!(app.mode, AppMode::Browser));
@@ -5911,11 +6073,24 @@ mod tests {
     }
 
     #[test]
+    fn direct_partition_hotkey_opens_the_partition_manager() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert!(matches!(app.mode, AppMode::Partitions(_)));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Browser));
+    }
+
+    #[test]
     fn partition_view_navigation_is_modal_and_returns_to_apps() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("untouched.txt");
         std::fs::write(&file, b"safe").unwrap();
         let mut app = test_app(temp.path());
+        app.partition_return_to_apps = true;
         app.mode = AppMode::Partitions(PartitionView {
             entries: Vec::new(),
             selected: 0,
@@ -6405,6 +6580,7 @@ mod tests {
         let view = partition_test_view();
         let action = PartitionAction::NvmeErase {
             disk: DeviceIdentity::from_entry(&view.entries[0]).unwrap(),
+            method: partition::NvmeEraseMethod::SanitizeBlockErase,
         };
         let message =
             "This NVMe controller does not support NVMe Sanitize. No erase command was started.";

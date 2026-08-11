@@ -5,6 +5,13 @@ fn installer_verifies_and_places_the_release_without_a_terminal() {
     let temp = tempfile::tempdir().unwrap();
     let fake_bin = temp.path().join("fake-bin");
     fs::create_dir(&fake_bin).unwrap();
+    let config_dir = temp.path().join(".config/minfm");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("config.toml");
+    fs::write(&config, "[icons]\ntheme = 'nerd-font'\n").unwrap();
+    let install_dir = temp.path().join(".local/bin");
+    fs::create_dir_all(&install_dir).unwrap();
+    fs::write(install_dir.join("minfm"), b"old-minfm\n").unwrap();
     let curl = fake_bin.join("curl");
     fs::write(
         &curl,
@@ -52,7 +59,16 @@ esac
         fs::read(temp.path().join(".local/bin/minfm")).unwrap(),
         b"fake-minfm\n"
     );
+    assert!(fs::read_dir(install_dir).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".minfm-install.")));
     assert!(temp.path().join(".config/minfm").is_dir());
+    assert_eq!(
+        fs::read_to_string(config).unwrap(),
+        "[icons]\ntheme = 'nerd-font'\n"
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Installed minfm"));
 }
 

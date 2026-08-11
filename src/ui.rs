@@ -1,7 +1,7 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap,
     },
@@ -14,8 +14,10 @@ use crate::{
         NetworkView, PartitionOverlay, PartitionView, Prompt, SearchScope, SearchView, TrashView,
     },
     entry::{human_size, EntryKind},
+    icons::Icons,
     partition::Filesystem,
 };
+use unicode_width::UnicodeWidthStr;
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
@@ -27,7 +29,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(6),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(shortcut_bar_height(app, frame.area().width)),
         ])
         .split(frame.area());
 
@@ -59,12 +61,67 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let title = format!(" {} ", app.current_dir.display());
+    let icons = Icons::new(&app.config.icons);
+    let title = format!(" {}", app.current_dir.display());
     let mode = if app.config.behavior.read_only {
         "READ ONLY"
     } else {
         "minfm"
     };
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).title(" minfm "),
+        area,
+    );
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let arrow = if app.config.ui.reverse_sort {
+        "↓"
+    } else {
+        "↑"
+    };
+    let full_actions = format!(
+        "{} {}  {} {}  {} {}  {} {}  {} {}{} {}/{}",
+        icons.header_trash(),
+        app.config.hotkeys.trash_bin.display(),
+        icons.header_info(),
+        app.config.hotkeys.info.display(),
+        icons.header_devices(),
+        app.config.hotkeys.devices.display(),
+        icons.header_partitions(),
+        app.config.hotkeys.partitions.display(),
+        icons.header_sort(),
+        app.sort_label(),
+        arrow,
+        app.config.hotkeys.sort.display(),
+        app.config.hotkeys.reverse_sort.display(),
+    );
+    let compact_actions = format!(
+        "{} {}   {} {}   {} {}   {} {}   {} {}",
+        icons.header_trash(),
+        app.config.hotkeys.trash_bin.display(),
+        icons.header_info(),
+        app.config.hotkeys.info.display(),
+        icons.header_devices(),
+        app.config.hotkeys.devices.display(),
+        icons.header_partitions(),
+        app.config.hotkeys.partitions.display(),
+        icons.header_sort(),
+        app.config.hotkeys.sort.display(),
+    );
+    let actions = if usize::from(inner.width) >= UnicodeWidthStr::width(full_actions.as_str()) + 18
+    {
+        full_actions
+    } else {
+        compact_actions
+    };
+    let action_width = u16::try_from(UnicodeWidthStr::width(actions.as_str())).unwrap_or(u16::MAX);
+    let columns = Layout::horizontal([
+        Constraint::Min(4),
+        Constraint::Length(action_width.min(inner.width.saturating_sub(4))),
+    ])
+    .split(inner);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -73,9 +130,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw(" "),
             Span::styled(mode, Style::default().fg(MUTED)),
-        ]))
-        .block(Block::default().borders(Borders::ALL).title(" minfm ")),
-        area,
+        ])),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(actions).alignment(Alignment::Right).style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        columns[1],
     );
 }
 
@@ -100,6 +164,7 @@ fn draw_table_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
+    let icons = Icons::new(&app.config.icons);
     let search_query = app.search_filter.as_deref();
     let visible_count = usize::from(area.height.saturating_sub(1)).max(1);
     let start = viewport_start(app.cursor, app.entries.len(), visible_count);
@@ -111,26 +176,16 @@ fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
             let index = start + offset;
             let depth = app.tree_depth(index);
             let marker = if entry.selected { "●" } else { " " };
-            let branch = if entry.kind == EntryKind::Directory {
-                if app.is_tree_directory_expanded(&entry.path) {
-                    "▾ "
-                } else {
-                    "▸ "
-                }
-            } else {
-                "  "
-            };
-            let suffix = if entry.kind == EntryKind::Directory {
-                "/"
-            } else {
-                ""
-            };
-            let name = format!("{}{branch}{}{suffix}", "  ".repeat(depth), entry.name);
+            let expanded =
+                entry.kind == EntryKind::Directory && app.is_tree_directory_expanded(&entry.path);
+            let name = Line::from(vec![
+                Span::raw("  ".repeat(depth)),
+                icon_span(Icons::slot(icons.entry(entry, expanded))),
+                Span::raw(" "),
+                Span::raw(entry.name.clone()),
+            ]);
             let name_cell = if search_query.is_some() {
-                Cell::from(Span::styled(
-                    name,
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ))
+                Cell::from(name.style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
             } else {
                 Cell::from(name)
             };
@@ -187,23 +242,20 @@ fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
+    let icons = Icons::new(&app.config.icons);
     let search_query = app.search_filter.as_deref();
     let visible_count = usize::from(area.height.saturating_sub(3)).max(1);
     let start = viewport_start(app.cursor, app.entries.len(), visible_count);
     let end = (start + visible_count).min(app.entries.len());
     let rows = app.entries[start..end].iter().map(|entry| {
         let marker = if entry.selected { "●" } else { " " };
-        let suffix = if entry.kind == EntryKind::Directory {
-            "/"
-        } else {
-            ""
-        };
-        let name = format!("{}{suffix}", entry.name);
+        let name = Line::from(vec![
+            icon_span(Icons::slot(icons.entry(entry, false))),
+            Span::raw(" "),
+            Span::raw(entry.name.clone()),
+        ]);
         let name_cell = if search_query.is_some() {
-            Cell::from(Span::styled(
-                name,
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ))
+            Cell::from(name.style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
         } else {
             Cell::from(name)
         };
@@ -258,6 +310,15 @@ fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
     let selected = (!app.entries.is_empty()).then_some(app.cursor.saturating_sub(start));
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn icon_span(icon: String) -> Span<'static> {
+    Span::styled(
+        icon,
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
@@ -344,78 +405,128 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
             " ↑↓/{}/{} Move · Enter Open · {}/{}/Esc Close ",
             app.config.hotkeys.down.display(),
             app.config.hotkeys.up.display(),
-            app.config.hotkeys.apps.display(),
+            app.config.hotkeys.tools.display(),
             app.config.hotkeys.quit.display(),
         )),
         AppMode::Partitions(view) => Some(partition_shortcuts(app, view)),
-        AppMode::Prompt(Prompt::PartitionAuthentication { .. }) => {
-            Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into())
-        }
+        AppMode::Prompt(
+            Prompt::PartitionAuthentication { .. } | Prompt::PartitionNvmeCapabilities { .. },
+        ) => Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into()),
         _ => Some(" A dialog owns input · File shortcuts are disabled until it closes. ".into()),
     };
     if let Some(context) = context {
         frame.render_widget(
             Paragraph::new(context)
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+                .alignment(Alignment::Left)
+                .style(Style::default().fg(MUTED)),
             area,
         );
         return;
     }
 
-    let edit = if app
+    let items = browser_shortcut_items(app);
+    let lines = shortcut_lines_owned(&items, area.width, usize::from(area.height));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default().fg(MUTED)),
+        area,
+    );
+}
+
+fn browser_shortcut_items(app: &App) -> Vec<(String, &'static str)> {
+    let mut items = vec![
+        (
+            format!(
+                "↑↓/{}/{}",
+                app.config.hotkeys.down.display(),
+                app.config.hotkeys.up.display()
+            ),
+            "Move",
+        ),
+        (
+            format!("←/{}", app.config.hotkeys.collapse.display()),
+            "Parent",
+        ),
+        (format!("→/{}", app.config.hotkeys.expand.display()), "Open"),
+        ("Enter".into(), "Open"),
+        (app.config.hotkeys.select.display().into(), "Mark"),
+        (app.config.hotkeys.cut.display().into(), "Cut"),
+        (app.config.hotkeys.copy.display().into(), "Copy"),
+        (app.config.hotkeys.paste.display().into(), "Paste"),
+        (app.config.hotkeys.rename.display().into(), "Rename"),
+        (app.config.hotkeys.create_file.display().into(), "File"),
+        (
+            app.config.hotkeys.create_directory.display().into(),
+            "Directory",
+        ),
+        (app.config.hotkeys.tools.display().into(), "Tools"),
+        (app.config.hotkeys.network_shares.display().into(), "Shares"),
+        (app.config.hotkeys.hidden.display().into(), "Hidden"),
+        (app.config.hotkeys.go_to.display().into(), "Path"),
+        (app.config.hotkeys.search.display().into(), "Search"),
+        (app.config.hotkeys.help.display().into(), "Help"),
+    ];
+    if app
         .selected_entry()
         .is_some_and(|entry| entry.is_text_file())
     {
-        format!(" · {} Edit", app.config.hotkeys.edit.display())
-    } else {
-        String::new()
-    };
-    let open_controls = match app.browser_view {
-        BrowserView::Tree => format!(
-            "→/{} Expand · Enter Open",
-            app.config.hotkeys.expand.display()
-        ),
-        BrowserView::Table => format!("→/{}/Enter Open", app.config.hotkeys.expand.display()),
-    };
-    let view = match app.browser_view {
-        BrowserView::Tree => format!("{} Table", app.config.hotkeys.toggle_view.display()),
-        BrowserView::Table => format!("{} Tree", app.config.hotkeys.toggle_view.display()),
-    };
-
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .split(area);
-    let groups = [
-        format!(
-            " NAVIGATION\n ↑↓/{}/{} Move · ←/{} Parent\n {open_controls}{edit} · {view} · {} Help",
-            app.config.hotkeys.down.display(), app.config.hotkeys.up.display(),
-            app.config.hotkeys.collapse.display(), app.config.hotkeys.help.display()
-        ),
-        format!(" FILE OPERATIONS\n {} Mark · {} Cut · {} Copy · {} Paste\n {} Rename · {} File · {} Dir", app.config.hotkeys.select.display(), app.config.hotkeys.cut.display(), app.config.hotkeys.copy.display(), app.config.hotkeys.paste.display(), app.config.hotkeys.rename.display(), app.config.hotkeys.create_file.display(), app.config.hotkeys.create_directory.display()),
-        format!(" VIEW & APPS\n {}/{} Trash · {} Bin · {} Hidden · {} Sort\n {} Apps · {} Devices · {} Shares · {} Path · {} Search · {} Search FS", app.config.hotkeys.trash.display(), app.config.hotkeys.quick_trash.display(), app.config.hotkeys.trash_bin.display(), app.config.hotkeys.hidden.display(), app.config.hotkeys.sort.display(), app.config.hotkeys.apps.display(), app.config.hotkeys.devices.display(), app.config.hotkeys.network_shares.display(), app.config.hotkeys.go_to.display(), app.config.hotkeys.search.display(), app.config.hotkeys.search_filesystem.display()),
-    ];
-
-    for (index, group) in groups.into_iter().enumerate() {
-        let block = if index < columns.len() - 1 {
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(Style::default().fg(Color::DarkGray))
-        } else {
-            Block::default()
-        };
-        frame.render_widget(
-            Paragraph::new(group)
-                .block(block)
-                .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
-            columns[index],
-        );
+        items.push((app.config.hotkeys.edit.display().into(), "Edit"));
     }
+    items
+}
+
+fn shortcut_bar_height(app: &App, width: u16) -> u16 {
+    let needs_second_line = matches!(app.mode, AppMode::Browser)
+        && shortcut_items_width(&browser_shortcut_items(app)) > usize::from(width);
+    if needs_second_line {
+        2
+    } else {
+        1
+    }
+}
+
+fn shortcut_items_width(items: &[(String, &'static str)]) -> usize {
+    1 + items
+        .iter()
+        .map(|(key, label)| UnicodeWidthStr::width(key.as_str()) + 1 + label.len())
+        .sum::<usize>()
+        + items.len().saturating_sub(1) * 3
+}
+
+fn shortcut_lines_owned(
+    items: &[(String, &'static str)],
+    width: u16,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let width = usize::from(width).max(1);
+    let max_lines = max_lines.max(1);
+    let mut lines = vec![vec![Span::raw(" ")]];
+    let mut line_width = 1usize;
+    for (key, label) in items {
+        let pair_width = UnicodeWidthStr::width(key.as_str()) + 1 + label.len();
+        let separator = if line_width > 1 { 3 } else { 0 };
+        if line_width + separator + pair_width > width && line_width > 1 {
+            if lines.len() == max_lines {
+                break;
+            }
+            lines.push(vec![Span::raw(" ")]);
+            line_width = 1;
+        }
+        let separator = if line_width > 1 { 3 } else { 0 };
+        if separator > 0 {
+            lines.last_mut().unwrap().push(Span::raw("   "));
+        }
+        lines.last_mut().unwrap().extend([
+            Span::styled(
+                key.clone(),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {label}"), Style::default().fg(MUTED)),
+        ]);
+        line_width += separator + pair_width;
+    }
+    lines.into_iter().map(Line::from).collect()
 }
 
 fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -> String {
@@ -425,17 +536,33 @@ fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -> String {
     let refresh = app.config.hotkeys.refresh.display();
     let hint = match &view.overlay {
         None => {
+            let exit = if app.partition_returns_to_apps() {
+                format!(
+                    "{}/Esc Apps · {} Browser",
+                    app.config.hotkeys.tools.display(),
+                    app.config.hotkeys.quit.display()
+                )
+            } else {
+                format!(
+                    "Esc/{} Browser · {} Tools",
+                    app.config.hotkeys.quit.display(),
+                    app.config.hotkeys.tools.display()
+                )
+            };
             return format!(
-                " ↑↓/{down}/{up} Move · Enter/{actions} Actions · {refresh} Refresh · {}/Esc Apps · {} Browser ",
-                app.config.hotkeys.apps.display(),
-                app.config.hotkeys.quit.display()
-            )
+                " ↑↓/{down}/{up} Move · Enter/{actions} Actions · {refresh} Refresh · {exit} "
+            );
         }
         Some(crate::app::PartitionOverlay::Actions { .. }) => {
             return format!(" ↑↓/{down}/{up} Move · Enter Continue · {actions}/Esc Back ")
         }
         Some(crate::app::PartitionOverlay::FormatOptions { .. }) => {
             return format!(" ↑↓/{down}/{up} Choose filesystem · Enter Continue · Esc Back ")
+        }
+        Some(crate::app::PartitionOverlay::NvmeEraseOptions { .. }) => {
+            return format!(
+                " ↑↓/{down}/{up} Choose supported NVMe method · Enter Review · Esc Back "
+            )
         }
         Some(crate::app::PartitionOverlay::DiskLayoutOptions { .. }) => {
             return format!(" ↑↓/{down}/{up} Choose layout · Enter Review · Esc Back ")
@@ -690,6 +817,52 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             );
             frame.render_widget(
                 Paragraph::new("Enter authenticate · Esc cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(ACCENT)),
+                rows[3],
+            );
+        }
+        Prompt::PartitionNvmeCapabilities {
+            view, input, error, ..
+        } => {
+            let area = responsive_centered(frame.area(), 72, 56, 90, 13);
+            frame.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" NVMe capability authentication ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let rows = Layout::vertical([
+                Constraint::Length(4),
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+            let target = view
+                .entries
+                .get(view.selected)
+                .map(|entry| entry.device.path.display().to_string())
+                .unwrap_or_else(|| "selected NVMe drive".into());
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Device: {target}\n\nAdministrator access is required to read this drive's supported erase methods."
+                )),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(format!("> {}", "•".repeat(input.character_count())))
+                    .block(Block::default().borders(Borders::ALL).title(" Password "))
+                    .style(Style::default().fg(ACCENT)),
+                rows[1],
+            );
+            frame.render_widget(
+                Paragraph::new(error.as_deref().unwrap_or(""))
+                    .style(Style::default().fg(Color::Red)),
+                rows[2],
+            );
+            frame.render_widget(
+                Paragraph::new("Enter inspect capabilities · Esc cancel")
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(ACCENT)),
                 rows[3],
@@ -1210,7 +1383,7 @@ fn draw_apps(frame: &mut Frame, app: &App, view: &AppsView) {
             "↑/{} ↓/{} move · Enter open · {}/{}/Esc close",
             app.config.hotkeys.up.display(),
             app.config.hotkeys.down.display(),
-            app.config.hotkeys.apps.display(),
+            app.config.hotkeys.tools.display(),
             app.config.hotkeys.quit.display()
         ))
         .alignment(Alignment::Center)
@@ -1335,7 +1508,7 @@ fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView) {
             app.config.hotkeys.refresh.display(),
             app.config.hotkeys.up.display(),
             app.config.hotkeys.down.display(),
-            app.config.hotkeys.apps.display(),
+            app.config.hotkeys.tools.display(),
             app.config.hotkeys.quit.display()
         ))
         .alignment(Alignment::Center)
@@ -1427,6 +1600,14 @@ fn draw_partition_overlay(
                 .map(|entry| entry.device.path.display().to_string())
                 .unwrap_or_else(|| "selected device".into());
             draw_format_options(frame, &target, *selected);
+        }
+        PartitionOverlay::NvmeEraseOptions { selected, methods } => {
+            let target = view
+                .entries
+                .get(view.selected)
+                .map(|entry| entry.device.path.display().to_string())
+                .unwrap_or_else(|| "selected NVMe drive".into());
+            draw_nvme_erase_options(frame, &target, methods, *selected);
         }
         PartitionOverlay::DiskLayoutOptions { selected } => {
             let target = view
@@ -1529,6 +1710,59 @@ fn draw_format_options(frame: &mut Frame, target: &str, selected: usize) {
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
         Paragraph::new("Choose a filesystem · Enter continue · Esc back")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT))
+            .block(Block::default().borders(Borders::ALL)),
+        sections[1],
+    );
+}
+
+fn draw_nvme_erase_options(
+    frame: &mut Frame,
+    target: &str,
+    methods: &[crate::partition::NvmeEraseMethod],
+    selected: usize,
+) {
+    let height = (methods.len() as u16 + 7).clamp(11, 16);
+    let area = responsive_centered(frame.area(), 92, 65, 130, height);
+    frame.render_widget(Clear, area);
+    let sections = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).split(area);
+    let rows = methods.iter().copied().map(|method| {
+        let scope = match method {
+            crate::partition::NvmeEraseMethod::SanitizeBlockErase
+            | crate::partition::NvmeEraseMethod::SanitizeCryptoErase
+            | crate::partition::NvmeEraseMethod::SanitizeOverwrite => "Controller-wide",
+            crate::partition::NvmeEraseMethod::FormatUserDataErase
+            | crate::partition::NvmeEraseMethod::FormatCryptoErase => "Namespace only",
+            crate::partition::NvmeEraseMethod::ExitFailureMode => "Recovery",
+        };
+        Row::new([method.name(), scope, method.description()])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(30),
+            Constraint::Length(17),
+            Constraint::Min(28),
+        ],
+    )
+    .header(Row::new(["Available method", "Scope", "Effect"]).style(Style::default().fg(MUTED)))
+    .row_highlight_style(
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ")
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" NVMe methods reported by {target} ")),
+    );
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new("Only controller-reported methods are shown · Enter review · Esc back")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT))
             .block(Block::default().borders(Borders::ALL)),
@@ -2163,14 +2397,14 @@ fn draw_network_progress(frame: &mut Frame) {
 fn draw_help(frame: &mut Frame, app: &App) {
     let h = &app.config.hotkeys;
     let body = format!(
-        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nApps and devices\n  {}              built-in apps (devices, partitions, shares)\n  {}              encrypted device manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
+        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nTools and devices\n  {}              built-in tools launcher\n  {}              encrypted device manager\n  {}              partition manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
         h.up.display(), h.down.display(), h.expand.display(), h.collapse.display(),
         h.toggle_view.display(), h.go_to.display(), h.search.display(), h.search_filesystem.display(),
         h.cut.display(), h.copy.display(), h.paste.display(), h.select.display(), h.edit.display(),
         h.rename.display(), h.trash.display(), h.quick_trash.display(), h.trash_bin.display(),
         h.select.display(), h.restore.display(), h.permanent_delete.display(),
         h.quick_permanent_delete.display(), h.clear_trash.display(), h.create_file.display(),
-        h.create_directory.display(), h.apps.display(), h.devices.display(),
+        h.create_directory.display(), h.tools.display(), h.devices.display(), h.partitions.display(),
         h.device_eject.display(), h.network_shares.display(), h.network_add.display(),
         h.network_disconnect.display(), h.network_forget.display(), h.refresh.display(),
         h.hidden.display(), h.sort.display(), h.reverse_sort.display(), h.info.display(),
@@ -2550,6 +2784,21 @@ mod performance_tests {
         assert_eq!(viewport_start(0, 5, 10), 0);
     }
 
+    #[test]
+    fn footer_wraps_only_between_complete_shortcuts() {
+        let lines = shortcut_lines_owned(&[("k".into(), "Move"), ("Ctrl+x".into(), "Cut")], 14, 2);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text, [" k Move", " Ctrl+x Cut"]);
+    }
+
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -2559,6 +2808,14 @@ mod performance_tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn entry_icons_are_high_contrast_without_a_background_fill() {
+        let icon = icon_span("󰉋  ".into());
+        assert_eq!(icon.style.fg, Some(Color::Gray));
+        assert_eq!(icon.style.bg, None);
+        assert!(icon.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -2585,7 +2842,9 @@ mod performance_tests {
     #[test]
     fn footer_and_help_render_configured_hotkeys() {
         let temp = tempfile::tempdir().unwrap();
-        let config = toml::from_str("[hotkeys]\napps = 'F2'\nnetwork_shares = 'F3'\n").unwrap();
+        let config =
+            toml::from_str("[hotkeys]\ntools = 'F2'\nnetwork_shares = 'F3'\npartitions = 'F4'\n")
+                .unwrap();
         let mut app = App::new(
             temp.path().to_path_buf(),
             ConfigLoad::Valid {
@@ -2598,15 +2857,61 @@ mod performance_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = rendered_text(&terminal);
-        assert!(text.contains("F2 Apps"));
+        assert!(text.contains("F2 Tools"));
         assert!(text.contains("F3 Shares"));
-        assert!(!text.contains("M Apps"));
+        assert!(text.contains("▤ F4"));
+        assert!(!text.contains("M Tools"));
 
         app.mode = AppMode::Help;
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = rendered_text(&terminal);
-        assert!(text.contains("F2              built-in apps"));
+        assert!(text.contains("F2              built-in tools launcher"));
         assert!(text.contains("F3              network shares"));
+        assert!(text.contains("F4              partition manager"));
+    }
+
+    #[test]
+    fn header_actions_render_at_narrow_medium_and_wide_widths() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        for width in [50, 100, 150] {
+            let backend = TestBackend::new(width, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let text = rendered_text(&terminal);
+            assert!(text.contains('␡'), "missing trash action at {width}");
+            assert!(text.contains('ⓘ'), "missing info action at {width}");
+            assert!(text.contains('▤'), "missing partitions action at {width}");
+        }
+    }
+
+    #[test]
+    fn header_actions_follow_the_configured_icon_theme() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = toml::from_str("[icons]\ntheme = 'nerd-font'\n").unwrap();
+        let app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config,
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let backend = TestBackend::new(150, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains('󰩹'));
+        assert!(text.contains('󰋼'));
+        assert!(text.contains('󰋊'));
+        assert!(!text.contains('ⓘ'));
     }
 
     #[test]

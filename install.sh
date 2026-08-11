@@ -29,7 +29,14 @@ if [ "$arch" != "x86_64" ]; then
 fi
 
 temp_dir=$(mktemp -d)
-trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
+staged_binary=""
+cleanup() {
+    rm -rf "$temp_dir"
+    if [ -n "$staged_binary" ]; then
+        rm -f "$staged_binary"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
 
 echo "Downloading minfm static binary..."
 curl --proto '=https' --tlsv1.2 -fsSL "$binary_url" -o "$temp_dir/$binary_name"
@@ -45,8 +52,11 @@ printf '%s  %s\n' "$expected" "$temp_dir/$binary_name" | sha256sum --check --sta
 install_dir=${XDG_BIN_HOME:-${HOME}/.local/bin}
 config_dir=${XDG_CONFIG_HOME:-${HOME}/.config}/minfm
 mkdir -p "$install_dir" "$config_dir"
-chmod 0755 "$temp_dir/$binary_name"
-mv "$temp_dir/$binary_name" "$install_dir/minfm"
+staged_binary=$(mktemp "$install_dir/.minfm-install.XXXXXX")
+cp "$temp_dir/$binary_name" "$staged_binary"
+chmod 0755 "$staged_binary"
+mv "$staged_binary" "$install_dir/minfm"
+staged_binary=""
 
 echo "Installed minfm to $install_dir/minfm"
 echo "Configuration directory: $config_dir"
@@ -64,6 +74,33 @@ done
 has_tty() {
     [ -r /dev/tty ] && (: </dev/tty) 2>/dev/null
 }
+
+if ! command -v xdg-open >/dev/null 2>&1; then
+    echo "xdg-open is missing; opening files with the default application is unavailable."
+    if has_tty; then
+        printf "Install xdg-utils now? [y/N] " > /dev/tty
+        read answer < /dev/tty || answer=""
+        case "$answer" in
+            y|Y|yes|YES)
+                if command -v dnf >/dev/null 2>&1; then
+                    sudo dnf install -y xdg-utils
+                elif command -v apt-get >/dev/null 2>&1; then
+                    sudo apt-get update
+                    sudo apt-get install -y xdg-utils
+                elif command -v pacman >/dev/null 2>&1; then
+                    sudo pacman -S --needed xdg-utils
+                else
+                    echo "No supported package manager found; install xdg-utils manually."
+                fi
+                ;;
+            *)
+                echo "Skipped xdg-utils. Configure [open] with another installed application if needed."
+                ;;
+        esac
+    else
+        echo "Install xdg-utils or configure [open] with another installed application if needed."
+    fi
+fi
 
 if [ -n "$missing" ]; then
     echo "Optional LUKS device-management tools are missing:$missing"
