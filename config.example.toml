@@ -10,7 +10,8 @@ show_modified = true
 # Override only the symbols you want to change. Each value must occupy one to
 # three terminal cells. Available names are: directory_closed, directory_open,
 # file, text, code, image, audio, video, archive, executable, symlink,
-# block_device, other, trash, info, devices, partitions, and sort.
+# block_device, and other. Older action-icon overrides are accepted but no
+# longer displayed because the top action bar uses text.
 [icons.overrides]
 # directory_closed = ">"
 # directory_open = "v"
@@ -57,7 +58,6 @@ open = "o"
 edit = "e"
 tools = "M"
 devices = "m"
-partitions = "P"
 network_shares = "N"
 device_eject = "e"
 device_action = "m"

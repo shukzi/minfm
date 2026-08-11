@@ -227,24 +227,28 @@ partition_packages=""
 if command -v dnf >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1 || command -v pacman >/dev/null 2>&1; then
     missing_any parted && add_partition_package parted
     missing_any wipefs sfdisk blockdev mkswap swaplabel && add_partition_package util-linux
-    missing_any shred && add_partition_package coreutils
+    missing_any dd cp install mkdir mv && add_partition_package coreutils
     missing_any sudo && add_partition_package sudo
     missing_any mkfs.ext4 e2fsck resize2fs e2label && add_partition_package e2fsprogs
     missing_any mkfs.xfs xfs_repair xfs_admin && add_partition_package xfsprogs
     missing_any mkfs.btrfs btrfs && add_partition_package btrfs-progs
     missing_any mkfs.fat fsck.fat fatlabel && add_partition_package dosfstools
     missing_any mkfs.exfat fsck.exfat exfatlabel && add_partition_package exfatprogs
-    missing_any nvme && add_partition_package nvme-cli
+    missing_any mkfs.ntfs ntfsfix ntfslabel && add_partition_package ntfs-3g
+    missing_any mkfs.f2fs fsck.f2fs f2fslabel && add_partition_package f2fs-tools
+    missing_any mkudffs && add_partition_package udftools
+    missing_any smartctl && add_partition_package smartmontools
+    missing_any hdparm && add_partition_package hdparm
 else
-    for tool in parted wipefs sfdisk blockdev shred sudo mkfs.ext4 e2fsck resize2fs e2label mkfs.xfs xfs_repair xfs_admin mkfs.btrfs btrfs mkfs.fat fsck.fat fatlabel mkfs.exfat fsck.exfat exfatlabel mkswap swaplabel nvme; do
+    for tool in parted wipefs sfdisk blockdev dd cp install mkdir mv sudo mkfs.ext4 e2fsck resize2fs e2label mkfs.xfs xfs_repair xfs_admin mkfs.btrfs btrfs mkfs.fat fsck.fat fatlabel mkfs.exfat fsck.exfat exfatlabel mkfs.ntfs ntfsfix ntfslabel mkfs.f2fs fsck.f2fs f2fslabel mkudffs smartctl hdparm mkswap swaplabel; do
         command -v "$tool" >/dev/null 2>&1 || add_partition_package "$tool"
     done
 fi
 
 if [ -n "$partition_packages" ]; then
-    echo "Partition-manager support is incomplete; missing packages/tools:$partition_packages"
+    echo "Device-manager support is incomplete; missing packages/tools:$partition_packages"
     if has_tty; then
-        printf "Install the required packages for complete partition-manager functionality? [y/N] " > /dev/tty
+        printf "Install the required packages for complete device-manager functionality? [y/N] " > /dev/tty
         read answer < /dev/tty || answer=""
         case "$answer" in
             y|Y|yes|YES)
@@ -260,10 +264,10 @@ if [ -n "$partition_packages" ]; then
                 fi
                 ;;
             *)
-                echo "Skipped partition-manager packages. Available operations depend on installed tools."
+                echo "Skipped device-manager packages. Available operations depend on installed tools."
                 ;;
         esac
     else
-        echo "Run your distribution's package manager to install them for complete partition-manager functionality."
+        echo "Run your distribution's package manager to install them for complete device-manager functionality."
     fi
 fi

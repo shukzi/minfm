@@ -100,11 +100,6 @@ pub enum Prompt {
         input: SecretInput,
         error: Option<String>,
     },
-    PartitionNvmeCapabilities {
-        view: PartitionView,
-        input: SecretInput,
-        error: Option<String>,
-    },
     PartitionError {
         body: String,
         view: PartitionView,
@@ -275,30 +270,23 @@ pub struct NetworkView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinApp {
     DeviceManager,
-    PartitionManager,
     NetworkShares,
 }
 
 impl BuiltinApp {
-    pub const ALL: [Self; 3] = [
-        Self::DeviceManager,
-        Self::PartitionManager,
-        Self::NetworkShares,
-    ];
+    pub const ALL: [Self; 2] = [Self::DeviceManager, Self::NetworkShares];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::DeviceManager => "Device manager",
-            Self::PartitionManager => "Partition manager",
             Self::NetworkShares => "Network shares",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::DeviceManager => "Mount, unlock, lock, and safely eject encrypted volumes",
-            Self::PartitionManager => {
-                "Inspect and safely manage disks, partitions, and filesystems"
+            Self::DeviceManager => {
+                "Inspect, mount, unlock, unmount, lock, and safely eject storage"
             }
             Self::NetworkShares => "Discover, connect, and manage Samba shares",
         }
@@ -318,7 +306,19 @@ pub struct PartitionView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum PartitionTask {
+    Mount,
+    Unmount,
+    EncryptionAccess,
+    ChangePassphrase,
+    MountOptions,
+    EncryptionOptions,
+    Eject,
+    SmartReport,
+    SmartShortTest,
+    SmartExtendedTest,
+    DriveSettings,
     CreatePartition,
     Resize,
     Format,
@@ -326,63 +326,100 @@ pub enum PartitionTask {
     Delete,
     Label,
     Check,
+    Repair,
+    CreateImage,
+    RestoreImage,
     Flag,
     PartitionName,
     PartitionType,
     BackupTable,
-    WipeHdd,
-    EraseNvme,
 }
 
 impl PartitionTask {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Mount => "Mount",
+            Self::Unmount => "Unmount",
+            Self::EncryptionAccess => "Unlock or lock",
+            Self::ChangePassphrase => "Change LUKS passphrase",
+            Self::MountOptions => "Mount options",
+            Self::EncryptionOptions => "Encryption options",
+            Self::Eject => "Eject",
+            Self::SmartReport => "SMART data",
+            Self::SmartShortTest => "Short SMART test",
+            Self::SmartExtendedTest => "Extended SMART test",
+            Self::DriveSettings => "Drive settings",
             Self::CreatePartition => "Create partition",
             Self::Resize => "Resize",
             Self::Format => "Format",
-            Self::CreateTable => "Create table",
+            Self::CreateTable => "Format disk",
             Self::Delete => "Delete",
-            Self::Label => "Change label",
+            Self::Label => "Edit filesystem",
             Self::Check => "Check filesystem",
+            Self::Repair => "Repair filesystem",
+            Self::CreateImage => "Create image",
+            Self::RestoreImage => "Restore image",
             Self::Flag => "Set flag",
-            Self::PartitionName => "Rename partition",
+            Self::PartitionName => "Edit partition",
             Self::PartitionType => "Change type",
             Self::BackupTable => "Back up table",
-            Self::WipeHdd => "Wipe HDD",
-            Self::EraseNvme => "Erase NVMe",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
+            Self::Mount => "Make this filesystem available",
+            Self::Unmount => "Safely stop using this filesystem",
+            Self::EncryptionAccess => "Unlock, mount, unmount, or lock LUKS",
+            Self::ChangePassphrase => "Replace the volume passphrase",
+            Self::MountOptions => "Configure startup mount behavior",
+            Self::EncryptionOptions => "Configure startup unlock behavior",
+            Self::Eject => "Safely power off a removable drive",
+            Self::SmartReport => "View health information",
+            Self::SmartShortTest => "Start a quick drive self-test",
+            Self::SmartExtendedTest => "Start a complete drive self-test",
+            Self::DriveSettings => "Set standby, APM, AAM, or write cache",
             Self::CreatePartition => "Use free space",
             Self::Resize => "Change the partition size",
             Self::Format => "Erase and create a filesystem",
-            Self::CreateTable => "Create a GPT or MBR table",
+            Self::CreateTable => "Choose GPT, MBR, or no partition table",
             Self::Delete => "Remove this partition",
             Self::Label => "Change the filesystem label",
             Self::Check => "Run a read-only filesystem check",
+            Self::Repair => "Repair filesystem errors",
+            Self::CreateImage => "Save a full device image",
+            Self::RestoreImage => "Replace the device from an image",
             Self::Flag => "Set boot, ESP, or another common flag",
-            Self::PartitionName => "Change the GPT partition name",
+            Self::PartitionName => "Change partition name and metadata",
             Self::PartitionType => "Change the partition type ID",
             Self::BackupTable => "Save a restorable table dump",
-            Self::WipeHdd => "Overwrite the entire rotational disk",
-            Self::EraseNvme => "Use controller-native NVMe Sanitize",
         }
     }
 
     pub fn risk(self) -> &'static str {
         match self {
+            Self::Mount
+            | Self::Unmount
+            | Self::EncryptionAccess
+            | Self::Eject
+            | Self::SmartReport
+            | Self::SmartShortTest
+            | Self::SmartExtendedTest => "Safe",
+            Self::ChangePassphrase | Self::MountOptions | Self::EncryptionOptions => {
+                "Changes configuration"
+            }
             Self::CreatePartition
             | Self::Resize
             | Self::Label
             | Self::Flag
             | Self::PartitionName
-            | Self::PartitionType => "Changes layout",
+            | Self::PartitionType
+            | Self::DriveSettings => "Changes settings",
             Self::Check | Self::BackupTable => "Read only",
-            Self::Format | Self::CreateTable | Self::Delete | Self::WipeHdd | Self::EraseNvme => {
-                "Erases data"
-            }
+            Self::Repair => "Changes data",
+            Self::CreateImage => "Read only",
+            Self::RestoreImage => "Erases data",
+            Self::Format | Self::CreateTable | Self::Delete => "Erases data",
         }
     }
 }
@@ -409,13 +446,31 @@ pub enum PartitionOverlay {
     },
     FormatOptions {
         selected: usize,
+        encrypted: bool,
     },
-    NvmeEraseOptions {
+    EncryptionFilesystem {
         selected: usize,
-        methods: Vec<partition::NvmeEraseMethod>,
+        whole_disk: bool,
+    },
+    EncryptionPassphrase {
+        filesystem: Filesystem,
+        whole_disk: bool,
+        label: Option<String>,
+        passphrase: SecretInput,
+        confirmation: SecretInput,
+        confirming: bool,
+        error: Option<String>,
+    },
+    ChangePassphrase {
+        old: SecretInput,
+        new: SecretInput,
+        confirmation: SecretInput,
+        stage: u8,
+        error: Option<String>,
     },
     DiskLayoutOptions {
         selected: usize,
+        overwrite: bool,
     },
     FreeRegionOptions {
         selected: usize,
@@ -429,6 +484,7 @@ pub enum PartitionOverlay {
     },
     FormatLabel {
         filesystem: Filesystem,
+        encrypted: bool,
         input: String,
         cursor: usize,
         error: Option<String>,
@@ -505,6 +561,12 @@ struct LuksRetry {
     size: u64,
 }
 
+struct PendingPartitionPreflight {
+    view: PartitionView,
+    task: PartitionTask,
+    remaining: VecDeque<PathBuf>,
+}
+
 #[derive(Debug)]
 struct BrowserSnapshot {
     cursor_path: PathBuf,
@@ -563,6 +625,7 @@ pub struct App {
     pub partition_refreshing: bool,
     partition_operation: Option<RunningPartitionOperation>,
     partition_return_view: Option<PartitionView>,
+    partition_preflight: Option<PendingPartitionPreflight>,
     partition_return_to_apps: bool,
     selector_memory: HashMap<PathBuf, PathBuf>,
     expanded_directories: HashSet<PathBuf>,
@@ -631,6 +694,7 @@ impl App {
             partition_refreshing: false,
             partition_operation: None,
             partition_return_view: None,
+            partition_preflight: None,
             partition_return_to_apps: false,
             selector_memory: HashMap::new(),
             expanded_directories: HashSet::new(),
@@ -951,10 +1015,23 @@ impl App {
             Ok(mut outcome) => {
                 outcome.message = format!("{} · took {}", outcome.message, format_elapsed(elapsed));
                 self.set_notice(outcome.message);
-                if let Some(mountpoint) = outcome.mountpoint.filter(|path| path.is_dir()) {
+                if let Some(pending) = self.partition_preflight.as_mut() {
+                    if let Some(source) = pending.remaining.pop_front() {
+                        self.start_luks(LuksAction::UnmountFilesystem { source }, None);
+                        self.mode = AppMode::Progress;
+                        return true;
+                    }
+                    let selected_path = pending
+                        .view
+                        .entries
+                        .get(pending.view.selected)
+                        .map(|entry| entry.device.path.clone());
+                    self.mode = AppMode::Partitions(pending.view.clone());
+                    self.start_partition_refresh(selected_path);
+                } else if let Some(mountpoint) = outcome.mountpoint.filter(|path| path.is_dir()) {
                     self.mode = AppMode::Prompt(Prompt::Mounted { path: mountpoint });
                 } else {
-                    self.mode = self.open_devices();
+                    self.mode = self.reopen_partitions();
                 }
             }
             Err(crate::error::MinfmError::IncorrectPassphrase) => {
@@ -978,7 +1055,11 @@ impl App {
                     "Encrypted-volume operation failed after {}: {error}",
                     format_elapsed(elapsed)
                 );
-                self.mode = self.open_devices();
+                if let Some(pending) = self.partition_preflight.take() {
+                    self.mode = AppMode::Partitions(pending.view);
+                } else {
+                    self.mode = self.reopen_partitions();
+                }
             }
         }
         true
@@ -1325,11 +1406,23 @@ impl App {
                                 .position(|entry| entry.device.path == path)
                         })
                         .unwrap_or(0);
-                    self.mode = AppMode::Partitions(PartitionView {
+                    let refreshed = PartitionView {
                         entries: inventory.entries,
                         selected,
                         overlay: None,
-                    });
+                    };
+                    if self
+                        .partition_preflight
+                        .as_ref()
+                        .is_some_and(|pending| pending.remaining.is_empty())
+                    {
+                        let task = self.partition_preflight.take().map(|pending| pending.task);
+                        self.mode = task
+                            .map(|task| self.begin_partition_task(refreshed.clone(), task))
+                            .unwrap_or(AppMode::Partitions(refreshed));
+                    } else {
+                        self.mode = AppMode::Partitions(refreshed);
+                    }
                 }
                 Err(error) => {
                     self.status = format!("Partition refresh failed: {error}");
@@ -1419,10 +1512,7 @@ impl App {
                             .unwrap_or_else(|| "Unknown device".into());
                         self.status = "Partition operation failed".into();
                         self.mode = AppMode::Prompt(Prompt::PartitionError {
-                            body: format!(
-                                "Action: {action}\nDevice: {target}\nElapsed: {}\n\nReason:\n{error}\n\nThe operation did not complete. Inspect the device before retrying; a multi-step operation may have completed earlier steps.",
-                                format_elapsed(elapsed)
-                            ),
+                            body: format!("{action}\n{target}\n\n{error}\n\nCheck the device before retrying."),
                             view,
                         });
                         return true;
@@ -1565,12 +1655,12 @@ impl App {
 
     pub fn sort_label(&self) -> &'static str {
         match self.config.ui.sort {
-            SortSetting::Name => "name",
-            SortSetting::Extension => "extension",
-            SortSetting::Size => "size",
-            SortSetting::Modified => "modified",
-            SortSetting::Type => "type",
-            SortSetting::Permissions => "permissions",
+            SortSetting::Name => "Name",
+            SortSetting::Extension => "Extension",
+            SortSetting::Size => "Size",
+            SortSetting::Modified => "Modified",
+            SortSetting::Type => "Type",
+            SortSetting::Permissions => "Permissions",
         }
     }
 
@@ -1676,17 +1766,7 @@ impl App {
         } else if hotkeys.open.matches(key) || hotkeys.edit.matches(key) {
             return self.open_external(hotkeys.edit.matches(key));
         } else if hotkeys.devices.matches(key) {
-            if self.config.behavior.read_only {
-                self.status = "Read-only mode: disk operations are disabled".into();
-            } else {
-                return self.open_devices();
-            }
-        } else if hotkeys.partitions.matches(key) {
-            if self.config.behavior.read_only {
-                self.status = "Read-only mode: partition operations are disabled".into();
-            } else {
-                return self.open_partitions(false);
-            }
+            return self.open_partitions(false);
         } else if hotkeys.network_shares.matches(key) {
             return self.open_network();
         }
@@ -1708,12 +1788,7 @@ impl App {
             || hotkeys.expand.matches(key)
         {
             match BuiltinApp::ALL.get(view.selected).copied() {
-                Some(BuiltinApp::DeviceManager) if self.config.behavior.read_only => {
-                    self.set_notice("Read-only mode: device operations are disabled");
-                    AppMode::Apps(view)
-                }
-                Some(BuiltinApp::DeviceManager) => self.open_devices(),
-                Some(BuiltinApp::PartitionManager) => self.open_partitions(true),
+                Some(BuiltinApp::DeviceManager) => self.open_partitions(true),
                 Some(BuiltinApp::NetworkShares) => self.open_network(),
                 None => AppMode::Apps(view),
             }
@@ -1860,7 +1935,12 @@ impl App {
                     self.start_luks(action.clone(), None);
                     return AppMode::Progress;
                 }
-                KeyCode::Esc => return self.open_devices(),
+                KeyCode::Esc => {
+                    if let Some(pending) = self.partition_preflight.take() {
+                        return AppMode::Partitions(pending.view);
+                    }
+                    return self.reopen_partitions();
+                }
                 _ => {}
             },
             Prompt::LuksPassphrase {
@@ -1870,7 +1950,7 @@ impl App {
                 input,
                 error,
             } => match key.code {
-                KeyCode::Esc => return self.open_devices(),
+                KeyCode::Esc => return self.reopen_partitions(),
                 KeyCode::Enter if !input.is_empty() => {
                     let retry = LuksRetry {
                         source: source.clone(),
@@ -1909,47 +1989,6 @@ impl App {
                     let password = std::mem::take(input);
                     self.start_partition_operation(action.clone(), view.clone(), Some(password));
                     return AppMode::Progress;
-                }
-                KeyCode::Backspace => {
-                    error.take();
-                    input.pop();
-                }
-                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    error.take();
-                    input.push(character);
-                }
-                _ => {}
-            },
-            Prompt::PartitionNvmeCapabilities { view, input, error } => match key.code {
-                KeyCode::Esc => return AppMode::Partitions(view.clone()),
-                KeyCode::Enter if input.is_empty() => {
-                    *error = Some("Enter your administrator password".into());
-                }
-                KeyCode::Enter => {
-                    let Some(entry) = view.entries.get(view.selected) else {
-                        return AppMode::Partitions(view.clone());
-                    };
-                    match partition::probe_nvme_erase_capabilities(
-                        &entry.device,
-                        Some(input.expose()),
-                    ) {
-                        Ok(capabilities) => {
-                            let mut view = view.clone();
-                            view.overlay = Some(PartitionOverlay::NvmeEraseOptions {
-                                selected: 0,
-                                methods: capabilities.methods,
-                            });
-                            return AppMode::Partitions(view);
-                        }
-                        Err(crate::error::MinfmError::IncorrectPassphrase) => {
-                            *input = SecretInput::default();
-                            *error = Some("Authentication failed. Try again.".into());
-                        }
-                        Err(probe_error) => {
-                            *input = SecretInput::default();
-                            *error = Some(probe_error.to_string());
-                        }
-                    }
                 }
                 KeyCode::Backspace => {
                     error.take();
@@ -2368,7 +2407,11 @@ impl App {
                 if device.system_protected || !device.ejectable || device.eject_blocked {
                     return AppMode::Devices(view);
                 }
-                let steps = if device.is_mounted() {
+                let steps = if !device.encrypted && device.is_mounted() {
+                    "The filesystem will be unmounted and the drive safely ejected."
+                } else if !device.encrypted {
+                    "The drive will be safely ejected."
+                } else if device.is_mounted() {
                     "The volume will be unmounted, locked, and safely ejected."
                 } else if !device.is_locked() {
                     "The volume will be locked and safely ejected."
@@ -2407,6 +2450,41 @@ impl App {
                 device.source.display()
             );
             return AppMode::Devices(view);
+        }
+        if !device.encrypted {
+            if device.filesystem.is_none() {
+                self.status = format!(
+                    "{} has no directly mountable filesystem",
+                    device.source.display()
+                );
+                return AppMode::Devices(view);
+            }
+            let (action, title, body) = if device.is_mounted() {
+                (
+                    LuksAction::UnmountFilesystem {
+                        source: device.source.clone(),
+                    },
+                    "Unmount filesystem",
+                    format!(
+                        "Device: {}\nMounted at: {}\n\nOpen files and programs using this filesystem must be closed. The unmount is cancelled if the device is busy.",
+                        device.source.display(),
+                        device.mountpoints.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
+                    ),
+                )
+            } else {
+                (
+                    LuksAction::MountFilesystem {
+                        source: device.source.clone(),
+                    },
+                    "Mount filesystem",
+                    format!("Device: {}", device.source.display()),
+                )
+            };
+            return AppMode::Prompt(Prompt::ConfirmLuks {
+                action,
+                title: title.into(),
+                body,
+            });
         }
         if device.is_locked() {
             AppMode::Prompt(Prompt::LuksPassphrase {
@@ -2583,12 +2661,12 @@ impl App {
         let hotkeys = self.config.hotkeys.clone();
         if key.code == KeyCode::Esc {
             if self.partition_return_to_apps {
-                AppMode::Apps(AppsView { selected: 1 })
+                AppMode::Apps(AppsView { selected: 0 })
             } else {
                 AppMode::Browser
             }
         } else if hotkeys.tools.matches(key) {
-            AppMode::Apps(AppsView { selected: 1 })
+            AppMode::Apps(AppsView { selected: 0 })
         } else if hotkeys.quit.matches(key) {
             AppMode::Browser
         } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
@@ -2629,7 +2707,7 @@ impl App {
             &overlay,
             PartitionOverlay::Actions { .. }
                 | PartitionOverlay::FormatOptions { .. }
-                | PartitionOverlay::NvmeEraseOptions { .. }
+                | PartitionOverlay::EncryptionFilesystem { .. }
                 | PartitionOverlay::DiskLayoutOptions { .. }
                 | PartitionOverlay::FreeRegionOptions { .. }
         );
@@ -2672,6 +2750,9 @@ impl App {
                         view.overlay = Some(PartitionOverlay::Actions { selected });
                         return AppMode::Partitions(view);
                     };
+                    if let Some(mode) = self.partition_unmount_preflight(&view, task) {
+                        return mode;
+                    }
                     if let Some(reason) = self.partition_task_unavailable(&view, task) {
                         self.set_notice(reason);
                         view.overlay = Some(PartitionOverlay::Actions { selected });
@@ -2684,7 +2765,10 @@ impl App {
                     AppMode::Partitions(view)
                 }
             },
-            PartitionOverlay::FormatOptions { mut selected } => match key.code {
+            PartitionOverlay::FormatOptions {
+                mut selected,
+                mut encrypted,
+            } => match key.code {
                 KeyCode::Esc => {
                     let tasks = self.partition_tasks_for_view(&view);
                     view.overlay = Some(PartitionOverlay::Actions {
@@ -2697,21 +2781,41 @@ impl App {
                 }
                 KeyCode::Down => {
                     selected = (selected + 1).min(Filesystem::ALL.len() - 1);
-                    view.overlay = Some(PartitionOverlay::FormatOptions { selected });
+                    view.overlay = Some(PartitionOverlay::FormatOptions {
+                        selected,
+                        encrypted,
+                    });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
-                    view.overlay = Some(PartitionOverlay::FormatOptions { selected });
+                    view.overlay = Some(PartitionOverlay::FormatOptions {
+                        selected,
+                        encrypted,
+                    });
+                    AppMode::Partitions(view)
+                }
+                KeyCode::Char('e') => {
+                    if Filesystem::ALL.get(selected) != Some(&Filesystem::None) {
+                        encrypted = !encrypted;
+                    }
+                    view.overlay = Some(PartitionOverlay::FormatOptions {
+                        selected,
+                        encrypted,
+                    });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Enter | KeyCode::Right => {
                     let Some(filesystem) = Filesystem::ALL.get(selected).copied() else {
-                        view.overlay = Some(PartitionOverlay::FormatOptions { selected });
+                        view.overlay = Some(PartitionOverlay::FormatOptions {
+                            selected,
+                            encrypted,
+                        });
                         return AppMode::Partitions(view);
                     };
                     view.overlay = Some(PartitionOverlay::FormatLabel {
                         filesystem,
+                        encrypted,
                         input: String::new(),
                         cursor: 0,
                         error: None,
@@ -2719,69 +2823,237 @@ impl App {
                     AppMode::Partitions(view)
                 }
                 _ => {
-                    view.overlay = Some(PartitionOverlay::FormatOptions { selected });
+                    view.overlay = Some(PartitionOverlay::FormatOptions {
+                        selected,
+                        encrypted,
+                    });
                     AppMode::Partitions(view)
                 }
             },
-            PartitionOverlay::NvmeEraseOptions {
+            PartitionOverlay::EncryptionFilesystem {
                 mut selected,
-                methods,
+                whole_disk,
             } => match key.code {
                 KeyCode::Esc => {
-                    let tasks = self.partition_tasks_for_view(&view);
-                    view.overlay = Some(PartitionOverlay::Actions {
-                        selected: tasks
-                            .iter()
-                            .position(|task| *task == PartitionTask::EraseNvme)
-                            .unwrap_or(0),
+                    view.overlay = Some(if whole_disk {
+                        PartitionOverlay::DiskLayoutOptions {
+                            selected: 2,
+                            overwrite: false,
+                        }
+                    } else {
+                        PartitionOverlay::FormatOptions {
+                            selected: Filesystem::ALL.len(),
+                            encrypted: false,
+                        }
                     });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Down => {
-                    selected = (selected + 1).min(methods.len().saturating_sub(1));
-                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                    selected = (selected + 1).min(Filesystem::ALL.len() - 1);
+                    view.overlay = Some(PartitionOverlay::EncryptionFilesystem {
+                        selected,
+                        whole_disk,
+                    });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
-                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                    view.overlay = Some(PartitionOverlay::EncryptionFilesystem {
+                        selected,
+                        whole_disk,
+                    });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Enter | KeyCode::Right => {
-                    let Some(method) = methods.get(selected).copied() else {
-                        view.overlay =
-                            Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                    let Some(filesystem) = Filesystem::ALL.get(selected).copied() else {
                         return AppMode::Partitions(view);
                     };
-                    match self.partition_nvme_action(&view, method) {
-                        Ok(action) => {
-                            if let Err(validation) =
-                                partition::validate_snapshot(&action, &view.entries)
-                            {
-                                self.set_notice(validation.to_string());
-                                view.overlay =
-                                    Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
-                            } else {
-                                view.overlay = Some(PartitionOverlay::Confirm {
-                                    action,
-                                    yes_selected: false,
-                                });
-                            }
-                        }
-                        Err(error) => {
-                            self.set_notice(error);
-                            view.overlay =
-                                Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
-                        }
-                    }
+                    view.overlay = Some(PartitionOverlay::EncryptionPassphrase {
+                        filesystem,
+                        whole_disk,
+                        label: None,
+                        passphrase: SecretInput::default(),
+                        confirmation: SecretInput::default(),
+                        confirming: false,
+                        error: None,
+                    });
                     AppMode::Partitions(view)
                 }
                 _ => {
-                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions { selected, methods });
+                    view.overlay = Some(PartitionOverlay::EncryptionFilesystem {
+                        selected,
+                        whole_disk,
+                    });
                     AppMode::Partitions(view)
                 }
             },
-            PartitionOverlay::DiskLayoutOptions { mut selected } => match key.code {
+            PartitionOverlay::EncryptionPassphrase {
+                filesystem,
+                whole_disk,
+                label,
+                mut passphrase,
+                mut confirmation,
+                mut confirming,
+                error: _,
+            } => {
+                let mut error = None;
+                match key.code {
+                    KeyCode::Esc => {
+                        view.overlay = Some(PartitionOverlay::EncryptionFilesystem {
+                            selected: Filesystem::ALL
+                                .iter()
+                                .position(|candidate| *candidate == filesystem)
+                                .unwrap_or(0),
+                            whole_disk,
+                        });
+                        return AppMode::Partitions(view);
+                    }
+                    KeyCode::Enter if !confirming => {
+                        if passphrase.character_count() < 8 {
+                            error = Some("Use at least 8 characters".into());
+                        } else {
+                            confirming = true;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if passphrase != confirmation {
+                            confirmation = SecretInput::default();
+                            error = Some(
+                                "Passphrases do not match; enter the confirmation again".into(),
+                            );
+                        } else {
+                            let action = self.partition_encryption_action(
+                                &view,
+                                filesystem,
+                                whole_disk,
+                                label.clone(),
+                                std::mem::take(&mut passphrase),
+                            );
+                            match action {
+                                Ok(action) => {
+                                    match partition::validate_snapshot(&action, &view.entries) {
+                                        Ok(()) => {
+                                            view.overlay = Some(PartitionOverlay::Confirm {
+                                                action,
+                                                yes_selected: false,
+                                            });
+                                            return AppMode::Partitions(view);
+                                        }
+                                        Err(validation) => error = Some(validation.to_string()),
+                                    }
+                                }
+                                Err(message) => error = Some(message),
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if confirming {
+                            confirmation.pop();
+                        } else {
+                            passphrase.pop();
+                        }
+                    }
+                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if confirming {
+                            confirmation.push(character);
+                        } else {
+                            passphrase.push(character);
+                        }
+                    }
+                    _ => {}
+                }
+                view.overlay = Some(PartitionOverlay::EncryptionPassphrase {
+                    filesystem,
+                    whole_disk,
+                    label,
+                    passphrase,
+                    confirmation,
+                    confirming,
+                    error,
+                });
+                AppMode::Partitions(view)
+            }
+            PartitionOverlay::ChangePassphrase {
+                mut old,
+                mut new,
+                mut confirmation,
+                mut stage,
+                error: _,
+            } => {
+                let mut error = None;
+                match key.code {
+                    KeyCode::Esc => {
+                        view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
+                        return AppMode::Partitions(view);
+                    }
+                    KeyCode::Enter if stage == 0 => {
+                        if old.is_empty() {
+                            error = Some("Enter the current passphrase".into());
+                        } else {
+                            stage = 1;
+                        }
+                    }
+                    KeyCode::Enter if stage == 1 => {
+                        if new.character_count() < 8 {
+                            error = Some("Use at least 8 characters".into());
+                        } else {
+                            stage = 2;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if new != confirmation {
+                            confirmation = SecretInput::default();
+                            error = Some("Passphrases do not match".into());
+                        } else if let Some(entry) = view.entries.get(view.selected) {
+                            match DeviceIdentity::from_entry(entry) {
+                                Ok(target) => {
+                                    let action = PartitionAction::ChangeLuksPassphrase {
+                                        target,
+                                        old: std::mem::take(&mut old),
+                                        new: std::mem::take(&mut new),
+                                    };
+                                    match partition::validate_snapshot(&action, &view.entries) {
+                                        Ok(()) => {
+                                            view.overlay = Some(PartitionOverlay::Confirm {
+                                                action,
+                                                yes_selected: false,
+                                            });
+                                            return AppMode::Partitions(view);
+                                        }
+                                        Err(validation) => error = Some(validation.to_string()),
+                                    }
+                                }
+                                Err(identity) => error = Some(identity.to_string()),
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => match stage {
+                        0 => old.pop(),
+                        1 => new.pop(),
+                        _ => confirmation.pop(),
+                    },
+                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match stage {
+                            0 => old.push(character),
+                            1 => new.push(character),
+                            _ => confirmation.push(character),
+                        }
+                    }
+                    _ => {}
+                }
+                view.overlay = Some(PartitionOverlay::ChangePassphrase {
+                    old,
+                    new,
+                    confirmation,
+                    stage,
+                    error,
+                });
+                AppMode::Partitions(view)
+            }
+            PartitionOverlay::DiskLayoutOptions {
+                mut selected,
+                mut overwrite,
+            } => match key.code {
                 KeyCode::Esc => {
                     let tasks = self.partition_tasks_for_view(&view);
                     view.overlay = Some(PartitionOverlay::Actions {
@@ -2794,23 +3066,31 @@ impl App {
                 }
                 KeyCode::Down => {
                     selected = (selected + 1).min(2);
-                    view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected });
+                    view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                        selected,
+                        overwrite,
+                    });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
-                    view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected });
+                    view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                        selected,
+                        overwrite,
+                    });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Enter | KeyCode::Right => {
-                    match self.partition_disk_layout_action(&view, selected) {
+                    match self.partition_disk_layout_action(&view, selected, overwrite) {
                         Ok(action) => {
                             if let Err(validation) =
                                 partition::validate_snapshot(&action, &view.entries)
                             {
                                 self.set_notice(validation.to_string());
-                                view.overlay =
-                                    Some(PartitionOverlay::DiskLayoutOptions { selected });
+                                view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                                    selected,
+                                    overwrite,
+                                });
                             } else {
                                 view.overlay = Some(PartitionOverlay::Confirm {
                                     action,
@@ -2820,13 +3100,27 @@ impl App {
                         }
                         Err(message) => {
                             self.set_notice(message);
-                            view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected });
+                            view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                                selected,
+                                overwrite,
+                            });
                         }
                     }
                     AppMode::Partitions(view)
                 }
+                KeyCode::Char('w') => {
+                    overwrite = !overwrite;
+                    view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                        selected,
+                        overwrite,
+                    });
+                    AppMode::Partitions(view)
+                }
                 _ => {
-                    view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected });
+                    view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                        selected,
+                        overwrite,
+                    });
                     AppMode::Partitions(view)
                 }
             },
@@ -2912,6 +3206,7 @@ impl App {
             }
             PartitionOverlay::FormatLabel {
                 filesystem,
+                encrypted,
                 mut input,
                 mut cursor,
                 error: _,
@@ -2921,11 +3216,26 @@ impl App {
                         .iter()
                         .position(|candidate| *candidate == filesystem)
                         .unwrap_or(0);
-                    view.overlay = Some(PartitionOverlay::FormatOptions { selected });
+                    view.overlay = Some(PartitionOverlay::FormatOptions {
+                        selected,
+                        encrypted,
+                    });
                     return AppMode::Partitions(view);
                 }
                 let mut error = None;
                 if key.code == KeyCode::Enter {
+                    if encrypted {
+                        view.overlay = Some(PartitionOverlay::EncryptionPassphrase {
+                            filesystem,
+                            whole_disk: false,
+                            label: (!input.trim().is_empty()).then(|| input.trim().to_owned()),
+                            passphrase: SecretInput::default(),
+                            confirmation: SecretInput::default(),
+                            confirming: false,
+                            error: None,
+                        });
+                        return AppMode::Partitions(view);
+                    }
                     match self.partition_format_action(&view, filesystem, &input) {
                         Ok(action) => {
                             if let Err(validation) =
@@ -2947,6 +3257,7 @@ impl App {
                 }
                 view.overlay = Some(PartitionOverlay::FormatLabel {
                     filesystem,
+                    encrypted,
                     input,
                     cursor,
                     error,
@@ -3068,40 +3379,81 @@ impl App {
             return AppMode::Partitions(view);
         }
         if task == PartitionTask::Format {
-            view.overlay = Some(PartitionOverlay::FormatOptions { selected: 0 });
+            view.overlay = Some(PartitionOverlay::FormatOptions {
+                selected: 0,
+                encrypted: false,
+            });
             return AppMode::Partitions(view);
         }
         if task == PartitionTask::CreateTable {
-            view.overlay = Some(PartitionOverlay::DiskLayoutOptions { selected: 0 });
+            view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
+                selected: 0,
+                overwrite: false,
+            });
             return AppMode::Partitions(view);
         }
         if task == PartitionTask::CreatePartition {
             view.overlay = Some(PartitionOverlay::FreeRegionOptions { selected: 0 });
             return AppMode::Partitions(view);
         }
-        if task == PartitionTask::EraseNvme {
-            let Some(entry) = view.entries.get(view.selected) else {
-                return AppMode::Partitions(view);
-            };
-            if partition::administrator_authentication_required() {
-                return AppMode::Prompt(Prompt::PartitionNvmeCapabilities {
-                    view,
-                    input: SecretInput::default(),
-                    error: None,
-                });
-            }
-            match partition::probe_nvme_erase_capabilities(&entry.device, None) {
-                Ok(capabilities) => {
-                    view.overlay = Some(PartitionOverlay::NvmeEraseOptions {
-                        selected: 0,
-                        methods: capabilities.methods,
-                    });
+        if task == PartitionTask::EncryptionAccess {
+            let selected_path = view.entries[view.selected].device.path.clone();
+            match luks::discover() {
+                Ok(devices) => {
+                    if let Some(selected) = devices.iter().position(|device| {
+                        device.source == selected_path
+                            || device.mapping.as_ref() == Some(&selected_path)
+                    }) {
+                        return self.device_action(DeviceView { devices, selected });
+                    }
+                    self.set_notice("LUKS state changed · refresh and retry");
                 }
                 Err(error) => self.set_notice(error.to_string()),
             }
             return AppMode::Partitions(view);
         }
-        if matches!(task, PartitionTask::Delete | PartitionTask::Check) {
+        if task == PartitionTask::ChangePassphrase {
+            view.overlay = Some(PartitionOverlay::ChangePassphrase {
+                old: SecretInput::default(),
+                new: SecretInput::default(),
+                confirmation: SecretInput::default(),
+                stage: 0,
+                error: None,
+            });
+            return AppMode::Partitions(view);
+        }
+        if task == PartitionTask::Eject {
+            let drive = view.entries[view.selected].device.path.clone();
+            match luks::discover().ok().and_then(|devices| {
+                devices.into_iter().find(|device| {
+                    device.drive == drive && device.ejectable && !device.eject_blocked
+                })
+            }) {
+                Some(device) => {
+                    return AppMode::Prompt(Prompt::ConfirmLuks {
+                        action: LuksAction::Eject {
+                            source: device.source,
+                            drive: device.drive,
+                        },
+                        title: "Eject device".into(),
+                        body: "Active filesystems will be unmounted first.".into(),
+                    })
+                }
+                None => self.set_notice("This drive cannot be safely ejected"),
+            }
+            return AppMode::Partitions(view);
+        }
+        if matches!(
+            task,
+            PartitionTask::Mount
+                | PartitionTask::Unmount
+                | PartitionTask::Delete
+                | PartitionTask::Check
+                | PartitionTask::Repair
+                | PartitionTask::SmartReport
+                | PartitionTask::SmartShortTest
+                | PartitionTask::SmartExtendedTest
+        ) {
             match self.partition_action_from_input(&view, task, "") {
                 Ok(action) => {
                     if let Err(error) = partition::validate_snapshot(&action, &view.entries) {
@@ -3128,49 +3480,194 @@ impl App {
         AppMode::Partitions(view)
     }
 
+    fn partition_unmount_preflight(
+        &mut self,
+        view: &PartitionView,
+        task: PartitionTask,
+    ) -> Option<AppMode> {
+        if matches!(
+            task,
+            PartitionTask::Mount
+                | PartitionTask::Unmount
+                | PartitionTask::EncryptionAccess
+                | PartitionTask::MountOptions
+                | PartitionTask::EncryptionOptions
+                | PartitionTask::Eject
+                | PartitionTask::Check
+                | PartitionTask::CreateImage
+                | PartitionTask::BackupTable
+        ) {
+            return None;
+        }
+        let selected = view.entries.get(view.selected)?;
+        let selected_path = &selected.device.path;
+        let belongs_to_selection = |entry: &PartitionEntry| {
+            let mut path = Some(entry.device.path.as_path());
+            while let Some(current) = path {
+                if current == selected_path {
+                    return true;
+                }
+                path = view
+                    .entries
+                    .iter()
+                    .find(|candidate| candidate.device.path == current)
+                    .and_then(|candidate| candidate.device.parent.as_deref());
+            }
+            false
+        };
+        let mut mounted = view
+            .entries
+            .iter()
+            .filter(|entry| entry.device.is_mounted() && belongs_to_selection(entry))
+            .collect::<Vec<_>>();
+        if mounted.is_empty() {
+            return None;
+        }
+        if mounted
+            .iter()
+            .any(|entry| entry.protected || entry.device.kind == "crypt")
+        {
+            return None;
+        }
+        mounted.sort_by_key(|entry| std::cmp::Reverse(entry.depth));
+        let targets = mounted
+            .iter()
+            .map(|entry| entry.device.path.clone())
+            .collect::<Vec<_>>();
+        let details = mounted
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} · {}",
+                    entry.device.path.display(),
+                    entry
+                        .device
+                        .mountpoints
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first = targets[0].clone();
+        self.partition_preflight = Some(PendingPartitionPreflight {
+            view: view.clone(),
+            task,
+            remaining: targets.into_iter().skip(1).collect(),
+        });
+        Some(AppMode::Prompt(Prompt::ConfirmLuks {
+            action: LuksAction::UnmountFilesystem { source: first },
+            title: "Unmount storage before continuing".into(),
+            body: format!(
+                "{} needs inactive storage. Unmount first:\n\n{}\n\nBusy devices stop safely. You will confirm the main action separately.",
+                task.name(), details
+            ),
+        }))
+    }
+
     pub fn partition_tasks_for_view(&self, view: &PartitionView) -> Vec<PartitionTask> {
         let Some(entry) = view.entries.get(view.selected) else {
             return Vec::new();
         };
+        let luks_entry = entry.device.filesystem.as_deref() == Some("crypto_LUKS")
+            || entry.device.kind == "crypt";
         if entry.device.is_disk() {
             let mut tasks = Vec::new();
+            if luks_entry {
+                tasks.push(PartitionTask::EncryptionAccess);
+                if entry.device.filesystem.as_deref() == Some("crypto_LUKS") {
+                    tasks.push(PartitionTask::ChangePassphrase);
+                    tasks.push(PartitionTask::EncryptionOptions);
+                }
+            } else if entry.device.filesystem.is_some() {
+                tasks.push(if entry.device.is_mounted() {
+                    PartitionTask::Unmount
+                } else {
+                    PartitionTask::Mount
+                });
+            }
             if entry.device.table_type.is_some() {
-                tasks.extend([
-                    PartitionTask::CreatePartition,
-                    PartitionTask::BackupTable,
-                    PartitionTask::CreateTable,
-                ]);
+                tasks.extend([PartitionTask::CreatePartition, PartitionTask::CreateTable]);
             } else {
                 tasks.extend([PartitionTask::CreateTable, PartitionTask::Format]);
             }
-            if partition::is_rotational_hdd(&entry.device) {
-                tasks.push(PartitionTask::WipeHdd);
+            tasks.extend([
+                PartitionTask::CreateImage,
+                PartitionTask::RestoreImage,
+                PartitionTask::SmartReport,
+                PartitionTask::SmartShortTest,
+                PartitionTask::SmartExtendedTest,
+                PartitionTask::DriveSettings,
+            ]);
+            if entry.device.filesystem.is_some() && !luks_entry {
+                tasks.push(PartitionTask::MountOptions);
             }
-            if entry.device.transport.as_deref() == Some("nvme") {
-                tasks.push(PartitionTask::EraseNvme);
-            }
+            tasks.push(PartitionTask::Eject);
             return tasks;
         }
-        vec![
+        let mut tasks = Vec::new();
+        if luks_entry {
+            tasks.push(PartitionTask::EncryptionAccess);
+            if entry.device.filesystem.as_deref() == Some("crypto_LUKS") {
+                tasks.push(PartitionTask::ChangePassphrase);
+                tasks.push(PartitionTask::EncryptionOptions);
+            } else if entry.device.kind == "crypt" && entry.device.uuid.is_some() {
+                tasks.push(PartitionTask::MountOptions);
+            }
+        } else if entry.device.filesystem.is_some() {
+            tasks.push(if entry.device.is_mounted() {
+                PartitionTask::Unmount
+            } else {
+                PartitionTask::Mount
+            });
+        }
+        tasks.extend([
             PartitionTask::Resize,
             PartitionTask::Format,
             PartitionTask::Delete,
             PartitionTask::Label,
             PartitionTask::Check,
+            PartitionTask::Repair,
+            PartitionTask::CreateImage,
+            PartitionTask::RestoreImage,
             PartitionTask::PartitionName,
             PartitionTask::PartitionType,
             PartitionTask::Flag,
-        ]
+        ]);
+        if entry.device.filesystem.is_some() && !luks_entry {
+            tasks.push(PartitionTask::MountOptions);
+        }
+        tasks
     }
 
     pub fn partition_task_name(&self, view: &PartitionView, task: PartitionTask) -> &'static str {
+        if task == PartitionTask::EncryptionAccess {
+            if let Some(entry) = view.entries.get(view.selected) {
+                if let Some(device) = luks::discover().ok().and_then(|devices| {
+                    devices.into_iter().find(|device| {
+                        device.source == entry.device.path
+                            || device.mapping.as_ref() == Some(&entry.device.path)
+                    })
+                }) {
+                    return if device.is_locked() {
+                        "Unlock and mount"
+                    } else if device.is_mounted() {
+                        "Unmount and lock"
+                    } else {
+                        "Mount unlocked volume"
+                    };
+                }
+            }
+        }
         if task == PartitionTask::CreateTable {
             if let Some(entry) = view.entries.get(view.selected) {
                 if entry.device.table_type.is_some() || entry.device.filesystem.is_some() {
-                    return "Reset disk";
+                    return "Format disk";
                 }
             }
-            return "Create partitions";
+            return "Format disk";
         }
         if task == PartitionTask::Format
             && view
@@ -3215,7 +3712,15 @@ impl App {
         task: PartitionTask,
     ) -> Option<String> {
         let entry = view.entries.get(view.selected)?;
-        let changes_storage = !matches!(task, PartitionTask::Check | PartitionTask::BackupTable);
+        let changes_storage = !matches!(
+            task,
+            PartitionTask::Check
+                | PartitionTask::BackupTable
+                | PartitionTask::CreateImage
+                | PartitionTask::SmartReport
+                | PartitionTask::SmartShortTest
+                | PartitionTask::SmartExtendedTest
+        );
         if self.config.behavior.read_only && changes_storage {
             return Some("Read-only mode: partition operations are disabled".into());
         }
@@ -3227,6 +3732,90 @@ impl App {
         }
         let active = entry.device.is_mounted() || entry.mounted_descendants;
         match task {
+            PartitionTask::EncryptionAccess => {
+                let found = luks::discover().ok().is_some_and(|devices| {
+                    devices.iter().any(|device| {
+                        device.source == entry.device.path
+                            || device.mapping.as_ref() == Some(&entry.device.path)
+                    })
+                });
+                (!found).then(|| "LUKS state is unavailable".into())
+            }
+            PartitionTask::ChangePassphrase => {
+                if entry.device.filesystem.as_deref() != Some("crypto_LUKS") {
+                    Some("Select a locked LUKS volume".into())
+                } else if active {
+                    Some("Unmount and lock the volume first".into())
+                } else {
+                    None
+                }
+            }
+            PartitionTask::MountOptions => {
+                if entry.device.uuid.as_deref().is_none_or(str::is_empty) {
+                    Some("This filesystem has no UUID".into())
+                } else {
+                    None
+                }
+            }
+            PartitionTask::EncryptionOptions => {
+                if entry.device.filesystem.as_deref() != Some("crypto_LUKS") {
+                    Some("Select a LUKS volume".into())
+                } else if entry.device.uuid.as_deref().is_none_or(str::is_empty) {
+                    Some("This LUKS volume has no UUID".into())
+                } else {
+                    None
+                }
+            }
+            PartitionTask::Eject => {
+                let found = luks::discover().ok().is_some_and(|devices| {
+                    devices.iter().any(|device| {
+                        device.drive == entry.device.path
+                            && device.ejectable
+                            && !device.eject_blocked
+                    })
+                });
+                (!found).then(|| "This drive cannot be safely ejected".into())
+            }
+            PartitionTask::SmartReport
+            | PartitionTask::SmartShortTest
+            | PartitionTask::SmartExtendedTest => {
+                if !entry.device.is_disk() {
+                    Some("Select a whole disk".into())
+                } else if !partition::helper_available("smartctl") {
+                    Some("Install smartmontools to use SMART".into())
+                } else {
+                    None
+                }
+            }
+            PartitionTask::DriveSettings => {
+                if !entry.device.is_disk() {
+                    Some("Select a whole disk".into())
+                } else if entry.device.transport.as_deref() == Some("nvme") {
+                    Some("ATA drive settings are unavailable for this disk".into())
+                } else if !partition::helper_available("hdparm") {
+                    Some("Install hdparm to change drive settings".into())
+                } else {
+                    None
+                }
+            }
+            PartitionTask::Mount => {
+                if entry.device.filesystem.is_none()
+                    || entry.device.filesystem.as_deref() == Some("crypto_LUKS")
+                {
+                    Some("Select a filesystem".into())
+                } else if entry.device.is_mounted() {
+                    Some("Already mounted".into())
+                } else {
+                    None
+                }
+            }
+            PartitionTask::Unmount => {
+                if !entry.device.is_mounted() {
+                    Some("Not mounted".into())
+                } else {
+                    None
+                }
+            }
             PartitionTask::CreatePartition => {
                 if !entry.device.is_disk() {
                     Some("Select a whole disk".into())
@@ -3274,6 +3863,7 @@ impl App {
             PartitionTask::Delete
             | PartitionTask::Label
             | PartitionTask::Check
+            | PartitionTask::Repair
             | PartitionTask::Flag
             | PartitionTask::PartitionName
             | PartitionTask::PartitionType => {
@@ -3324,29 +3914,47 @@ impl App {
                     None
                 }
             }
-            PartitionTask::WipeHdd => {
-                if active {
-                    Some("The disk contains mounted storage".into())
-                } else if !partition::is_rotational_hdd(&entry.device) {
-                    Some("Available only for rotational HDDs".into())
-                } else {
-                    None
-                }
-            }
-            PartitionTask::EraseNvme => {
-                if active {
-                    Some("The disk contains mounted storage".into())
-                } else if entry.device.transport.as_deref() != Some("nvme") {
-                    Some("Available only for NVMe disks".into())
-                } else {
-                    None
-                }
+            PartitionTask::CreateImage => None,
+            PartitionTask::RestoreImage => {
+                active.then(|| "Unmount storage before restoring".into())
             }
         }
     }
 
     fn partition_task_input(&self, _view: &PartitionView, task: PartitionTask) -> (String, String) {
         match task {
+            PartitionTask::Mount
+            | PartitionTask::Unmount
+            | PartitionTask::EncryptionAccess
+            | PartitionTask::ChangePassphrase
+            | PartitionTask::Eject => (String::new(), String::new()),
+            PartitionTask::SmartReport
+            | PartitionTask::SmartShortTest
+            | PartitionTask::SmartExtendedTest => (String::new(), String::new()),
+            PartitionTask::DriveSettings => (
+                "write-cache on".into(),
+                "standby 0-255 · apm 1-255 · aam 128-254 · write-cache on/off".into(),
+            ),
+            PartitionTask::MountOptions => (
+                _view
+                    .entries
+                    .get(_view.selected)
+                    .and_then(|entry| entry.device.uuid.as_deref())
+                    .and_then(partition::current_mount_options)
+                    .map(|(mountpoint, options)| format!("{} {options}", mountpoint.display()))
+                    .unwrap_or_else(|| "/mnt/data defaults,nofail".into()),
+                "Absolute mount point, then comma-separated options".into(),
+            ),
+            PartitionTask::EncryptionOptions => (
+                _view
+                    .entries
+                    .get(_view.selected)
+                    .and_then(|entry| entry.device.uuid.as_deref())
+                    .and_then(partition::current_encryption_options)
+                    .map(|(name, options)| format!("{name} {options}"))
+                    .unwrap_or_else(|| "encrypted-volume nofail".into()),
+                "Mapping name, then comma-separated crypttab options".into(),
+            ),
             PartitionTask::CreatePartition => (
                 "max".into(),
                 "Size: max (recommended), a percentage, or a value such as 20GiB".into(),
@@ -3373,7 +3981,7 @@ impl App {
                 "gpt".into(),
                 "Partition table: gpt (recommended) or mbr".into(),
             ),
-            PartitionTask::Delete | PartitionTask::Check | PartitionTask::EraseNvme => {
+            PartitionTask::Delete | PartitionTask::Check | PartitionTask::Repair => {
                 (String::new(), String::new())
             }
             PartitionTask::Label => (
@@ -3418,10 +4026,21 @@ impl App {
                     .to_string(),
                 "New backup file path; existing files are never overwritten".into(),
             ),
-            PartitionTask::WipeHdd => (
-                "3".into(),
-                "Overwrite passes: 1, 3, or 7; a final zero pass is added".into(),
+            PartitionTask::CreateImage => (
+                self.current_dir
+                    .join(format!(
+                        "{}.img",
+                        _view
+                            .entries
+                            .get(_view.selected)
+                            .map(|entry| entry.device.name())
+                            .unwrap_or_else(|| "disk".into())
+                    ))
+                    .display()
+                    .to_string(),
+                "New image file".into(),
             ),
+            PartitionTask::RestoreImage => (String::new(), "Existing image file".into()),
         }
     }
 
@@ -3437,6 +4056,93 @@ impl App {
             .ok_or_else(|| "No device is selected".to_string())?;
         let target = DeviceIdentity::from_entry(entry).map_err(|error| error.to_string())?;
         match task {
+            PartitionTask::Mount => Ok(PartitionAction::Mount { target }),
+            PartitionTask::Unmount => Ok(PartitionAction::Unmount { target }),
+            PartitionTask::EncryptionAccess | PartitionTask::Eject => {
+                Err("This device action uses the safe device workflow".into())
+            }
+            PartitionTask::ChangePassphrase => {
+                Err("This action uses the protected passphrase form".into())
+            }
+            PartitionTask::MountOptions => {
+                let mut values = input.split_whitespace();
+                let mountpoint = values
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or("Enter a mount point")?;
+                let options = values.next().ok_or("Enter mount options")?.to_owned();
+                if values.next().is_some() {
+                    return Err("Enter a mount point and one options list".into());
+                }
+                let uuid = entry
+                    .device
+                    .uuid
+                    .clone()
+                    .ok_or("This filesystem has no UUID")?;
+                Ok(PartitionAction::SetMountOptions {
+                    target,
+                    uuid,
+                    mountpoint,
+                    options,
+                })
+            }
+            PartitionTask::EncryptionOptions => {
+                let mut values = input.split_whitespace();
+                let name = values.next().ok_or("Enter a mapping name")?.to_owned();
+                let options = values.next().ok_or("Enter encryption options")?.to_owned();
+                if values.next().is_some() {
+                    return Err("Enter a mapping name and one options list".into());
+                }
+                let uuid = entry
+                    .device
+                    .uuid
+                    .clone()
+                    .ok_or("This LUKS volume has no UUID")?;
+                Ok(PartitionAction::SetEncryptionOptions {
+                    target,
+                    uuid,
+                    name,
+                    options,
+                })
+            }
+            PartitionTask::SmartReport => Ok(PartitionAction::SmartReport { disk: target }),
+            PartitionTask::SmartShortTest => Ok(PartitionAction::SmartTest {
+                disk: target,
+                extended: false,
+            }),
+            PartitionTask::SmartExtendedTest => Ok(PartitionAction::SmartTest {
+                disk: target,
+                extended: true,
+            }),
+            PartitionTask::DriveSettings => {
+                let mut values = input.split_whitespace();
+                let name = values.next().unwrap_or_default();
+                let value = values.next().unwrap_or_default();
+                if values.next().is_some() {
+                    return Err("Enter one setting and one value".into());
+                }
+                let setting = match name {
+                    "standby" => partition::DriveSetting::Standby(
+                        value.parse().map_err(|_| "Standby must be 0-255")?,
+                    ),
+                    "apm" => partition::DriveSetting::PowerManagement(
+                        value.parse().map_err(|_| "APM must be 1-255")?,
+                    ),
+                    "aam" => partition::DriveSetting::AcousticManagement(
+                        value.parse().map_err(|_| "AAM must be 128-254")?,
+                    ),
+                    "write-cache" => partition::DriveSetting::WriteCache(match value {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err("Write cache must be on or off".into()),
+                    }),
+                    _ => return Err("Use standby, apm, aam, or write-cache".into()),
+                };
+                Ok(PartitionAction::DriveSetting {
+                    disk: target,
+                    setting,
+                })
+            }
             PartitionTask::CreatePartition => {
                 let (start_bytes, maximum_end) =
                     partition::largest_free_region(entry, &view.entries)
@@ -3491,6 +4197,7 @@ impl App {
                 Ok(PartitionAction::CreateTable {
                     disk: target,
                     table,
+                    overwrite: false,
                 })
             }
             PartitionTask::Delete => {
@@ -3527,6 +4234,18 @@ impl App {
                     return Err("Swap does not have a read-only filesystem check".into());
                 }
                 Ok(PartitionAction::CheckFilesystem { target, filesystem })
+            }
+            PartitionTask::Repair => {
+                let filesystem = entry
+                    .device
+                    .filesystem
+                    .as_deref()
+                    .and_then(Filesystem::parse)
+                    .ok_or_else(|| "This filesystem cannot be repaired".to_string())?;
+                if matches!(filesystem, Filesystem::Swap | Filesystem::None) {
+                    return Err("This filesystem cannot be repaired".into());
+                }
+                Ok(PartitionAction::RepairFilesystem { target, filesystem })
             }
             PartitionTask::Flag => {
                 let (disk, number) = self.partition_parent_context(view)?;
@@ -3572,30 +4291,15 @@ impl App {
                 disk: target,
                 destination: PathBuf::from(input.trim()),
             }),
-            PartitionTask::WipeHdd => Ok(PartitionAction::HddWipe {
-                disk: target,
-                passes: input
-                    .trim()
-                    .parse()
-                    .map_err(|_| "Overwrite passes must be 1, 3, or 7".to_string())?,
+            PartitionTask::CreateImage => Ok(PartitionAction::CreateImage {
+                target,
+                destination: PathBuf::from(input.trim()),
             }),
-            PartitionTask::EraseNvme => {
-                Err("Choose an NVMe erase method from the capability list".into())
-            }
+            PartitionTask::RestoreImage => Ok(PartitionAction::RestoreImage {
+                target,
+                source: PathBuf::from(input.trim()),
+            }),
         }
-    }
-
-    fn partition_nvme_action(
-        &self,
-        view: &PartitionView,
-        method: partition::NvmeEraseMethod,
-    ) -> std::result::Result<PartitionAction, String> {
-        let entry = view
-            .entries
-            .get(view.selected)
-            .ok_or_else(|| "No NVMe device is selected".to_string())?;
-        let disk = DeviceIdentity::from_entry(entry).map_err(|error| error.to_string())?;
-        Ok(PartitionAction::NvmeErase { disk, method })
     }
 
     fn partition_parent_context(
@@ -3701,6 +4405,39 @@ impl App {
             filesystem,
             label,
         })
+    }
+
+    fn partition_encryption_action(
+        &self,
+        view: &PartitionView,
+        filesystem: Filesystem,
+        whole_disk: bool,
+        label: Option<String>,
+        passphrase: SecretInput,
+    ) -> std::result::Result<PartitionAction, String> {
+        let entry = view
+            .entries
+            .get(view.selected)
+            .ok_or_else(|| "No device is selected".to_string())?;
+        let identity = DeviceIdentity::from_entry(entry).map_err(|error| error.to_string())?;
+        if whole_disk {
+            if !entry.device.is_disk() {
+                return Err("Select a whole disk for an encrypted disk layout".into());
+            }
+            Ok(PartitionAction::CreateEncryptedDisk {
+                disk: identity,
+                filesystem,
+                label,
+                passphrase,
+            })
+        } else {
+            Ok(PartitionAction::EncryptFormat {
+                target: identity,
+                filesystem,
+                label,
+                passphrase,
+            })
+        }
     }
 
     fn partition_create_action_for_region(
@@ -3812,6 +4549,7 @@ impl App {
         &self,
         view: &PartitionView,
         selected: usize,
+        overwrite: bool,
     ) -> std::result::Result<PartitionAction, String> {
         let entry = view
             .entries
@@ -3819,14 +4557,16 @@ impl App {
             .ok_or_else(|| "No disk is selected".to_string())?;
         let disk = DeviceIdentity::from_entry(entry).map_err(|error| error.to_string())?;
         match selected {
-            0 => Ok(PartitionAction::EraseDisk { disk }),
+            0 => Ok(PartitionAction::EraseDisk { disk, overwrite }),
             1 => Ok(PartitionAction::CreateTable {
                 disk,
                 table: PartitionTable::Gpt,
+                overwrite,
             }),
             2 => Ok(PartitionAction::CreateTable {
                 disk,
                 table: PartitionTable::Msdos,
+                overwrite,
             }),
             _ => Err("Choose Empty, GPT, or MBR".into()),
         }
@@ -4450,6 +5190,8 @@ impl App {
                 ("Unlocking and mounting volume", source.clone())
             }
             LuksAction::Mount { mapping } => ("Mounting volume", mapping.clone()),
+            LuksAction::MountFilesystem { source } => ("Mounting filesystem", source.clone()),
+            LuksAction::UnmountFilesystem { source } => ("Unmounting filesystem", source.clone()),
             LuksAction::UnmountAndLock { source, .. } => {
                 ("Unmounting and locking volume", source.clone())
             }
@@ -4604,6 +5346,7 @@ impl App {
         })
     }
 
+    #[allow(dead_code)]
     fn open_devices(&mut self) -> AppMode {
         if cfg!(test) {
             self.last_device_refresh = Instant::now();
@@ -4613,7 +5356,7 @@ impl App {
                     selected: 0,
                 }),
                 Err(error) => AppMode::Prompt(Prompt::Message {
-                    title: "Encrypted devices unavailable".into(),
+                    title: "Storage devices unavailable".into(),
                     body: error.to_string(),
                 }),
             };
@@ -4710,6 +5453,10 @@ impl App {
             selected: 0,
             overlay: None,
         })
+    }
+
+    fn reopen_partitions(&mut self) -> AppMode {
+        self.open_partitions(self.partition_return_to_apps)
     }
 
     pub fn partition_returns_to_apps(&self) -> bool {
@@ -5266,6 +6013,9 @@ mod tests {
                 system_protected: true,
                 ejectable: false,
                 eject_blocked: false,
+                kind: "part".into(),
+                filesystem: Some("crypto_LUKS".into()),
+                encrypted: true,
             }],
             selected: 0,
         });
@@ -5305,6 +6055,9 @@ mod tests {
                 system_protected: false,
                 ejectable: true,
                 eject_blocked: false,
+                kind: "part".into(),
+                filesystem: Some("crypto_LUKS".into()),
+                encrypted: true,
             }],
             selected: 0,
         });
@@ -5388,6 +6141,9 @@ mod tests {
                 system_protected: false,
                 ejectable: true,
                 eject_blocked: true,
+                kind: "part".into(),
+                filesystem: Some("crypto_LUKS".into()),
+                encrypted: true,
             }],
             selected: 0,
         });
@@ -6073,11 +6829,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_partition_hotkey_opens_the_partition_manager() {
+    fn one_device_hotkey_opens_the_unified_manager() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(temp.path());
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         assert!(matches!(app.mode, AppMode::Partitions(_)));
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -6104,11 +6860,11 @@ mod tests {
         assert!(matches!(app.mode, AppMode::Partitions(_)));
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 1 })));
+        assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 0 })));
     }
 
     #[test]
-    fn read_only_mode_keeps_device_manager_unavailable_from_apps() {
+    fn read_only_mode_opens_device_manager_for_safe_inspection() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = App::new(
             temp.path().to_path_buf(),
@@ -6122,10 +6878,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 0 })));
-        assert!(app
-            .visible_status()
-            .contains("device operations are disabled"));
+        assert!(matches!(app.mode, AppMode::Partitions(_)));
     }
 
     fn partition_test_view() -> PartitionView {
@@ -6148,16 +6901,17 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             app.mode,
             AppMode::Partitions(PartitionView {
-                overlay: Some(PartitionOverlay::FormatOptions { selected: 0 }),
+                overlay: Some(PartitionOverlay::FormatOptions { selected: 0, .. }),
                 ..
             })
         ));
 
-        for _ in 0..4 {
+        for _ in 0..7 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -6216,6 +6970,103 @@ mod tests {
     }
 
     #[test]
+    fn partition_format_flow_offers_luks2_and_confirms_the_passphrase_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        app.mode = AppMode::Partitions(partition_test_view());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            AppMode::Partitions(PartitionView {
+                overlay: Some(PartitionOverlay::FormatLabel {
+                    encrypted: true,
+                    ..
+                }),
+                ..
+            })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for character in "correct horse".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for character in "correct horse".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            app.mode,
+            AppMode::Partitions(PartitionView {
+                overlay: Some(PartitionOverlay::Confirm {
+                    action: PartitionAction::EncryptFormat {
+                        filesystem: Filesystem::Ext4,
+                        ..
+                    },
+                    yes_selected: false,
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn luks_passphrase_change_uses_three_masked_steps() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let fixture = "PATH=\"/dev/sdb1\" TYPE=\"part\" SIZE=\"104857600\" FSTYPE=\"crypto_LUKS\" UUID=\"luks-id\" MOUNTPOINTS=\"\" PKNAME=\"\" PARTN=\"1\" START=\"2048\" LOG-SEC=\"512\" RO=\"0\" RM=\"1\" MAJ:MIN=\"8:17\"\n";
+        let view = PartitionView {
+            entries: partition::from_lsblk_fixture(fixture, &[]).unwrap().entries,
+            selected: 0,
+            overlay: None,
+        };
+        app.mode = app.begin_partition_task(view, PartitionTask::ChangePassphrase);
+        for text in ["current key", "replacement key", "replacement key"] {
+            for character in text.chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        let AppMode::Partitions(PartitionView {
+            overlay: Some(PartitionOverlay::Confirm { action, .. }),
+            ..
+        }) = &app.mode
+        else {
+            panic!("expected passphrase-change confirmation");
+        };
+        assert!(matches!(
+            action,
+            PartitionAction::ChangeLuksPassphrase { .. }
+        ));
+        let rendered = format!("{action:?}");
+        assert!(!rendered.contains("current key"));
+        assert!(!rendered.contains("replacement key"));
+    }
+
+    #[test]
+    fn locked_luks_volume_offers_access_passphrase_and_encryption_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = test_app(temp.path());
+        let fixture = "PATH=\"/dev/sdb1\" TYPE=\"part\" SIZE=\"104857600\" FSTYPE=\"crypto_LUKS\" UUID=\"luks-id\" MOUNTPOINTS=\"\" PKNAME=\"\" PARTN=\"1\" START=\"2048\" LOG-SEC=\"512\" RO=\"0\" RM=\"1\" MAJ:MIN=\"8:17\"\n";
+        let view = PartitionView {
+            entries: partition::from_lsblk_fixture(fixture, &[]).unwrap().entries,
+            selected: 0,
+            overlay: None,
+        };
+        let tasks = app.partition_tasks_for_view(&view);
+        assert!(tasks.contains(&PartitionTask::EncryptionAccess));
+        assert!(tasks.contains(&PartitionTask::ChangePassphrase));
+        assert!(tasks.contains(&PartitionTask::EncryptionOptions));
+        assert!(!tasks.contains(&PartitionTask::MountOptions));
+    }
+
+    #[test]
     fn partition_tasks_are_context_sensitive_and_read_only_aware() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(temp.path());
@@ -6224,14 +7075,19 @@ mod tests {
         assert_eq!(
             partition_tasks,
             vec![
+                PartitionTask::Mount,
                 PartitionTask::Resize,
                 PartitionTask::Format,
                 PartitionTask::Delete,
                 PartitionTask::Label,
                 PartitionTask::Check,
+                PartitionTask::Repair,
+                PartitionTask::CreateImage,
+                PartitionTask::RestoreImage,
                 PartitionTask::PartitionName,
                 PartitionTask::PartitionType,
                 PartitionTask::Flag,
+                PartitionTask::MountOptions,
             ]
         );
         assert!(!partition_tasks.contains(&PartitionTask::CreateTable));
@@ -6249,13 +7105,19 @@ mod tests {
             disk_tasks,
             vec![
                 PartitionTask::CreatePartition,
-                PartitionTask::BackupTable,
                 PartitionTask::CreateTable,
+                PartitionTask::CreateImage,
+                PartitionTask::RestoreImage,
+                PartitionTask::SmartReport,
+                PartitionTask::SmartShortTest,
+                PartitionTask::SmartExtendedTest,
+                PartitionTask::DriveSettings,
+                PartitionTask::Eject,
             ]
         );
         assert_eq!(
             app.partition_task_name(&view, PartitionTask::CreateTable),
-            "Reset disk"
+            "Format disk"
         );
         assert!(app
             .partition_task_unavailable(&view, PartitionTask::CreatePartition)
@@ -6265,11 +7127,21 @@ mod tests {
         let blank_disk_tasks = app.partition_tasks_for_view(&view);
         assert_eq!(
             blank_disk_tasks,
-            vec![PartitionTask::CreateTable, PartitionTask::Format]
+            vec![
+                PartitionTask::CreateTable,
+                PartitionTask::Format,
+                PartitionTask::CreateImage,
+                PartitionTask::RestoreImage,
+                PartitionTask::SmartReport,
+                PartitionTask::SmartShortTest,
+                PartitionTask::SmartExtendedTest,
+                PartitionTask::DriveSettings,
+                PartitionTask::Eject
+            ]
         );
         assert_eq!(
             app.partition_task_name(&view, PartitionTask::CreateTable),
-            "Create partitions"
+            "Format disk"
         );
         assert_eq!(
             app.partition_task_name(&view, PartitionTask::Format),
@@ -6301,32 +7173,6 @@ mod tests {
     }
 
     #[test]
-    fn media_specific_erase_tasks_are_shown_only_for_matching_disks() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = test_app(temp.path());
-        let mut view = partition_test_view();
-        view.selected = 0;
-
-        view.entries[0].device.rotational = true;
-        view.entries[0].device.model = Some("Rotational Disk".into());
-        assert!(app
-            .partition_tasks_for_view(&view)
-            .contains(&PartitionTask::WipeHdd));
-        assert!(!app
-            .partition_tasks_for_view(&view)
-            .contains(&PartitionTask::EraseNvme));
-
-        view.entries[0].device.rotational = false;
-        view.entries[0].device.transport = Some("nvme".into());
-        assert!(!app
-            .partition_tasks_for_view(&view)
-            .contains(&PartitionTask::WipeHdd));
-        assert!(app
-            .partition_tasks_for_view(&view)
-            .contains(&PartitionTask::EraseNvme));
-    }
-
-    #[test]
     fn read_only_mode_still_allows_checks_and_table_backups() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(temp.path());
@@ -6351,14 +7197,14 @@ mod tests {
         let mut app = test_app(temp.path());
         let mut view = partition_test_view();
         view.selected = 0;
-        view.overlay = Some(PartitionOverlay::Actions { selected: 2 });
+        view.overlay = Some(PartitionOverlay::Actions { selected: 1 });
         app.mode = AppMode::Partitions(view);
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             app.mode,
             AppMode::Partitions(PartitionView {
-                overlay: Some(PartitionOverlay::DiskLayoutOptions { selected: 0 }),
+                overlay: Some(PartitionOverlay::DiskLayoutOptions { selected: 0, .. }),
                 ..
             })
         ));
@@ -6382,6 +7228,7 @@ mod tests {
                 ..view.clone()
             },
             1,
+            false,
         );
         let mbr = app.partition_disk_layout_action(
             &PartitionView {
@@ -6389,6 +7236,7 @@ mod tests {
                 ..view
             },
             2,
+            false,
         );
         assert!(matches!(
             gpt,
@@ -6578,12 +7426,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(temp.path());
         let view = partition_test_view();
-        let action = PartitionAction::NvmeErase {
-            disk: DeviceIdentity::from_entry(&view.entries[0]).unwrap(),
-            method: partition::NvmeEraseMethod::SanitizeBlockErase,
+        let action = PartitionAction::Format {
+            target: DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
+            filesystem: Filesystem::Ext4,
+            label: None,
         };
-        let message =
-            "This NVMe controller does not support NVMe Sanitize. No erase command was started.";
+        let message = "mkfs.ext4 failed because the device became unavailable";
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
             .send(PartitionUpdate::Finished(Err(
@@ -6601,8 +7449,8 @@ mod tests {
         assert!(matches!(
             app.mode,
             AppMode::Prompt(Prompt::PartitionError { ref body, .. })
-                if body.contains("Action: Erase NVMe")
-                    && body.contains("Device: /dev/sdb")
+                if body.contains("Format")
+                    && body.contains("/dev/sdb1")
                     && body.contains(message)
         ));
         assert_eq!(app.status, "Partition operation failed");
