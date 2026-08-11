@@ -1367,9 +1367,12 @@ fn draw_apps(frame: &mut Frame, app: &App, view: &AppsView) {
         .split(area);
     let rows = BuiltinApp::ALL.into_iter().map(|builtin| {
         let status = match builtin {
-            BuiltinApp::DeviceManager if app.config.behavior.read_only => {
-                "Unavailable in read-only mode"
+            BuiltinApp::DeviceManager
+                if app.config.behavior.read_only || !app.device_manager_available() =>
+            {
+                "Unavailable"
             }
+            BuiltinApp::NetworkShares if !app.network_shares_available() => "Unavailable",
             _ => "Available",
         };
         Row::new([builtin.name(), builtin.description(), status])

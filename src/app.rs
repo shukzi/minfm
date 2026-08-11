@@ -5437,7 +5437,7 @@ impl App {
         if !self.network_environment.samba_tools_available() {
             return AppMode::Prompt(Prompt::SmbMessage {
                 title: "Network shares unavailable".into(),
-                body: "Samba support requires gio and the GVFS Samba backend.".into(),
+                body: "Network Shares cannot start because gio or the GVFS Samba backend is unavailable. Install the required desktop integration, then try again.".into(),
                 return_to_network: false,
             });
         }
@@ -5511,6 +5511,12 @@ impl App {
     }
 
     fn open_partitions(&mut self, return_to_apps: bool) -> AppMode {
+        if !self.device_manager_available() {
+            return AppMode::Prompt(Prompt::Message {
+                title: "Device Manager unavailable".into(),
+                body: "Device discovery cannot start because the lsblk command is unavailable. Install util-linux, then try again.".into(),
+            });
+        }
         self.partition_return_to_apps = return_to_apps;
         self.start_partition_refresh(None);
         AppMode::Partitions(PartitionView {
@@ -5526,6 +5532,14 @@ impl App {
 
     pub fn partition_returns_to_apps(&self) -> bool {
         self.partition_return_to_apps
+    }
+
+    pub fn device_manager_available(&self) -> bool {
+        command_available("lsblk")
+    }
+
+    pub fn network_shares_available(&self) -> bool {
+        self.network_environment.samba_tools_available()
     }
 
     fn open_external(&mut self, editor: bool) -> AppMode {
@@ -5773,6 +5787,12 @@ fn is_virtual_search_path(path: &Path) -> bool {
         .iter()
         .map(Path::new)
         .any(|excluded| path == excluded || path.starts_with(excluded))
+}
+
+fn command_available(command: &str) -> bool {
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

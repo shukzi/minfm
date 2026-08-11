@@ -31,6 +31,35 @@ functionality.
 - **Updates:** Background startup checks with checksum-verified installation
 - **Configuration:** Invalid-configuration detection with safe-operation blocking
 
+## About the project
+
+minfm began with a simple goal: create a file manager that is simple, intuitive,
+and easy to configure, while keeping configuration optional.
+
+The file managers I tried handled browsing well, but left an important part of
+working with a Linux system outside the application. None offered the default,
+integrated way I wanted to mount drives or safely unlock encrypted volumes from
+the same terminal interface.
+
+minfm brings those needs together in one TUI without requiring Lua or plugins.
+If you feel something is missing or should be improved without overcomplicating
+the core functionality, open a pull request. minfm is designed to be
+approachable for everyday file work and configurable for people who want to tune
+their workflow.
+
+Terminal applications are complex enough on their own. A graphical application
+often adds a large dependency stack, background services, and another interface
+to learn and maintain, while a terminal application can remain comparatively
+lightweight. Together with other well-designed terminal tools, TUIs can cover
+an entire workflow without requiring a user to leave the terminal. minfm
+follows that principle by keeping common file and storage work close at hand
+without turning the core into a larger system than it needs to be.
+
+The device manager and network-share tools are optional. In most cases, their
+packages are already present, so the installer will not prompt you to install
+them. If you prefer a minimal file manager and those packages are not present,
+you can leave them out and continue using minfm for file management.
+
 ## Install
 
 Install the latest release:
@@ -49,6 +78,8 @@ To update an existing installation, run the same install command again or
 accept the update prompt that appears on startup when a newer version is
 available. The latest binary replaces only `~/.local/bin/minfm`; your
 configuration and trash remain in place.
+
+## Installation details
 
 The installer downloads the static Linux x86-64 binary and its SHA-256 checksum.
 It verifies the checksum before installing anything.
@@ -91,14 +122,8 @@ Only the Samba package names differ:
 - Debian and Ubuntu: `gvfs-backends`, `libsecret-tools`
 
 You may decline any package prompt and continue using the basic file manager.
-Features whose helpers are unavailable will explain what they need when opened.
-
-Open Device Manager through `M`, or directly with `m`. Actions are contextual:
-unsupported or unsafe choices remain visible with a short reason. Eject first
-unmounts filesystems and locks LUKS mappings belonging to that drive. Formatting
-offers Ext4, NTFS, and FAT first; XFS, swap, Btrfs, F2FS, exFAT, UDF, and no
-filesystem are under Other. Password protection is a LUKS2 toggle, independent
-of the filesystem choice.
+If an optional tool in `M` is unavailable, minfm explains what packages are
+required when you open it.
 
 ## Uninstall
 
