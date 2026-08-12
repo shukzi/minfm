@@ -1403,11 +1403,8 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     });
     let help = search_help_text(form);
     let help_inner_width = content_area.width.saturating_sub(2);
-    let wrapped_help_rows = if help_inner_width == 0 {
-        0
-    } else {
-        wrapped_line_count(help, usize::from(help_inner_width)).min(u16::MAX as usize) as u16
-    };
+    let wrapped_help = hard_wrap_text(help, usize::from(help_inner_width));
+    let wrapped_help_rows = wrapped_help.lines().count().min(u16::MAX as usize) as u16;
     let desired_help_height = wrapped_help_rows.saturating_add(2);
     let help_height = if content_area.width >= 3 && content_area.height >= 6 {
         desired_help_height.min(content_area.height.saturating_sub(1))
@@ -1425,10 +1422,11 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     } else {
         search_control_text(form, usize::from(control_area.width))
     };
+    let wrapped_controls = hard_wrap_text(&controls, usize::from(control_area.width));
     let rendered_through_active = if control_area.width == 0 {
         0
     } else {
-        wrapped_line_count(
+        hard_wrap_text(
             &controls
                 .lines()
                 .take(active_line.saturating_add(1))
@@ -1436,19 +1434,18 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
                 .join("\n"),
             usize::from(control_area.width),
         )
+        .lines()
+        .count()
     };
     let scroll = rendered_through_active.saturating_sub(usize::from(control_area.height));
     frame.render_widget(
-        Paragraph::new(controls)
-            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(wrapped_controls).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         control_area,
     );
     if help_height >= 3 {
         frame.render_widget(
-            Paragraph::new(help)
-                .block(Block::default().borders(Borders::ALL).title(" Help "))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(wrapped_help)
+                .block(Block::default().borders(Borders::ALL).title(" Help ")),
             content_rows[1],
         );
     }
@@ -1483,13 +1480,27 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     let _ = app;
 }
 
-fn wrapped_line_count(text: &str, width: usize) -> usize {
+fn hard_wrap_text(text: &str, width: usize) -> String {
     if width == 0 {
-        return 0;
+        return String::new();
     }
-    text.lines()
-        .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(width))
-        .sum()
+    let mut output = String::new();
+    for (line_index, line) in text.split('\n').enumerate() {
+        if line_index > 0 {
+            output.push('\n');
+        }
+        let mut line_width: usize = 0;
+        for grapheme in UnicodeSegmentation::graphemes(line, true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if line_width > 0 && line_width.saturating_add(grapheme_width) > width {
+                output.push('\n');
+                line_width = 0;
+            }
+            output.push_str(grapheme);
+            line_width = line_width.saturating_add(grapheme_width);
+        }
+    }
+    output
 }
 
 fn active_search_control_text(form: &SearchForm, width: usize) -> String {
@@ -4443,7 +4454,18 @@ mod performance_tests {
             terminal.draw(|frame| draw(frame, &app)).unwrap();
             let text = rendered_text(&terminal);
             assert!(text.contains("> Include"), "{width}x{height}: {text}");
-            assert!(text.contains("ignored/hidden"), "{width}x{height}: {text}");
+            if width == 40 {
+                assert!(
+                    text.contains("> Include ignore"),
+                    "{width}x{height}: {text}"
+                );
+                assert!(text.contains("d/hidden: No"), "{width}x{height}: {text}");
+            } else {
+                assert!(
+                    text.contains("ignored/hidden: No"),
+                    "{width}x{height}: {text}"
+                );
+            }
         }
     }
 
