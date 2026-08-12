@@ -227,9 +227,19 @@ pub struct SearchForm {
     pub section: SearchSection,
     #[allow(dead_code)] // Task 5 owns full field navigation.
     pub field: usize,
-    pub cursor: usize,
+    pub cursors: SearchCursors,
     pub error: Option<String>,
     pub return_to: SearchReturn,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchCursors {
+    pub name: usize,
+    pub content: usize,
+    pub minimum_size: usize,
+    pub maximum_size: usize,
+    pub modified_after: usize,
+    pub modified_before: usize,
 }
 
 impl SearchForm {
@@ -239,7 +249,7 @@ impl SearchForm {
             advanced: false,
             section: SearchSection::Match,
             field: 0,
-            cursor: 0,
+            cursors: SearchCursors::default(),
             error: None,
             return_to,
         }
@@ -251,33 +261,32 @@ impl SearchForm {
             advanced: true,
             section: SearchSection::Scope,
             field: 0,
-            cursor: 0,
+            cursors: SearchCursors::default(),
             error: None,
             return_to,
         }
     }
 
-    fn active_text(&self) -> Option<&str> {
-        match (self.section, self.field) {
-            (SearchSection::Match, 1) => Some(&self.draft.content),
-            (SearchSection::Filters, 5) => Some(&self.draft.minimum_size),
-            (SearchSection::Filters, 6) => Some(&self.draft.maximum_size),
-            (SearchSection::Filters, 7) => Some(&self.draft.modified_after),
-            (SearchSection::Filters, 8) => Some(&self.draft.modified_before),
-            _ => None,
-        }
-    }
-
     fn edit_active_text(&mut self, key: KeyEvent) -> bool {
-        let input = match (self.section, self.field) {
-            (SearchSection::Match, 1) => &mut self.draft.content,
-            (SearchSection::Filters, 5) => &mut self.draft.minimum_size,
-            (SearchSection::Filters, 6) => &mut self.draft.maximum_size,
-            (SearchSection::Filters, 7) => &mut self.draft.modified_after,
-            (SearchSection::Filters, 8) => &mut self.draft.modified_before,
+        let (input, cursor) = match (self.section, self.field) {
+            (SearchSection::Match, 1) => (&mut self.draft.content, &mut self.cursors.content),
+            (SearchSection::Filters, 5) => {
+                (&mut self.draft.minimum_size, &mut self.cursors.minimum_size)
+            }
+            (SearchSection::Filters, 6) => {
+                (&mut self.draft.maximum_size, &mut self.cursors.maximum_size)
+            }
+            (SearchSection::Filters, 7) => (
+                &mut self.draft.modified_after,
+                &mut self.cursors.modified_after,
+            ),
+            (SearchSection::Filters, 8) => (
+                &mut self.draft.modified_before,
+                &mut self.cursors.modified_before,
+            ),
             _ => return false,
         };
-        edit_cursor_input(input, &mut self.cursor, key);
+        edit_cursor_input(input, cursor, key);
         true
     }
 
@@ -288,6 +297,19 @@ impl SearchForm {
             key.code,
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
         ) {
+            return;
+        }
+        if key.code == KeyCode::Char(' ') {
+            if let (SearchSection::Filters, field @ 0..=4) = (self.section, self.field) {
+                let kind = [
+                    crate::entry::EntryKind::File,
+                    crate::entry::EntryKind::Directory,
+                    crate::entry::EntryKind::Symlink,
+                    crate::entry::EntryKind::BlockDevice,
+                    crate::entry::EntryKind::Other,
+                ][field];
+                self.draft.types.toggle(kind);
+            }
             return;
         }
         match (self.section, self.field) {
@@ -316,16 +338,6 @@ impl SearchForm {
                     ContentMode::Literal => ContentMode::Regex,
                     ContentMode::Regex => ContentMode::Literal,
                 };
-            }
-            (SearchSection::Filters, field @ 0..=4) if key.code == KeyCode::Char(' ') => {
-                let kind = match field {
-                    0 => crate::entry::EntryKind::File,
-                    1 => crate::entry::EntryKind::Directory,
-                    2 => crate::entry::EntryKind::Symlink,
-                    3 => crate::entry::EntryKind::BlockDevice,
-                    _ => crate::entry::EntryKind::Other,
-                };
-                self.draft.types.toggle(kind);
             }
             (SearchSection::Filters, 9) => {
                 self.draft.include_ignored_hidden = !self.draft.include_ignored_hidden;
@@ -2745,7 +2757,7 @@ impl App {
             return self.submit_search(form);
         }
         if !form.advanced {
-            edit_cursor_input(&mut form.draft.name, &mut form.cursor, key);
+            edit_cursor_input(&mut form.draft.name, &mut form.cursors.name, key);
             form.error = None;
             return AppMode::SearchForm(form);
         }
@@ -2753,8 +2765,6 @@ impl App {
         if matches!(key.code, KeyCode::Up | KeyCode::Down) {
             form.section = form.section.moved(key.code == KeyCode::Down);
             form.field = 0;
-            form.cursor = 0;
-            form.error = None;
             return AppMode::SearchForm(form);
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -2764,18 +2774,15 @@ impl App {
             } else {
                 (form.field + 1) % count
             };
-            form.cursor = form.active_text().map_or(0, |text| text.chars().count());
-            form.error = None;
             return AppMode::SearchForm(form);
         }
         if form.edit_active_text(key) {
             form.error = None;
             return AppMode::SearchForm(form);
         }
-        let entry_kind_toggle = form.section == SearchSection::Filters
-            && form.field <= 4
-            && key.code == KeyCode::Char(' ');
-        if !entry_kind_toggle
+        let space = key.code == KeyCode::Char(' ');
+        let entry_kind_toggle = form.section == SearchSection::Filters && form.field <= 4 && space;
+        if !space
             && matches!(
                 key.code,
                 KeyCode::Char(_)
@@ -2785,12 +2792,14 @@ impl App {
                     | KeyCode::End
             )
         {
-            edit_cursor_input(&mut form.draft.name, &mut form.cursor, key);
+            edit_cursor_input(&mut form.draft.name, &mut form.cursors.name, key);
             form.error = None;
             return AppMode::SearchForm(form);
         }
-        form.handle_choice_key(key);
-        form.error = None;
+        if entry_kind_toggle || matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            form.handle_choice_key(key);
+            form.error = None;
+        }
         AppMode::SearchForm(form)
     }
 
@@ -7302,6 +7311,83 @@ mod tests {
                 .cancel
                 .store(true, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn advanced_search_preserves_validation_error_while_navigating() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.minimum_size = "bad".into();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for code in [KeyCode::Down, KeyCode::Tab, KeyCode::Up] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        }
+    }
+
+    #[test]
+    fn advanced_search_text_fields_keep_independent_unicode_cursors() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.name = "a界b".into();
+            form.cursors.name = 2;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "xy".chars() {
+            app.handle_key(key(ch));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(key('界'));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(key('Z'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.name == "a界Zb" && form.draft.content == "x界y"
+                && form.cursors.name == 3 && form.cursors.content == 2));
+    }
+
+    #[test]
+    fn advanced_search_space_is_noop_for_non_type_choices() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        app.handle_key(key(' '));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.scope == SearchScope::Filesystem && form.draft.name.is_empty()));
+    }
+
+    #[test]
+    fn configured_filesystem_binding_expands_only_an_empty_quick_query() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.config =
+            toml::from_str::<crate::config::Config>("[hotkeys]\nsearch_filesystem = 'G'").unwrap();
+        app.handle_key(key('/'));
+        app.handle_key(key('G'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.advanced));
+        app.mode = AppMode::Browser;
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(key('G'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.name == "xG"));
+    }
+
+    #[test]
+    fn advanced_search_scope_cycles_from_exact_initial_scope() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.scope == SearchScope::Filesystem)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.scope == SearchScope::CurrentDirectory)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.scope == SearchScope::Filesystem)
+        );
     }
 
     #[test]
