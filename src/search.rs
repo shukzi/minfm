@@ -809,6 +809,7 @@ fn run_worker_body(
     });
     let mut builder = ignore::WalkBuilder::new(request.root());
     builder.follow_links(false);
+    builder.require_git(false);
     if request.scope() == SearchScope::CurrentDirectory {
         builder.max_depth(Some(1));
     }
@@ -1381,14 +1382,14 @@ impl SearchDraft {
         {
             return Err(SearchValidationError::Unconstrained);
         }
-        if !self.content.is_empty() && !rg_available {
-            return Err(SearchValidationError::RipgrepRequired);
-        }
         if !self.content.is_empty() && self.content_mode == ContentMode::Regex {
             Regex::new(&self.content).map_err(|error| SearchValidationError::InvalidPattern {
                 mode: "content regex",
                 message: error.to_string(),
             })?;
+        }
+        if !self.content.is_empty() && !rg_available {
+            return Err(SearchValidationError::RipgrepRequired);
         }
 
         let minimum =
@@ -1874,6 +1875,12 @@ mod tests {
             }
         }
 
+        fn matching_literal_content() -> Self {
+            Self::from_script(
+                "#!/bin/sh\npattern=\nafter=\nfor argument do\n  if [ \"$after\" = yes ]; then\n    if grep -IqF -- \"$pattern\" \"$argument\"; then printf '%s\\0' \"$argument\"; fi\n  elif [ \"$argument\" = -- ]; then\n    after=yes\n  elif [ -z \"$pattern\" ] && [ \"${argument#--}\" = \"$argument\" ]; then\n    pattern=$argument\n  fi\ndone\n",
+            )
+        }
+
         fn arguments(&self) -> Vec<OsString> {
             fs::read(&self.capture)
                 .unwrap()
@@ -2065,6 +2072,7 @@ mod tests {
 
     #[test]
     fn rg_unusual_paths_round_trip_and_binary_files_are_excluded() {
+        let fake = FakeRg::matching_literal_content();
         let temp = tempfile::tempdir().unwrap();
         let names = [
             OsString::from("with space"),
@@ -2085,12 +2093,9 @@ mod tests {
         let mut draft = SearchDraft::quick(temp.path().to_path_buf());
         draft.content = "needle".into();
 
-        let matches = run_rg_batch(
-            &draft.compile(true).unwrap(),
-            &paths,
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        let mut request = draft.compile(true).unwrap();
+        request.rg_program = Some(fake.command.program.clone());
+        let matches = run_rg_batch(&request, &paths, &AtomicBool::new(false)).unwrap();
 
         assert_eq!(matches.len(), 5);
         assert!(paths[..5].iter().all(|path| matches.contains(path)));
@@ -2417,6 +2422,7 @@ mod tests {
 
     #[test]
     fn content_search_emits_only_rg_verified_regular_files() {
+        let fake = FakeRg::matching_literal_content();
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("matching.txt"), "contains needle").unwrap();
         fs::write(temp.path().join("other.txt"), "nothing relevant").unwrap();
@@ -2426,7 +2432,9 @@ mod tests {
         draft.name = ".txt".into();
         draft.content = "needle".into();
 
-        let (hits, completion) = run_traversal(draft.compile(true).unwrap());
+        let mut request = draft.compile(true).unwrap();
+        request.rg_program = Some(fake.command.program.clone());
+        let (hits, completion) = run_traversal(request);
 
         assert_eq!(
             paths(temp.path(), &hits),
@@ -3128,6 +3136,7 @@ mod tests {
 
     #[test]
     fn content_requests_do_not_emit_unverified_filename_matches() {
+        let fake = FakeRg::matching_literal_content();
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("report.txt"), "not the requested content").unwrap();
         let mut draft =
@@ -3135,7 +3144,9 @@ mod tests {
         draft.name = "report".into();
         draft.content = "needle".into();
 
-        let (hits, completion) = run_traversal(draft.compile(true).unwrap());
+        let mut request = draft.compile(true).unwrap();
+        request.rg_program = Some(fake.command.program.clone());
+        let (hits, completion) = run_traversal(request);
 
         assert!(hits.is_empty());
         assert_eq!(completion, SearchCompletion::default());
