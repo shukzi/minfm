@@ -33,10 +33,11 @@ pub fn resolve_editor(configured: &str) -> String {
     }
 }
 
-pub fn launch(
+pub fn launch<E: Send + 'static>(
     program: String,
     path: PathBuf,
-    errors: SyncSender<LaunchError>,
+    errors: SyncSender<E>,
+    wrap_error: impl Fn(LaunchError) -> E + Send + 'static,
 ) -> Result<(), LaunchError> {
     if program.trim().is_empty() {
         return Err(LaunchError {
@@ -60,18 +61,18 @@ pub fn launch(
     thread::spawn(move || match child.wait() {
         Ok(status) if status.success() => {}
         Ok(status) => {
-            let _ = errors.try_send(LaunchError {
+            let _ = errors.try_send(wrap_error(LaunchError {
                 program,
                 path,
                 detail: format!("The application exited with {status}."),
-            });
+            }));
         }
         Err(error) => {
-            let _ = errors.try_send(LaunchError {
+            let _ = errors.try_send(wrap_error(LaunchError {
                 program,
                 path,
                 detail: format!("Could not monitor the application: {error}"),
-            });
+            }));
         }
     });
     Ok(())
@@ -133,14 +134,26 @@ mod tests {
     #[test]
     fn successful_direct_launch_is_silent() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        launch("/bin/true".into(), PathBuf::from("example.txt"), sender).unwrap();
+        launch(
+            "/bin/true".into(),
+            PathBuf::from("example.txt"),
+            sender,
+            |error| error,
+        )
+        .unwrap();
         assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
     #[test]
     fn failed_direct_launch_is_reported() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        launch("/bin/false".into(), PathBuf::from("example.txt"), sender).unwrap();
+        launch(
+            "/bin/false".into(),
+            PathBuf::from("example.txt"),
+            sender,
+            |error| error,
+        )
+        .unwrap();
         let error = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(error.program, "/bin/false");
         assert!(error.detail.contains("exited with"));
@@ -153,6 +166,7 @@ mod tests {
             "/minfm-test/missing-opener".into(),
             PathBuf::from("example.txt"),
             sender,
+            |error| error,
         )
         .unwrap_err();
         assert!(error.detail.contains("No such file") || error.detail.contains("not found"));

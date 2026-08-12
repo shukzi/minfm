@@ -216,6 +216,12 @@ pub enum ReturnDestination {
     SearchResults,
 }
 
+#[derive(Debug)]
+struct PendingLaunchError {
+    error: LaunchError,
+    return_to: ReturnDestination,
+}
+
 impl ReturnDestination {
     fn mode(self) -> AppMode {
         match self {
@@ -831,13 +837,13 @@ pub struct App {
     archive_operation: Option<RunningArchive>,
     operation_trash_manager: Option<TrashManager>,
     operation_return: ReturnDestination,
+    operation_search_paths: Vec<PathBuf>,
     archive_return: ReturnDestination,
     modal_return: ReturnDestination,
-    launch_return: ReturnDestination,
     luks_operation: Option<RunningLuks>,
-    launch_sender: SyncSender<LaunchError>,
-    launch_receiver: Receiver<LaunchError>,
-    pending_launch_errors: VecDeque<LaunchError>,
+    launch_sender: SyncSender<PendingLaunchError>,
+    launch_receiver: Receiver<PendingLaunchError>,
+    pending_launch_errors: VecDeque<PendingLaunchError>,
     pending_terminal_editor: Option<PendingTerminalEditor>,
     last_device_refresh: Instant,
     device_refresh: Option<RunningDeviceRefresh>,
@@ -906,9 +912,9 @@ impl App {
             archive_operation: None,
             operation_trash_manager: None,
             operation_return: ReturnDestination::Browser,
+            operation_search_paths: Vec::new(),
             archive_return: ReturnDestination::Browser,
             modal_return: ReturnDestination::Browser,
-            launch_return: ReturnDestination::Browser,
             luks_operation: None,
             launch_sender,
             launch_receiver,
@@ -1181,8 +1187,9 @@ impl App {
         self.operation = None;
         let return_to_trash = self.operation_trash_manager.take();
         self.refresh();
-        if self.operation_return == ReturnDestination::SearchResults {
+        if !self.operation_search_paths.is_empty() {
             self.refresh_search_results(None);
+            self.operation_search_paths.clear();
         }
         if summary.failed.is_empty() && summary.warnings.is_empty() && !summary.cancelled {
             self.set_notice(format!(
@@ -2025,6 +2032,46 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn revalidated_search_targets(&mut self) -> Vec<PathBuf> {
+        let snapshots = self
+            .search_results
+            .as_ref()
+            .map(|view| {
+                let targets = target_paths_from_hits(&view.results, view.selected);
+                targets
+                    .into_iter()
+                    .filter_map(|path| {
+                        view.results
+                            .iter()
+                            .find(|hit| hit.entry.path == path)
+                            .map(|hit| (path, hit.entry.kind))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut valid = Vec::new();
+        let mut missing = false;
+        let mut changed = false;
+        for (path, expected_kind) in snapshots {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if FileEntry::kind_from_metadata(&metadata) == expected_kind => {
+                    valid.push(path);
+                }
+                Ok(_) => changed = true,
+                Err(_) => missing = true,
+            }
+        }
+        if missing || changed {
+            self.refresh_search_results(None);
+            self.set_notice(if changed {
+                "One or more search results changed type and were skipped"
+            } else {
+                "Search result is no longer available"
+            });
+        }
+        valid
+    }
+
     fn revalidated_search_entry(&mut self) -> Option<FileEntry> {
         let snapshot = self.focused_search_entry()?.clone();
         let metadata = match fs::symlink_metadata(&snapshot.path) {
@@ -2044,6 +2091,18 @@ impl App {
         Some(entry)
     }
 
+    fn activate_search_entry(&mut self, editor: bool) -> AppMode {
+        let Some(entry) = self.revalidated_search_entry() else {
+            return AppMode::SearchResults;
+        };
+        if !editor && entry.kind == EntryKind::Directory {
+            self.open_search_result(&entry.path);
+            AppMode::Browser
+        } else {
+            self.open_external_entry(&entry, editor, ReturnDestination::SearchResults)
+        }
+    }
+
     pub fn poll_file_launch(&mut self) -> bool {
         while let Ok(error) = self.launch_receiver.try_recv() {
             self.pending_launch_errors.push_back(error);
@@ -2056,14 +2115,14 @@ impl App {
         let Some(config_error) = config_error else {
             return false;
         };
-        let Some(error) = self.pending_launch_errors.pop_front() else {
+        let Some(pending) = self.pending_launch_errors.pop_front() else {
             return false;
         };
         self.mode = AppMode::Prompt(Prompt::OpenError {
-            body: error.to_string(),
+            body: pending.error.to_string(),
             config_error,
         });
-        self.modal_return = self.launch_return;
+        self.modal_return = pending.return_to;
         true
     }
 
@@ -2977,15 +3036,7 @@ impl App {
             || key.code == KeyCode::Right
             || hotkeys.expand.matches(key)
         {
-            let entry = self.focused_search_entry().cloned();
-            match entry {
-                Some(entry) if entry.kind == EntryKind::Directory => {
-                    self.open_search_result(&entry.path);
-                    AppMode::Browser
-                }
-                Some(entry) => self.open_external_entry(&entry, false, return_to),
-                None => AppMode::SearchResults,
-            }
+            self.activate_search_entry(false)
         } else if hotkeys.select.matches(key) {
             if let Some(view) = &mut self.search_results {
                 if let Some(hit) = view.results.get_mut(view.selected) {
@@ -3028,12 +3079,14 @@ impl App {
         } else if hotkeys.archive.matches(key) {
             self.archive_return = return_to;
             self.modal_return = return_to;
-            self.prepare_archive_paths(self.search_target_paths())
+            let paths = self.revalidated_search_targets();
+            if paths.is_empty() {
+                AppMode::SearchResults
+            } else {
+                self.prepare_archive_paths(paths)
+            }
         } else if hotkeys.open.matches(key) || hotkeys.edit.matches(key) {
-            let Some(entry) = self.revalidated_search_entry() else {
-                return AppMode::SearchResults;
-            };
-            self.open_external_entry(&entry, hotkeys.edit.matches(key), return_to)
+            self.activate_search_entry(hotkeys.edit.matches(key))
         } else if hotkeys.info.matches(key) {
             self.modal_return = return_to;
             AppMode::Info(self.focused_search_entry().cloned())
@@ -5392,7 +5445,12 @@ impl App {
                     });
                     return AppMode::ConfigError { path, error };
                 }
-                match launcher::launch(program, path.clone(), self.launch_sender.clone()) {
+                match launcher::launch(program, path.clone(), self.launch_sender.clone(), |error| {
+                    PendingLaunchError {
+                        error,
+                        return_to: ReturnDestination::Browser,
+                    }
+                }) {
                     Ok(()) => AppMode::ConfigError { path, error },
                     Err(launch_error) => AppMode::Prompt(Prompt::OpenError {
                         body: launch_error.to_string(),
@@ -5917,6 +5975,20 @@ impl App {
         self.progress = ProgressState::default();
         self.progress.cancellable = true;
         self.operation_trash_manager = None;
+        self.operation_search_paths = if cut {
+            self.search_results
+                .as_ref()
+                .map(|view| {
+                    sources
+                        .iter()
+                        .filter(|source| view.results.iter().any(|hit| &hit.entry.path == *source))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.operation = Some(operation::spawn(OperationRequest::Copy {
             sources,
             destination: self.current_dir.clone(),
@@ -5939,6 +6011,17 @@ impl App {
         self.progress = ProgressState::default();
         self.progress.cancellable = true;
         self.operation_trash_manager = None;
+        self.operation_search_paths = self
+            .search_results
+            .as_ref()
+            .map(|view| {
+                paths
+                    .iter()
+                    .filter(|path| view.results.iter().any(|hit| &hit.entry.path == *path))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         self.operation = Some(operation::spawn(OperationRequest::Trash {
             paths,
             current_dir: self.current_dir.clone(),
@@ -6302,14 +6385,17 @@ impl App {
             });
             return return_to.mode();
         }
-        if let Err(error) = launcher::launch(program, path, self.launch_sender.clone()) {
+        if let Err(error) =
+            launcher::launch(program, path, self.launch_sender.clone(), move |error| {
+                PendingLaunchError { error, return_to }
+            })
+        {
             self.modal_return = return_to;
             return AppMode::Prompt(Prompt::OpenError {
                 body: error.to_string(),
                 config_error: None,
             });
         }
-        self.launch_return = return_to;
         return_to.mode()
     }
 }
@@ -6651,6 +6737,158 @@ mod tests {
     }
 
     #[test]
+    fn stale_result_activation_revalidates_before_using_snapshot_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let deleted_file = temp.path().join("deleted.txt");
+        let replaced_directory = temp.path().join("was-directory.txt");
+        std::fs::write(&deleted_file, b"").unwrap();
+        std::fs::create_dir(&replaced_directory).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(
+            &mut app,
+            &[deleted_file.clone(), replaced_directory.clone()],
+        );
+        std::fs::remove_file(&deleted_file).unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert_eq!(app.search_results.as_ref().unwrap().results.len(), 1);
+
+        std::fs::remove_dir(&replaced_directory).unwrap();
+        std::fs::write(&replaced_directory, b"now a file").unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert!(app.status.contains("changed type"));
+    }
+
+    #[test]
+    fn stale_archive_result_is_not_reinterpreted_as_a_creation_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("old.txt.zip");
+        std::fs::write(&archive, b"not needed").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&archive));
+        std::fs::remove_file(&archive).unwrap();
+
+        app.handle_key(key('z'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(app.status, "Search result is no longer available");
+    }
+
+    #[test]
+    fn archive_result_revalidation_skips_changed_type_but_keeps_valid_marked_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let changed = temp.path().join("changed.txt");
+        std::fs::write(&valid, b"valid").unwrap();
+        std::fs::write(&changed, b"old").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), changed.clone()]);
+        for hit in &mut app.search_results.as_mut().unwrap().results {
+            hit.entry.selected = true;
+        }
+        std::fs::remove_file(&changed).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+
+        app.handle_key(key('z'));
+
+        assert!(
+            matches!(app.mode, AppMode::Prompt(Prompt::ArchiveFormat { ref sources, .. }) if sources == &vec![valid])
+        );
+        assert_eq!(app.search_results.as_ref().unwrap().results.len(), 1);
+        assert!(app.status.contains("changed type"));
+    }
+
+    #[test]
+    fn archive_result_revalidation_does_not_follow_or_reclassify_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("linked.txt");
+        std::fs::write(&target, b"target").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&link));
+
+        app.handle_key(key('z'));
+
+        assert!(
+            matches!(app.mode, AppMode::Prompt(Prompt::ArchiveFormat { ref sources, .. }) if sources == &vec![link])
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_mark_and_moves_cursor_to_nearest_remaining_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ["one.txt", "two.txt", "three.txt"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"").unwrap();
+        }
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &paths);
+        {
+            let view = app.search_results.as_mut().unwrap();
+            view.selected = 1;
+            view.results[2].entry.selected = true;
+        }
+        std::fs::remove_file(&paths[1]).unwrap();
+
+        app.refresh_search_results(None);
+
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.selected, 1);
+        assert_eq!(view.results[1].entry.path, paths[2]);
+        assert!(view.results[1].entry.selected);
+    }
+
+    #[test]
+    fn cut_result_pasted_from_browser_refreshes_retained_results_after_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination");
+        std::fs::write(&source, b"move me").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&source));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.go_to(destination.clone());
+
+        app.handle_key(key('p'));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.operation.is_some() && Instant::now() < deadline {
+            if !app.poll_operation() {
+                thread::yield_now();
+            }
+        }
+
+        assert!(destination.join("source.txt").is_file());
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert!(matches!(app.mode, AppMode::Browser));
+    }
+
+    #[test]
+    fn read_only_result_mutations_stay_in_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, b"").unwrap();
+        let mut app = test_app(temp.path());
+        app.config.behavior.read_only = true;
+        install_search_results(&mut app, std::slice::from_ref(&source));
+
+        for key_code in ['x', 'c', 'd', 'D', 'z'] {
+            app.handle_key(key(key_code));
+            assert!(matches!(app.mode, AppMode::SearchResults));
+        }
+        assert!(source.exists());
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
     fn search_result_terminal_editor_and_launch_error_return_to_results() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("notes.txt");
@@ -6665,14 +6903,48 @@ mod tests {
         app.finish_terminal_editor(&action, Ok(()));
         assert!(matches!(app.mode, AppMode::SearchResults));
 
-        app.launch_return = ReturnDestination::SearchResults;
         app.launch_sender
-            .try_send(LaunchError {
-                program: "opener".into(),
-                path,
-                detail: "failed".into(),
+            .try_send(PendingLaunchError {
+                error: LaunchError {
+                    program: "opener".into(),
+                    path,
+                    detail: "failed".into(),
+                },
+                return_to: ReturnDestination::SearchResults,
             })
             .unwrap();
+        assert!(app.poll_file_launch());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+    }
+
+    #[test]
+    fn overlapping_launcher_errors_keep_their_individual_return_destinations() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        for (detail, return_to) in [
+            ("browser error", ReturnDestination::Browser),
+            ("results error", ReturnDestination::SearchResults),
+        ] {
+            app.launch_sender
+                .try_send(PendingLaunchError {
+                    error: LaunchError {
+                        program: "opener".into(),
+                        path: temp.path().join("file.txt"),
+                        detail: detail.into(),
+                    },
+                    return_to,
+                })
+                .unwrap();
+        }
+        app.mode = AppMode::SearchResults;
+
+        assert!(app.poll_file_launch());
+        assert!(
+            matches!(app.mode, AppMode::Prompt(Prompt::OpenError { ref body, .. }) if body.contains("browser error"))
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Browser));
         assert!(app.poll_file_launch());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.mode, AppMode::SearchResults));
@@ -6941,10 +7213,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(temp.path());
         app.launch_sender
-            .try_send(LaunchError {
-                program: "missing-opener".into(),
-                path: temp.path().join("example.txt"),
-                detail: "application not found".into(),
+            .try_send(PendingLaunchError {
+                error: LaunchError {
+                    program: "missing-opener".into(),
+                    path: temp.path().join("example.txt"),
+                    detail: "application not found".into(),
+                },
+                return_to: ReturnDestination::Browser,
             })
             .unwrap();
 
@@ -7100,10 +7375,13 @@ mod tests {
             false,
         );
         app.launch_sender
-            .try_send(LaunchError {
-                program: "missing-editor".into(),
-                path: path.clone(),
-                detail: "application not found".into(),
+            .try_send(PendingLaunchError {
+                error: LaunchError {
+                    program: "missing-editor".into(),
+                    path: path.clone(),
+                    detail: "application not found".into(),
+                },
+                return_to: ReturnDestination::Browser,
             })
             .unwrap();
 
