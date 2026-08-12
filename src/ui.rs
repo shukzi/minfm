@@ -1308,7 +1308,6 @@ fn draw_search_form(frame: &mut Frame, app: &App, form: &SearchForm) {
 fn draw_quick_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     let title = "Search";
     let area = centered(frame.area(), 72, 11);
-    draw_popup_halo(frame, area);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1344,7 +1343,6 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
         screen.width.saturating_sub(4).min(110),
         screen.height.saturating_sub(4).min(32),
     );
-    draw_popup_halo(frame, area);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3964,6 +3962,77 @@ mod performance_tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 
         assert!(rendered_text(&terminal).contains("enter a search or choose a filter"));
+    }
+
+    #[test]
+    fn search_dialogs_have_no_popup_halo() {
+        const SENTINEL: Color = Color::Rgb(0x12, 0x34, 0x56);
+        let temp = tempfile::tempdir().unwrap();
+        let app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let quick = SearchForm {
+            draft: crate::search::SearchDraft::quick(temp.path().to_path_buf()),
+            advanced: false,
+            section: crate::app::SearchSection::Match,
+            field: 0,
+            cursors: crate::app::SearchCursors::default(),
+            error: None,
+            return_to: crate::app::SearchReturn::Browser,
+        };
+        let advanced = SearchForm::advanced(
+            temp.path().to_path_buf(),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+
+        let mut quick_terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        quick_terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(SENTINEL)),
+                    frame.area(),
+                );
+                draw_quick_search(frame, &app, &quick);
+            })
+            .unwrap();
+        assert_eq!(quick_terminal.backend().buffer()[(23, 14)].bg, SENTINEL);
+        assert!(rendered_text(&quick_terminal).contains("Search"));
+        assert_eq!(quick_terminal.backend().buffer()[(24, 14)].symbol(), "┌");
+
+        let mut advanced_terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        advanced_terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(SENTINEL)),
+                    frame.area(),
+                );
+                draw_advanced_search(frame, &app, &advanced);
+            })
+            .unwrap();
+        assert_eq!(advanced_terminal.backend().buffer()[(4, 4)].bg, SENTINEL);
+        assert!(rendered_text(&advanced_terminal).contains("Advanced search"));
+        assert_eq!(advanced_terminal.backend().buffer()[(5, 4)].symbol(), "┌");
+
+        let mut popup_terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        popup_terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(SENTINEL)),
+                    frame.area(),
+                );
+                draw_format_options(frame, "/dev/test", 0, false);
+            })
+            .unwrap();
+        assert_eq!(
+            popup_terminal.backend().buffer()[(11, 11)].bg,
+            Color::Rgb(0x00, 0x00, 0x00)
+        );
     }
 
     #[test]
