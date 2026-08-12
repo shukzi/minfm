@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""Drive the release binary through a real PTY and assert search TUI behavior."""
+
 import codecs
 import os
 import pathlib
@@ -31,9 +34,11 @@ class Screen:
         self.width = width
         self.height = height
         self.lines = [[" "] * width for _ in range(height)]
+        self.backgrounds = [[None] * width for _ in range(height)]
         self.row = 0
         self.col = 0
         self.saved = (0, 0)
+        self.background = None
 
     def feed(self, text):
         text = OSC_RE.sub("", text)
@@ -61,6 +66,7 @@ class Screen:
             elif ch >= " ":
                 if 0 <= self.row < self.height and 0 <= self.col < self.width:
                     self.lines[self.row][self.col] = ch
+                    self.backgrounds[self.row][self.col] = self.background
                 self.col = min(self.width - 1, self.col + 1)
             i += 1
 
@@ -87,21 +93,48 @@ class Screen:
         elif final == "J":
             if not nums or nums[0] in (2, 3):
                 self.lines = [[" "] * self.width for _ in range(self.height)]
+                self.backgrounds = [[self.background] * self.width for _ in range(self.height)]
                 self.row = self.col = 0
         elif final == "K":
             mode = nums[0] if nums else 0
             if mode == 0:
-                for c in range(self.col, self.width): self.lines[self.row][c] = " "
+                for c in range(self.col, self.width):
+                    self.lines[self.row][c] = " "
+                    self.backgrounds[self.row][c] = self.background
             elif mode == 1:
-                for c in range(0, self.col + 1): self.lines[self.row][c] = " "
+                for c in range(0, self.col + 1):
+                    self.lines[self.row][c] = " "
+                    self.backgrounds[self.row][c] = self.background
             elif mode == 2:
                 self.lines[self.row] = [" "] * self.width
+                self.backgrounds[self.row] = [self.background] * self.width
+        elif final == "m":
+            values = nums or [0]
+            index = 0
+            while index < len(values):
+                value = values[index]
+                if value == 0 or value == 49:
+                    self.background = None
+                elif 40 <= value <= 47:
+                    self.background = ("ansi", value - 40)
+                elif 100 <= value <= 107:
+                    self.background = ("ansi", value - 100 + 8)
+                elif value == 48 and index + 2 < len(values) and values[index + 1] == 5:
+                    self.background = ("indexed", values[index + 2])
+                    index += 2
+                elif value == 48 and index + 4 < len(values) and values[index + 1] == 2:
+                    self.background = tuple(values[index + 2:index + 5])
+                    index += 4
+                index += 1
         elif final == "s": self.saved = (self.row, self.col)
         elif final == "u": self.row, self.col = self.saved
         # styles, modes, cursor visibility, and alternate-screen switches do not alter cells here
 
     def text(self):
         return "\n".join("".join(line).rstrip() for line in self.lines)
+
+    def cell(self, x, y):
+        return self.lines[y][x], self.backgrounds[y][x]
 
 
 class Session:
@@ -196,6 +229,36 @@ def fixture(name):
 
 RESULTS = "Search results"
 
+def centered_rect(screen_width, screen_height, width, height):
+    return ((screen_width - width) // 2, (screen_height - height) // 2, width, height)
+
+def surrounding_cells(screen, rect):
+    x, y, width, height = rect
+    coordinates = []
+    if y > 0:
+        coordinates.extend((column, y - 1) for column in range(x, x + width))
+    if y + height < screen.height:
+        coordinates.extend((column, y + height) for column in range(x, x + width))
+    if x > 0:
+        coordinates.extend((x - 1, row) for row in range(y, y + height))
+    if x + width < screen.width:
+        coordinates.extend((x + width, row) for row in range(y, y + height))
+    return {coordinate: screen.cell(*coordinate) for coordinate in coordinates}
+
+def assert_dialog_preserves_surroundings(session, before, dialog):
+    after = surrounding_cells(session.screen, dialog)
+    black = {("ansi", 0), ("indexed", 0), (0, 0, 0)}
+    painted_black = {
+        cell: (before[cell], after[cell])
+        for cell in before
+        if before[cell][1] != after[cell][1] and after[cell][1] in black
+    }
+    if painted_black:
+        session.dump()
+        raise AssertionError(
+            f"{session.name}: search dialog painted a black halo outside its rectangle: {painted_black}"
+        )
+
 def quick_and_fuzzy():
     root=fixture("quick")
     s=Session(root,name="quick")
@@ -225,6 +288,64 @@ def advanced_recursive_content_and_hidden():
         for _ in range(9): s.send(TAB, .03)
         s.send(RIGHT)  # include ignored/hidden yes
         s.send(ENTER,.8); s.wait_for(RESULTS); s.assert_has(".hidden-note.txt")
+    finally: s.close()
+
+def selector_help_size_units_and_dialog_appearance():
+    root=fixture("selector-help")
+    (root/"large.bin").write_bytes(b"x" * (24 * 1024))
+    s=Session(root,name="selector-help")
+    try:
+        quick_rect = centered_rect(s.width, s.height, 72, 11)
+        quick_surroundings = surrounding_cells(s.screen, quick_rect)
+        s.send("/"); s.wait_for("Search")
+        assert_dialog_preserves_surroundings(s, quick_surroundings, quick_rect)
+
+        advanced_rect = centered_rect(s.width, s.height, 110, 32)
+        advanced_surroundings = surrounding_cells(s.screen, advanced_rect)
+        s.send("F"); s.wait_for("Advanced search")
+        assert_dialog_preserves_surroundings(s, advanced_surroundings, advanced_rect)
+
+        lines = s.screen.text().splitlines()
+        scope_rows = {
+            label: next(index for index, line in enumerate(lines) if label in line)
+            for label in ("Current directory", "Recursive here", "Entire filesystem")
+        }
+        if len(set(scope_rows.values())) != 3:
+            raise AssertionError(f"scope choices share screen rows: {scope_rows}")
+
+        s.send(RIGHT, .4)
+        s.wait_for("[x] Recursive here")
+        s.assert_has("current directory and all subfolders")
+
+        scope_help = next(line for line in s.screen.text().splitlines() if "all subfolders" in line)
+        s.send(DOWN)
+        s.assert_has("Smart matching ranks exact matches first")
+        if scope_help in s.screen.text():
+            raise AssertionError("Match navigation retained the Scope help")
+
+        s.send(DOWN)
+        s.assert_has("Files includes regular files")
+        s.send(SPACE)
+        for _ in range(5): s.send(TAB, .03)
+        size_help = "".join(
+            re.sub(r"[^A-Za-z0-9., ]", "", line).strip()
+            for line in s.screen.text().splitlines()
+            if "minimum size is" in line or "Directories are excluded" in line
+        )
+        for text, pattern in (
+            ("inclusive", r"inclusive"),
+            ("KB", r"KB"),
+            ("GB", r"GB"),
+            ("GiB", r"GiB"),
+        ):
+            if not re.search(pattern, size_help):
+                s.dump()
+                raise AssertionError(f"minimum-size help omitted {text!r}")
+        s.send("20 KB")
+        s.send(ENTER,.8); s.wait_for(RESULTS)
+        s.assert_has("large.bin")
+        if "photo.bin" in s.screen.text():
+            raise AssertionError("20 KB minimum admitted the 3-byte fixture")
     finally: s.close()
 
 def type_size_filter():
@@ -354,7 +475,8 @@ def missing_rg_and_narrow():
     finally: s.close()
 
 
-tests=[quick_and_fuzzy, advanced_recursive_content_and_hidden, type_size_filter,
+tests=[quick_and_fuzzy, advanced_recursive_content_and_hidden,
+       selector_help_size_units_and_dialog_appearance, type_size_filter,
        glob_regex_validation_and_result_context,
        cancellation, copy_paste, rename_archive_trash_and_stale, missing_rg_and_narrow]
 passed=[]
@@ -365,5 +487,3 @@ try:
 except Exception:
     print(f"FAILED after={passed} root={BASE}", flush=True)
     raise
-#!/usr/bin/env python3
-"""Drive the release binary through a real PTY and assert search TUI behavior."""
