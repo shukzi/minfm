@@ -3099,13 +3099,21 @@ impl App {
                 input,
             })
         } else if hotkeys.trash.matches(key) {
-            let Some(paths) = self.mutation_targets_from(self.search_target_paths()) else {
+            let paths = self.revalidated_search_targets();
+            if paths.is_empty() {
+                return AppMode::SearchResults;
+            }
+            let Some(paths) = self.mutation_targets_from(paths) else {
                 return AppMode::SearchResults;
             };
             self.modal_return = return_to;
             AppMode::Prompt(Prompt::ConfirmTrash { paths })
         } else if hotkeys.quick_trash.matches(key) {
-            let Some(paths) = self.mutation_targets_from(self.search_target_paths()) else {
+            let paths = self.revalidated_search_targets();
+            if paths.is_empty() {
+                return AppMode::SearchResults;
+            }
+            let Some(paths) = self.mutation_targets_from(paths) else {
                 return AppMode::SearchResults;
             };
             self.operation_return = return_to;
@@ -6937,6 +6945,96 @@ mod tests {
         assert!(
             matches!(app.mode, AppMode::Prompt(Prompt::ArchiveFormat { ref sources, .. }) if sources == &vec![link])
         );
+    }
+
+    #[test]
+    fn missing_search_result_is_removed_before_trash_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.txt");
+        std::fs::write(&missing, b"stale").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&missing));
+        std::fs::remove_file(&missing).unwrap();
+
+        app.handle_key(key('d'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(app.status, "Search result is no longer available");
+    }
+
+    #[test]
+    fn file_replaced_by_directory_is_removed_before_trash_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let replaced = temp.path().join("replaced.txt");
+        std::fs::write(&replaced, b"file snapshot").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&replaced));
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::create_dir(&replaced).unwrap();
+
+        app.handle_key(key('d'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(replaced.is_dir());
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(
+            app.status,
+            "Search result changed type and is no longer available"
+        );
+    }
+
+    #[test]
+    fn directory_replaced_by_file_is_removed_before_quick_trash() {
+        let temp = tempfile::tempdir().unwrap();
+        let replaced = temp.path().join("replaced.txt");
+        std::fs::create_dir(&replaced).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&replaced));
+        std::fs::remove_dir(&replaced).unwrap();
+        std::fs::write(&replaced, b"replacement file").unwrap();
+
+        app.handle_key(key('D'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(replaced.is_file());
+        assert!(app.operation.is_none());
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(
+            app.status,
+            "Search result changed type and is no longer available"
+        );
+    }
+
+    #[test]
+    fn trash_confirmation_keeps_only_valid_marked_search_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let missing = temp.path().join("missing.txt");
+        let changed = temp.path().join("changed.txt");
+        std::fs::write(&valid, b"valid").unwrap();
+        std::fs::write(&missing, b"missing").unwrap();
+        std::fs::write(&changed, b"file snapshot").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), missing.clone(), changed.clone()]);
+        for hit in &mut app.search_results.as_mut().unwrap().results {
+            hit.entry.selected = true;
+        }
+        std::fs::remove_file(&missing).unwrap();
+        std::fs::remove_file(&changed).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+
+        app.handle_key(key('d'));
+
+        assert!(
+            matches!(&app.mode, AppMode::Prompt(Prompt::ConfirmTrash { paths }) if paths == &vec![valid.clone()])
+        );
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.results.len(), 1);
+        assert_eq!(view.results[0].entry.path, valid);
+        assert!(view.results[0].entry.selected);
+        assert!(changed.is_dir());
+        assert!(app.status.contains("changed type"));
     }
 
     #[test]
