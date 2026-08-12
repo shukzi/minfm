@@ -1253,9 +1253,16 @@ fn draw_progress_modal(frame: &mut Frame, app: &App) {
 fn draw_search_progress(frame: &mut Frame, app: &App) {
     let area = centered(frame.area(), 76, 12);
     frame.render_widget(Clear, area);
+    let scope = app.search_results.as_ref().map(|view| view.request.scope());
+    let scope_label = match scope {
+        Some(crate::search::SearchScope::CurrentDirectory) => "Current directory",
+        Some(crate::search::SearchScope::RecursiveHere) => "Recursive here",
+        Some(crate::search::SearchScope::Filesystem) => "Entire filesystem",
+        None => "Search",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Search entire filesystem ");
+        .title(format!(" {scope_label} search "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let root = app
@@ -1269,8 +1276,9 @@ fn draw_search_progress(frame: &mut Frame, app: &App) {
         "Searching…"
     };
     let body = format!(
-        "{}\nScope root: {}\n\nMatches: {}\nSkipped: {}\n\n{}",
+        "{}\nScope: {}\nRoot: {}\n\nMatches: {}\nSkipped: {}\n\n{}",
         message,
+        scope_label,
         root,
         app.search_matches,
         app.search_skipped,
@@ -1340,8 +1348,8 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(6),
+        Constraint::Length(if area.height < 16 { 1 } else { 3 }),
+        Constraint::Min(1),
         Constraint::Length(if form.error.is_some() { 2 } else { 1 }),
         Constraint::Length(1),
     ])
@@ -1349,11 +1357,7 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     frame.render_widget(
         Paragraph::new(format!(
             "Query  {}",
-            if form.draft.name.is_empty() {
-                "<name or pattern>"
-            } else {
-                &form.draft.name
-            }
+            cursor_text(&form.draft.name, form.cursors.name, "<name or pattern>")
         ))
         .block(Block::default().borders(Borders::BOTTOM)),
         rows[0],
@@ -1384,12 +1388,21 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
         Paragraph::new(navigation).block(Block::default().borders(Borders::RIGHT)),
         columns[0],
     );
+    let control_area = columns[1].inner(Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
+    let (controls, active_line) = if area.height < 16 {
+        (active_search_control_text(form), 0)
+    } else {
+        search_section_text(form)
+    };
+    let scroll = active_line.saturating_sub(usize::from(control_area.height).saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(search_section_text(form)).wrap(Wrap { trim: false }),
-        columns[1].inner(Margin {
-            horizontal: 2,
-            vertical: 0,
-        }),
+        Paragraph::new(controls)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false }),
+        control_area,
     );
     if let Some(error) = &form.error {
         frame.render_widget(
@@ -1422,33 +1435,131 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     let _ = app;
 }
 
-fn search_section_text(form: &SearchForm) -> String {
+fn active_search_control_text(form: &SearchForm) -> String {
     use crate::search::{ContentMode, NameMode, ResultLimit, SearchScope};
+    match (form.section, form.field) {
+        (crate::app::SearchSection::Scope, _) => format!(
+            "> Scope: {}",
+            match form.draft.scope {
+                SearchScope::CurrentDirectory => "Current directory",
+                SearchScope::RecursiveHere => "Recursive here",
+                SearchScope::Filesystem => "Entire filesystem",
+            }
+        ),
+        (crate::app::SearchSection::Match, 0) => format!(
+            "> Name mode: {}",
+            match form.draft.name_mode {
+                NameMode::Smart => "Smart",
+                NameMode::Glob => "Glob",
+                NameMode::Regex => "Regex",
+            }
+        ),
+        (crate::app::SearchSection::Match, 1) => format!(
+            "> Content: {}",
+            cursor_text(&form.draft.content, form.cursors.content, "<optional>")
+        ),
+        (crate::app::SearchSection::Match, _) => format!(
+            "> Content mode: {}",
+            match form.draft.content_mode {
+                ContentMode::Literal => "Literal",
+                ContentMode::Regex => "Regex",
+            }
+        ),
+        (crate::app::SearchSection::Filters, 0) => format!(
+            "> {} Files",
+            selected(form.draft.types.contains(EntryKind::File))
+        ),
+        (crate::app::SearchSection::Filters, 1) => format!(
+            "> {} Directories",
+            selected(form.draft.types.contains(EntryKind::Directory))
+        ),
+        (crate::app::SearchSection::Filters, 2) => format!(
+            "> {} Symlinks",
+            selected(form.draft.types.contains(EntryKind::Symlink))
+        ),
+        (crate::app::SearchSection::Filters, 3) => format!(
+            "> {} Block devices",
+            selected(form.draft.types.contains(EntryKind::BlockDevice))
+        ),
+        (crate::app::SearchSection::Filters, 4) => format!(
+            "> {} Other",
+            selected(form.draft.types.contains(EntryKind::Other))
+        ),
+        (crate::app::SearchSection::Filters, 5) => format!(
+            "> Minimum size: {}",
+            cursor_text(&form.draft.minimum_size, form.cursors.minimum_size, "—")
+        ),
+        (crate::app::SearchSection::Filters, 6) => format!(
+            "> Maximum size: {}",
+            cursor_text(&form.draft.maximum_size, form.cursors.maximum_size, "—")
+        ),
+        (crate::app::SearchSection::Filters, 7) => format!(
+            "> Modified after: {}",
+            cursor_text(&form.draft.modified_after, form.cursors.modified_after, "—")
+        ),
+        (crate::app::SearchSection::Filters, 8) => format!(
+            "> Modified before: {}",
+            cursor_text(
+                &form.draft.modified_before,
+                form.cursors.modified_before,
+                "—"
+            )
+        ),
+        (crate::app::SearchSection::Filters, _) => format!(
+            "> Include ignored/hidden: {}",
+            if form.draft.include_ignored_hidden {
+                "Yes"
+            } else {
+                "No"
+            }
+        ),
+        (crate::app::SearchSection::Traversal, _) => format!(
+            "> Result limit: {}",
+            match form.draft.result_limit {
+                ResultLimit::OneThousand => "1,000",
+                ResultLimit::FiveThousand => "5,000",
+                ResultLimit::TenThousand => "10,000",
+            }
+        ),
+    }
+}
+
+fn search_section_text(form: &SearchForm) -> (String, usize) {
+    use crate::search::{ContentMode, NameMode, ResultLimit, SearchScope};
+    let mark = |field: usize| if form.field == field { ">" } else { " " };
     match form.section {
-        crate::app::SearchSection::Scope => format!(
-            "Scope\n\n{} Current directory\n{} Recursive here\n{} Entire filesystem\n\nRoot: {}",
+        crate::app::SearchSection::Scope => (format!(
+            "Scope\n{} Scope: {} Current directory / {} Recursive here / {} Entire filesystem\nRoot: {}",
+            mark(0),
             selected(form.draft.scope == SearchScope::CurrentDirectory),
             selected(form.draft.scope == SearchScope::RecursiveHere),
             selected(form.draft.scope == SearchScope::Filesystem),
             form.draft.root.display()
-        ),
-        crate::app::SearchSection::Match => format!(
-            "Match\n\nName mode: {}\nContent: {}\nContent mode: {}",
+        ), 1),
+        crate::app::SearchSection::Match => (format!(
+            "Match\n{} Name mode: {}\n{} Content: {}\n{} Content mode: {}",
+            mark(0),
             match form.draft.name_mode { NameMode::Smart => "Smart", NameMode::Glob => "Glob", NameMode::Regex => "Regex" },
-            empty_hint(&form.draft.content, "<optional content>"),
+            mark(1), cursor_text(&form.draft.content, form.cursors.content, "<optional content>"),
+            mark(2),
             match form.draft.content_mode { ContentMode::Literal => "Literal", ContentMode::Regex => "Regex" },
-        ),
-        crate::app::SearchSection::Filters => format!(
-            "Filters\n\n{} Files   {} Directories   {} Symlinks\n{} Block devices   {} Other\n\nMinimum size: {}\nMaximum size: {}\nModified after: {}\nModified before: {}\nInclude ignored/hidden: {}",
-            selected(form.draft.types.contains(EntryKind::File)), selected(form.draft.types.contains(EntryKind::Directory)), selected(form.draft.types.contains(EntryKind::Symlink)),
-            selected(form.draft.types.contains(EntryKind::BlockDevice)), selected(form.draft.types.contains(EntryKind::Other)),
-            empty_hint(&form.draft.minimum_size, "—"), empty_hint(&form.draft.maximum_size, "—"), empty_hint(&form.draft.modified_after, "—"), empty_hint(&form.draft.modified_before, "—"),
+        ), form.field + 1),
+        crate::app::SearchSection::Filters => (format!(
+            "Filters\n{} {} Files\n{} {} Directories\n{} {} Symlinks\n{} {} Block devices\n{} {} Other\n{} Minimum size: {}\n{} Maximum size: {}\n{} Modified after: {}\n{} Modified before: {}\n{} Include ignored/hidden: {}",
+            mark(0), selected(form.draft.types.contains(EntryKind::File)), mark(1), selected(form.draft.types.contains(EntryKind::Directory)), mark(2), selected(form.draft.types.contains(EntryKind::Symlink)),
+            mark(3), selected(form.draft.types.contains(EntryKind::BlockDevice)), mark(4), selected(form.draft.types.contains(EntryKind::Other)),
+            mark(5), cursor_text(&form.draft.minimum_size, form.cursors.minimum_size, "—"),
+            mark(6), cursor_text(&form.draft.maximum_size, form.cursors.maximum_size, "—"),
+            mark(7), cursor_text(&form.draft.modified_after, form.cursors.modified_after, "—"),
+            mark(8), cursor_text(&form.draft.modified_before, form.cursors.modified_before, "—"),
+            mark(9),
             if form.draft.include_ignored_hidden { "Yes" } else { "No" }
-        ),
-        crate::app::SearchSection::Traversal => format!(
-            "Traversal\n\nResult limit: {}",
+        ), form.field + 1),
+        crate::app::SearchSection::Traversal => (format!(
+            "Traversal\n{} Result limit: {}",
+            mark(0),
             match form.draft.result_limit { ResultLimit::OneThousand => "1,000", ResultLimit::FiveThousand => "5,000", ResultLimit::TenThousand => "10,000" }
-        ),
+        ), 1),
     }
 }
 
@@ -1459,12 +1570,15 @@ fn selected(value: bool) -> &'static str {
         "[ ]"
     }
 }
-fn empty_hint<'a>(value: &'a str, hint: &'a str) -> &'a str {
+fn cursor_text(value: &str, cursor: usize, hint: &str) -> String {
     if value.is_empty() {
-        hint
-    } else {
-        value
+        return format!("│{hint}");
     }
+    let index = value
+        .char_indices()
+        .nth(cursor)
+        .map_or(value.len(), |(index, _)| index);
+    format!("{}│{}", &value[..index], &value[index..])
 }
 
 fn draw_update_progress(frame: &mut Frame) {
@@ -1569,7 +1683,8 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
     frame.render_stateful_widget(table, area, &mut state);
     let footer = if view.truncated {
         format!(
-            "10,000 result limit reached · ↑/↓ {}/{} Move · Enter open · Esc return",
+            "{} result limit reached · ↑/↓ {}/{} Move · Enter open · Esc return",
+            format_count(view.request.result_limit().get()),
             app.config.hotkeys.down.display(),
             app.config.hotkeys.up.display()
         )
@@ -1591,7 +1706,7 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
     };
     let footer_area = Rect {
         x: area.x + 1,
-        y: area.bottom().saturating_sub(2),
+        y: area.bottom().saturating_sub(3),
         width: area.width.saturating_sub(2),
         height: 1,
     };
@@ -1601,6 +1716,18 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
             .style(Style::default().fg(MUTED)),
         footer_area,
     );
+}
+
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(character);
+    }
+    output
 }
 
 fn draw_archive(frame: &mut Frame, app: &App, view: &ArchiveView) {
@@ -3445,7 +3572,7 @@ mod performance_tests {
             advanced: false,
             section: crate::app::SearchSection::Match,
             field: 0,
-            cursor: 0,
+            cursors: crate::app::SearchCursors::default(),
             error: Some("enter a search or choose a filter".into()),
             return_to: crate::app::SearchReturn::Browser,
         });
@@ -3516,6 +3643,117 @@ mod performance_tests {
             "Esc cancel",
         ] {
             assert!(text.contains(label), "missing {label}");
+        }
+    }
+
+    #[test]
+    fn search_advanced_last_field_is_marked_and_scrolled_at_all_supported_sizes() {
+        for (width, height) in [(80, 24), (100, 30), (140, 40), (40, 12)] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = App::new(
+                temp.path().to_path_buf(),
+                ConfigLoad::Valid {
+                    config: Config::default(),
+                    path: temp.path().join("config.toml"),
+                },
+                false,
+            );
+            let mut form = SearchForm::advanced(
+                temp.path().to_path_buf(),
+                crate::search::SearchScope::CurrentDirectory,
+                crate::app::SearchReturn::Browser,
+            );
+            form.section = crate::app::SearchSection::Filters;
+            form.field = 9;
+            app.mode = AppMode::SearchForm(form);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let text = rendered_text(&terminal);
+            assert!(text.contains("> Include"), "{width}x{height}: {text}");
+            assert!(text.contains("ignored/hidden"), "{width}x{height}: {text}");
+        }
+    }
+
+    #[test]
+    fn search_progress_labels_each_scope_and_root_truthfully() {
+        for (scope, label) in [
+            (
+                crate::search::SearchScope::CurrentDirectory,
+                "Current directory",
+            ),
+            (crate::search::SearchScope::RecursiveHere, "Recursive here"),
+            (crate::search::SearchScope::Filesystem, "Entire filesystem"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = App::new(
+                temp.path().to_path_buf(),
+                ConfigLoad::Valid {
+                    config: Config::default(),
+                    path: temp.path().join("config.toml"),
+                },
+                false,
+            );
+            let mut draft = crate::search::SearchDraft::advanced(temp.path().to_path_buf(), scope);
+            draft.name = "needle".into();
+            app.search_results = Some(crate::app::SearchView {
+                request: draft.compile(true).unwrap(),
+                results: Vec::new(),
+                selected: 0,
+                selected_path: None,
+                skipped: 0,
+                truncated: false,
+                incomplete: false,
+            });
+            app.mode = AppMode::SearchProgress;
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let text = rendered_text(&terminal);
+            assert!(text.contains(label));
+            assert!(text.contains(&temp.path().display().to_string()));
+        }
+    }
+
+    #[test]
+    fn search_results_footer_uses_exact_truncated_limit_preset() {
+        for (limit, label) in [
+            (
+                crate::search::ResultLimit::OneThousand,
+                "1,000 result limit reached",
+            ),
+            (
+                crate::search::ResultLimit::FiveThousand,
+                "5,000 result limit reached",
+            ),
+            (
+                crate::search::ResultLimit::TenThousand,
+                "10,000 result limit reached",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = App::new(
+                temp.path().to_path_buf(),
+                ConfigLoad::Valid {
+                    config: Config::default(),
+                    path: temp.path().join("config.toml"),
+                },
+                false,
+            );
+            let mut draft = crate::search::SearchDraft::quick(temp.path().to_path_buf());
+            draft.name = "needle".into();
+            draft.result_limit = limit;
+            app.search_results = Some(crate::app::SearchView {
+                request: draft.compile(true).unwrap(),
+                results: Vec::new(),
+                selected: 0,
+                selected_path: None,
+                skipped: 0,
+                truncated: true,
+                incomplete: false,
+            });
+            app.mode = AppMode::SearchResults;
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            assert!(rendered_text(&terminal).contains(label));
         }
     }
 
