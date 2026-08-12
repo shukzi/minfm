@@ -1631,6 +1631,17 @@ mod tests {
     }
 
     #[test]
+    fn streaming_sample_first_result_and_completion_share_origin() {
+        let fixture = create_benchmark_fixture();
+        let mut draft =
+            SearchDraft::advanced(fixture.path().to_path_buf(), SearchScope::RecursiveHere);
+        draft.content = "needle".into();
+        let sample = streaming_content_sample(draft.compile(true).unwrap(), RG_BATCH_MAX_PATHS);
+        assert!(sample.timing.first_us <= sample.timing.wall_us);
+        assert!(sample.timing.first_us > 0);
+    }
+
+    #[test]
     fn refresh_hits_updates_metadata_rename_marks_and_removes_stale_kinds() {
         let temp = tempfile::tempdir().unwrap();
         let retained = temp.path().join("retained.txt");
@@ -3064,9 +3075,13 @@ mod tests {
             Some(Arc::clone(&metrics)),
         );
         let mut retained_results = 0;
+        let mut first_result_us = None;
         loop {
             match running.receiver.recv().unwrap() {
-                SearchUpdate::Match(_) => retained_results += 1,
+                SearchUpdate::Match(_) => {
+                    first_result_us.get_or_insert_with(|| started.elapsed().as_micros());
+                    retained_results += 1;
+                }
                 SearchUpdate::Skipped(_) => {}
                 SearchUpdate::Finished(completion) => {
                     assert_eq!(completion, SearchCompletion::default());
@@ -3080,7 +3095,7 @@ mod tests {
             timing: BenchmarkSample {
                 wall_us: started.elapsed().as_micros(),
                 cpu_us: process_cpu_us().saturating_sub(cpu_started),
-                first_us: metrics.first_match_us.expect("fixture must match"),
+                first_us: first_result_us.expect("fixture must deliver a match"),
             },
             candidates_examined: metrics.candidates_examined,
             candidates_passed: metrics.candidates_passed_metadata,
@@ -3120,31 +3135,45 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn direct_child_pids() -> Vec<String> {
-        fs::read_to_string("/proc/self/task/1/children")
-            .or_else(|_| {
-                fs::read_to_string(format!("/proc/self/task/{}/children", std::process::id()))
+        fs::read_dir("/proc/self/task")
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
+            .flat_map(|children| {
+                children
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
             .collect()
     }
 
-    fn real_rg_cancellation_sample(request: CompiledSearch) -> u128 {
+    fn real_rg_cancellation_sample(request: CompiledSearch) -> Option<u128> {
         let metrics = Arc::new(std::sync::Mutex::new(SearchMetrics::default()));
         let running =
             spawn_with_options(request, RunOptions::default(), Some(Arc::clone(&metrics)));
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while metrics.lock().unwrap().rg_subprocesses == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "real rg did not launch"
-            );
+        let observation_deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let observed_children = loop {
+            #[cfg(target_os = "linux")]
+            {
+                let children = direct_child_pids();
+                if !children.is_empty() {
+                    break children;
+                }
+            }
+            match running.receiver.try_recv() {
+                Ok(SearchUpdate::Finished(_)) | Err(TryRecvError::Disconnected) => return None,
+                Ok(SearchUpdate::Failed(message)) => panic!("real rg failed: {message}"),
+                Ok(SearchUpdate::Match(_) | SearchUpdate::Skipped(_))
+                | Err(TryRecvError::Empty) => {}
+            }
+            if std::time::Instant::now() >= observation_deadline {
+                running.cancel.store(true, AtomicOrdering::Relaxed);
+                return None;
+            }
             thread::yield_now();
-        }
-        thread::park_timeout(Duration::from_millis(2));
-        #[cfg(target_os = "linux")]
-        let observed_children = direct_child_pids();
+        };
         let started = std::time::Instant::now();
         running.cancel.store(true, AtomicOrdering::Relaxed);
         let completion = loop {
@@ -3161,18 +3190,17 @@ mod tests {
         assert!(completion.cancelled);
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_secs(2));
-        #[cfg(target_os = "linux")]
         for pid in observed_children {
             assert!(
                 !Path::new("/proc").join(pid).exists(),
                 "real rg child remains"
             );
         }
-        elapsed.as_micros()
+        Some(elapsed.as_micros())
     }
 
     /// Manual baseline (2026-08-12, release build, nine warm-cache runs):
-    /// first result 1,074 us; completion 1,082 us on the 256-file fixture.
+    /// first result 1,075 us; completion 1,086 us on the 256-file fixture.
     /// Compare trends, not absolute timings, across machines and filesystems.
     #[test]
     #[ignore]
@@ -3192,8 +3220,8 @@ mod tests {
     }
 
     /// Manual baseline (2026-08-12, release, nine runs): filtered batch 128
-    /// completed end-to-end in 11,593 us with 128 candidates/one subprocess;
-    /// unpruned batch 128 took 22,149 us with 256 candidates/two subprocesses.
+    /// completed end-to-end in 11,621 us with 128 candidates/one subprocess;
+    /// unpruned batch 128 took 22,129 us with 256 candidates/two subprocesses.
     /// Executes every required bounded batch size on the identical fixture;
     /// each of nine rounds rotates the eight mode/batch cases to avoid a fixed
     /// warm-cache ordering advantage.
@@ -3321,8 +3349,15 @@ mod tests {
         real_cancel_draft.content = "needle-not-present".into();
         let real_cancel_request = real_cancel_draft.compile(true).unwrap();
         let mut real_cancel_samples = Vec::with_capacity(BENCHMARK_RUNS);
-        for _ in 0..BENCHMARK_RUNS {
-            real_cancel_samples.push(real_rg_cancellation_sample(real_cancel_request.clone()));
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while real_cancel_samples.len() < BENCHMARK_RUNS {
+            assert!(
+                std::time::Instant::now() < retry_deadline,
+                "could not observe live real rg child for cancellation sample"
+            );
+            if let Some(sample) = real_rg_cancellation_sample(real_cancel_request.clone()) {
+                real_cancel_samples.push(sample);
+            }
         }
         eprintln!(
             "PERF search_cancel_real_rg batch_size=128 cancel_to_finished_us={} fixture_bytes={} child_cleanup=verified_where_observable",
