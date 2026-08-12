@@ -57,7 +57,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::NetworkProgress => draw_network_progress(frame),
         AppMode::Partitions(view) => draw_partitions(frame, app, view),
         AppMode::Help => draw_help(frame, app),
-        AppMode::Info => draw_info(frame, app),
+        AppMode::Info(entry) => draw_info(frame, app, entry.as_ref()),
         AppMode::ConfigError { path, error } => draw_config_error(frame, app, path, error),
     }
 
@@ -3123,12 +3123,23 @@ fn draw_help(frame: &mut Frame, app: &App) {
     message_modal(frame, &title, &body, "Esc/Enter close", 70, 94);
 }
 
-fn draw_info(frame: &mut Frame, app: &App) {
+fn draw_info(frame: &mut Frame, app: &App, entry: Option<&crate::entry::FileEntry>) {
     let binary = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
+    let focused = entry.map_or_else(String::new, |entry| {
+        format!(
+            "Selected item:\nPath: {}\nKind: {:?}\nSize: {}\nPermissions: {}\nModified: {}\n\n",
+            entry.path.display(),
+            entry.kind,
+            entry.size_text(),
+            entry.permissions(),
+            entry.modified_text()
+        )
+    });
     let body = format!(
-        "minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}\n  smartctl: {}\n  hdparm: {}\n  gio: {}\n  secret-tool: {}\n  parted: {}\n  wipefs: {}\n  sfdisk: {}\n  sudo: {}",
+        "{}minfm {}\n\nBinary:\n{}\n\nConfig:\n{}\n\nCurrent directory:\n{}\n\nMode: {}\nView: {}\nSort: {} {}\n\nSystem tools:\n  lsblk: {}\n  udisksctl: {}\n  cryptsetup: {}\n  smartctl: {}\n  hdparm: {}\n  gio: {}\n  secret-tool: {}\n  parted: {}\n  wipefs: {}\n  sfdisk: {}\n  sudo: {}",
+        focused,
         env!("CARGO_PKG_VERSION"),
         binary,
         app.config_path.display(),
