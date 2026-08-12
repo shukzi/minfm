@@ -2942,6 +2942,17 @@ impl App {
             };
             return AppMode::SearchForm(form);
         }
+        if form.section == SearchSection::Filters
+            && form.field <= 4
+            && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            form.field = if key.code == KeyCode::Left {
+                (form.field + 4) % 5
+            } else {
+                (form.field + 1) % 5
+            };
+            return AppMode::SearchForm(form);
+        }
         if let Some(changed) = form.edit_active_text(key) {
             if changed {
                 form.error = None;
@@ -8058,6 +8069,39 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert!(matches!(app.mode, AppMode::SearchForm(ref form)
             if form.draft.result_limit == crate::search::ResultLimit::TenThousand));
+    }
+
+    #[test]
+    fn advanced_search_type_arrows_wrap_without_toggling() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.error = Some("keep this validation error".into());
+        }
+
+        let initial_types = match &app.mode {
+            AppMode::SearchForm(form) => form.draft.types,
+            _ => panic!("advanced search form was not open"),
+        };
+        for expected_field in [1, 2, 3, 4, 0] {
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            assert!(matches!(&app.mode, AppMode::SearchForm(form)
+                if form.field == expected_field
+                    && form.draft.types == initial_types
+                    && form.error.as_deref() == Some("keep this validation error")));
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(&app.mode, AppMode::SearchForm(form)
+            if form.field == 4
+                && form.draft.types == initial_types
+                && form.error.as_deref() == Some("keep this validation error")));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(&app.mode, AppMode::SearchForm(form)
+            if form.field == 4 && form.draft.types == crate::search::EntryKinds::OTHER));
     }
 
     #[test]
