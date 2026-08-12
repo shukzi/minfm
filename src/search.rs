@@ -6,6 +6,7 @@ use std::{
     fmt, fs,
     io::Read,
     os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -27,11 +28,74 @@ use crate::entry::{EntryKind, FileEntry};
 const UPDATE_QUEUE_CAPACITY: usize = 256;
 const RG_BATCH_MAX_PATHS: usize = 128;
 const RG_BATCH_MAX_ARG_BYTES: usize = 256 * 1024;
+const RG_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const UPDATES_PER_UI_TICK: usize = 512;
 
 #[derive(Debug)]
 struct RgBatch {
     paths: Vec<PathBuf>,
+    arg_bytes: usize,
+    budget: RgArgBudget,
+}
+
+impl RgBatch {
+    fn new(budget: RgArgBudget) -> Self {
+        Self {
+            paths: Vec::new(),
+            arg_bytes: budget.fixed_bytes,
+            budget,
+        }
+    }
+
+    fn try_push(&mut self, path: PathBuf) -> bool {
+        if self.paths.len() == RG_BATCH_MAX_PATHS || !self.budget.can_add(self.arg_bytes, &path) {
+            return false;
+        }
+        self.arg_bytes += encoded_arg_bytes(path.as_os_str());
+        self.paths.push(path);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.paths.clear();
+        self.arg_bytes = self.budget.fixed_bytes;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RgArgBudget {
+    fixed_bytes: usize,
+}
+
+impl RgArgBudget {
+    fn new(request: &CompiledSearch, command: &RgCommand) -> Result<Self, RgError> {
+        let mut fixed_bytes = encoded_arg_bytes(command.program.as_os_str());
+        if request.content_mode() == ContentMode::Literal {
+            fixed_bytes += encoded_arg_bytes(OsStr::new("--fixed-strings"));
+        }
+        for argument in ["--null", "--files-with-matches", "--no-messages"] {
+            fixed_bytes += encoded_arg_bytes(OsStr::new(argument));
+        }
+        fixed_bytes += encoded_arg_bytes(OsStr::new(request.content()));
+        fixed_bytes += encoded_arg_bytes(OsStr::new("--"));
+        if fixed_bytes > RG_BATCH_MAX_ARG_BYTES {
+            return Err(RgError::Failed(format!(
+                "ripgrep arguments exceed the {} byte argument limit",
+                RG_BATCH_MAX_ARG_BYTES
+            )));
+        }
+        Ok(Self { fixed_bytes })
+    }
+
+    fn can_add(self, current_bytes: usize, path: &Path) -> bool {
+        current_bytes
+            .checked_add(encoded_arg_bytes(path.as_os_str()))
+            .is_some_and(|bytes| bytes <= RG_BATCH_MAX_ARG_BYTES)
+    }
+}
+
+fn encoded_arg_bytes(argument: &OsStr) -> usize {
+    argument.as_bytes().len().saturating_add(1)
 }
 
 #[derive(Debug)]
@@ -52,12 +116,16 @@ impl fmt::Display for RgError {
 #[derive(Debug, Clone)]
 struct RgCommand {
     program: PathBuf,
+    #[cfg(test)]
+    inject_supervision_error: bool,
 }
 
 impl Default for RgCommand {
     fn default() -> Self {
         Self {
             program: PathBuf::from("rg"),
+            #[cfg(test)]
+            inject_supervision_error: false,
         }
     }
 }
@@ -76,17 +144,25 @@ fn run_rg_batch(
     paths: &[PathBuf],
     cancel: &AtomicBool,
 ) -> Result<HashSet<PathBuf>, RgError> {
-    #[cfg(test)]
-    let command = request
+    let command = rg_command(request);
+    run_rg_batch_with_command(request, paths, cancel, &command)
+}
+
+#[cfg(test)]
+fn rg_command(request: &CompiledSearch) -> RgCommand {
+    request
         .rg_program
         .as_ref()
         .map(|program| RgCommand {
             program: program.clone(),
+            inject_supervision_error: false,
         })
-        .unwrap_or_default();
-    #[cfg(not(test))]
-    let command = RgCommand::default();
-    run_rg_batch_with_command(request, paths, cancel, &command)
+        .unwrap_or_default()
+}
+
+#[cfg(not(test))]
+fn rg_command(_request: &CompiledSearch) -> RgCommand {
+    RgCommand::default()
 }
 
 fn run_rg_batch_with_command(
@@ -98,6 +174,18 @@ fn run_rg_batch_with_command(
     if cancel.load(AtomicOrdering::Relaxed) {
         return Err(RgError::Cancelled);
     }
+    let budget = RgArgBudget::new(request, command)?;
+    let total_bytes = paths.iter().try_fold(budget.fixed_bytes, |bytes, path| {
+        bytes.checked_add(encoded_arg_bytes(path.as_os_str()))
+    });
+    if paths.len() > RG_BATCH_MAX_PATHS
+        || total_bytes.is_none_or(|bytes| bytes > RG_BATCH_MAX_ARG_BYTES)
+    {
+        return Err(RgError::Failed(format!(
+            "ripgrep batch exceeds the {} byte argument limit",
+            RG_BATCH_MAX_ARG_BYTES
+        )));
+    }
     let mut process = Command::new(&command.program);
     if request.content_mode() == ContentMode::Literal {
         process.arg("--fixed-strings");
@@ -108,48 +196,61 @@ fn run_rg_batch_with_command(
         .arg("--")
         .args(paths.iter().map(|path| path.as_os_str()))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = process
         .spawn()
         .map_err(|error| RgError::Failed(error.to_string()))?;
     let stdout = child.stdout.take().expect("piped ripgrep stdout");
     let stderr = child.stderr.take().expect("piped ripgrep stderr");
 
-    let (status, stdout, stderr, cancelled) = thread::scope(|scope| {
-        let stdout_reader = scope.spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stdout.take(u64::MAX).read_to_end(&mut bytes);
-            bytes
-        });
-        let stderr_reader = scope.spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.take(u64::MAX).read_to_end(&mut bytes);
-            bytes
-        });
-        let mut cancelled = false;
-        let status = loop {
-            if cancel.load(AtomicOrdering::Relaxed) {
-                cancelled = true;
-                let _ = child.kill();
-                break child.wait();
+    let stdout_reader = thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+    #[cfg(test)]
+    let mut supervision_polls = 0_usize;
+    let status = loop {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            cleanup_rg_process_group(&mut child).map_err(|error| {
+                RgError::Failed(format!("ripgrep cancellation cleanup failed: {error}"))
+            })?;
+            join_reader(stdout_reader, "stdout")?;
+            join_reader(stderr_reader, "stderr")?;
+            return Err(RgError::Cancelled);
+        }
+        #[cfg(test)]
+        if command.inject_supervision_error && supervision_polls == 10 {
+            cleanup_rg_process_group(&mut child).map_err(|error| {
+                RgError::Failed(format!("ripgrep supervision cleanup failed: {error}"))
+            })?;
+            join_reader(stdout_reader, "stdout")?;
+            join_reader(stderr_reader, "stderr")?;
+            return Err(RgError::Failed("injected supervision failure".into()));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                #[cfg(test)]
+                {
+                    supervision_polls += 1;
+                }
+                thread::park_timeout(Duration::from_millis(10));
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => thread::park_timeout(Duration::from_millis(10)),
-                Err(error) => break Err(error),
+            Err(error) => {
+                cleanup_rg_process_group(&mut child).map_err(|cleanup| {
+                    RgError::Failed(format!(
+                        "ripgrep supervision failed: {error}; cleanup failed: {cleanup}"
+                    ))
+                })?;
+                join_reader(stdout_reader, "stdout")?;
+                join_reader(stderr_reader, "stderr")?;
+                return Err(RgError::Failed(format!(
+                    "ripgrep supervision failed: {error}"
+                )));
             }
-        };
-        (
-            status,
-            stdout_reader.join().unwrap_or_default(),
-            stderr_reader.join().unwrap_or_default(),
-            cancelled,
-        )
-    });
-    if cancelled {
-        return Err(RgError::Cancelled);
-    }
-    let status = status.map_err(|error| RgError::Failed(error.to_string()))?;
+        }
+    };
+    let stdout = join_reader(stdout_reader, "stdout")?;
+    let stderr = join_reader(stderr_reader, "stderr")?;
     match status.code() {
         Some(0) => {
             let candidates: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
@@ -164,6 +265,51 @@ fn run_rg_batch_with_command(
         _ => Err(RgError::Failed(
             String::from_utf8_lossy(&stderr).into_owned(),
         )),
+    }
+}
+
+fn read_pipe(mut pipe: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = pipe.read_to_end(&mut bytes);
+    bytes
+}
+
+fn join_reader(reader: thread::JoinHandle<Vec<u8>>, stream: &str) -> Result<Vec<u8>, RgError> {
+    reader
+        .join()
+        .map_err(|_| RgError::Failed(format!("ripgrep {stream} reader panicked")))
+}
+
+fn cleanup_rg_process_group(child: &mut std::process::Child) -> Result<(), String> {
+    let pid = rustix::process::Pid::from_raw(child.id() as i32)
+        .ok_or_else(|| "invalid child process id".to_owned())?;
+    let signal_error = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
+        .err()
+        .map(|error| error.to_string());
+    if signal_error.is_some() {
+        let _ = child.kill();
+    }
+    let deadline = std::time::Instant::now() + RG_CLEANUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return signal_error.map_or(Ok(()), |error| {
+                    Err(format!("could not signal ripgrep process group: {error}"))
+                });
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::park_timeout(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                return Err(signal_error.unwrap_or_else(|| {
+                    format!(
+                        "child did not exit within {} ms",
+                        RG_CLEANUP_TIMEOUT.as_millis()
+                    )
+                }));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 
@@ -285,9 +431,19 @@ fn run(
     let mut skipped = 0_usize;
     let mut matches = 0_usize;
     let mut truncated = false;
-    let mut rg_batch = RgBatch { paths: Vec::new() };
+    let rg_budget = match RgArgBudget::new(&request, &rg_command(&request)) {
+        Ok(budget) => budget,
+        Err(error) => {
+            let _ = control_sender.send(SearchUpdate::Failed(error.to_string()));
+            let _ = control_sender.send(SearchUpdate::Finished(SearchCompletion {
+                incomplete: true,
+                ..SearchCompletion::default()
+            }));
+            return;
+        }
+    };
+    let mut rg_batch = RgBatch::new(rg_budget);
     let mut rg_hits = Vec::new();
-    let mut rg_arg_bytes = 0_usize;
     let mut rg_error = None;
     for item in builder.build() {
         if cancel.load(AtomicOrdering::Relaxed) {
@@ -343,11 +499,14 @@ fn run(
             if kind != EntryKind::File {
                 continue;
             }
-            let path_bytes = entry.path.as_os_str().as_bytes().len();
-            if !rg_batch.paths.is_empty()
-                && (rg_batch.paths.len() == RG_BATCH_MAX_PATHS
-                    || rg_arg_bytes.saturating_add(path_bytes) > RG_BATCH_MAX_ARG_BYTES)
-            {
+            if !rg_batch.try_push(entry.path.clone()) {
+                if rg_batch.paths.is_empty() {
+                    rg_error = Some(RgError::Failed(format!(
+                        "path exceeds the {} byte ripgrep argument limit",
+                        RG_BATCH_MAX_ARG_BYTES
+                    )));
+                    break;
+                }
                 match emit_rg_batch(
                     &request,
                     &mut rg_batch,
@@ -357,7 +516,6 @@ fn run(
                     &mut matches,
                 ) {
                     Ok(limit_reached) => {
-                        rg_arg_bytes = 0;
                         if limit_reached {
                             truncated = true;
                             break;
@@ -368,9 +526,14 @@ fn run(
                         break;
                     }
                 }
+                if !rg_batch.try_push(entry.path.clone()) {
+                    rg_error = Some(RgError::Failed(format!(
+                        "path exceeds the {} byte ripgrep argument limit",
+                        RG_BATCH_MAX_ARG_BYTES
+                    )));
+                    break;
+                }
             }
-            rg_arg_bytes = rg_arg_bytes.saturating_add(path_bytes);
-            rg_batch.paths.push(entry.path.clone());
             rg_hits.push(SearchHit { entry, rank });
             continue;
         }
@@ -431,7 +594,7 @@ fn emit_rg_batch(
     emitted: &mut usize,
 ) -> Result<bool, RgError> {
     let verified = run_rg_batch(request, &batch.paths, cancel)?;
-    batch.paths.clear();
+    batch.clear();
     for hit in hits.drain(..) {
         if !verified.contains(&hit.entry.path) {
             continue;
@@ -1043,7 +1206,10 @@ mod tests {
             fs::set_permissions(&program, permissions).unwrap();
             Self {
                 _temp: temp,
-                command: RgCommand { program },
+                command: RgCommand {
+                    program,
+                    inject_supervision_error: false,
+                },
                 capture,
             }
         }
@@ -1062,7 +1228,10 @@ mod tests {
             fs::set_permissions(&program, permissions).unwrap();
             Self {
                 _temp: temp,
-                command: RgCommand { program },
+                command: RgCommand {
+                    program,
+                    inject_supervision_error: false,
+                },
                 capture,
             }
         }
@@ -1074,6 +1243,30 @@ mod tests {
                 .filter(|argument| !argument.is_empty())
                 .map(|argument| OsString::from_vec(argument.to_vec()))
                 .collect()
+        }
+    }
+
+    fn wait_for_pids(capture: &Path, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rg did not record PIDs"
+            );
+            if let Ok(contents) = fs::read_to_string(capture) {
+                let pids: Vec<_> = contents.lines().map(str::to_owned).collect();
+                if pids.len() == count {
+                    return pids;
+                }
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn assert_processes_gone(pids: &[String]) {
+        #[cfg(target_os = "linux")]
+        for pid in pids {
+            assert!(!Path::new("/proc").join(pid).exists(), "PID {pid} remains");
         }
     }
 
@@ -1288,6 +1481,119 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         #[cfg(target_os = "linux")]
         assert!(!Path::new("/proc").join(pid).exists());
+    }
+
+    #[test]
+    fn rg_cancellation_kills_descendants_that_inherit_pipes() {
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\necho $$ > '$CAPTURE'\nsleep 60 &\necho $! >> '$CAPTURE'\nwait\n",
+        );
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let command = fake.command.clone();
+        let started = std::time::Instant::now();
+        let worker = thread::spawn(move || {
+            run_rg_batch_with_command(
+                &request,
+                &[PathBuf::from("/tmp/candidate")],
+                &worker_cancel,
+                &command,
+            )
+        });
+        let pids = wait_for_pids(&fake.capture, 2);
+        cancel.store(true, AtomicOrdering::Relaxed);
+
+        assert!(matches!(worker.join().unwrap(), Err(RgError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_processes_gone(&pids);
+    }
+
+    #[test]
+    fn rg_supervision_error_cleans_up_the_process_group() {
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\necho $$ > '$CAPTURE'\nsleep 60 &\necho $! >> '$CAPTURE'\nwait\n",
+        );
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let mut command = fake.command.clone();
+        command.inject_supervision_error = true;
+        let started = std::time::Instant::now();
+        let worker = thread::spawn(move || {
+            run_rg_batch_with_command(
+                &request,
+                &[PathBuf::from("/tmp/candidate")],
+                &AtomicBool::new(false),
+                &command,
+            )
+        });
+        let pids = wait_for_pids(&fake.capture, 2);
+        let result = worker.join().unwrap();
+
+        assert!(matches!(result, Err(RgError::Failed(message)) if message.contains("supervision")));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_processes_gone(&pids);
+    }
+
+    #[test]
+    fn rg_argument_budget_accepts_exact_limit_and_rejects_one_byte_more() {
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let command = RgCommand::default();
+        let budget = RgArgBudget::new(&request, &command).unwrap();
+        let exact = PathBuf::from(OsString::from_vec(vec![
+            b'x';
+            RG_BATCH_MAX_ARG_BYTES
+                - budget.fixed_bytes
+                - 1
+        ]));
+        let too_large = PathBuf::from(OsString::from_vec(vec![
+            b'x';
+            RG_BATCH_MAX_ARG_BYTES
+                - budget.fixed_bytes
+        ]));
+
+        assert!(budget.can_add(budget.fixed_bytes, &exact));
+        assert!(!budget.can_add(budget.fixed_bytes, &too_large));
+    }
+
+    #[test]
+    fn rg_argument_budget_rejects_oversized_pattern_before_spawn() {
+        let fake = FakeRg::capturing_arguments();
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "x".repeat(RG_BATCH_MAX_ARG_BYTES);
+        let request = draft.compile(true).unwrap();
+
+        let result = run_rg_batch_with_command(
+            &request,
+            &[PathBuf::from("/tmp/candidate")],
+            &AtomicBool::new(false),
+            &fake.command,
+        );
+
+        assert!(
+            matches!(result, Err(RgError::Failed(message)) if message.contains("argument limit"))
+        );
+        assert!(!fake.capture.exists());
+    }
+
+    #[test]
+    fn rg_batch_applies_count_ceiling_even_when_byte_budget_remains() {
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let budget = RgArgBudget::new(&request, &RgCommand::default()).unwrap();
+        let mut batch = RgBatch::new(budget);
+
+        for index in 0..RG_BATCH_MAX_PATHS {
+            assert!(batch.try_push(PathBuf::from(format!("p{index}"))));
+        }
+        assert!(!batch.try_push(PathBuf::from("one-too-many")));
+        assert!(batch.arg_bytes < RG_BATCH_MAX_ARG_BYTES);
     }
 
     #[test]
