@@ -12,7 +12,7 @@ use crate::{
     app::{
         format_elapsed, App, AppMode, AppsView, ArchiveView, BrowserView, BuiltinApp,
         ClipboardMode, DeviceView, NetworkView, PartitionOverlay, PartitionView, Prompt,
-        SearchScope, SearchView, TrashView,
+        SearchForm, SearchView, TrashView,
     },
     entry::{human_size, EntryKind},
     icons::Icons,
@@ -44,7 +44,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::Prompt(prompt) => draw_prompt(frame, app, prompt),
         AppMode::Progress => draw_progress_modal(frame, app),
         AppMode::SearchProgress => draw_search_progress(frame, app),
-        AppMode::SearchResults(view) => draw_search_results(frame, app, view),
+        AppMode::SearchForm(form) => draw_search_form(frame, form),
+        AppMode::SearchResults => {
+            if let Some(view) = &app.search_results {
+                draw_search_results(frame, app, view);
+            }
+        }
         AppMode::UpdateProgress => draw_update_progress(frame),
         AppMode::Trash(view) => draw_trash(frame, app, view),
         AppMode::Devices(view) => draw_devices(frame, app, view),
@@ -181,7 +186,7 @@ fn draw_table_view(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
     let icons = Icons::new(&app.config.icons);
-    let search_query = app.search_filter.as_deref();
+    let search_query: Option<&str> = None;
     let visible_count = usize::from(area.height.saturating_sub(1)).max(1);
     let start = viewport_start(app.cursor, app.entries.len(), visible_count);
     let end = (start + visible_count).min(app.entries.len());
@@ -292,7 +297,7 @@ fn has_later_tree_sibling(app: &App, index: usize, depth: usize) -> bool {
 
 fn draw_file_table(frame: &mut Frame, app: &App, area: Rect) {
     let icons = Icons::new(&app.config.icons);
-    let search_query = app.search_filter.as_deref();
+    let search_query: Option<&str> = None;
     let visible_count = usize::from(area.height.saturating_sub(3)).max(1);
     let start = viewport_start(app.cursor, app.entries.len(), visible_count);
     let end = (start + visible_count).min(app.entries.len());
@@ -442,10 +447,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         },
         app.sort_label(),
         arrow,
-        app.search_filter
-            .as_deref()
-            .map(|query| format!(" · search: {query}"))
-            .unwrap_or_default(),
+        "",
         loading,
     );
     let message = app.visible_status();
@@ -657,15 +659,6 @@ fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -> String {
 fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
     match prompt {
         Prompt::GoTo { input } => input_modal(frame, "Go to path", input, "Enter go · Esc cancel"),
-        Prompt::Search { input, scope } => input_modal(
-            frame,
-            match scope {
-                SearchScope::CurrentDirectory => "Search current directory",
-                SearchScope::Filesystem => "Search entire filesystem",
-            },
-            input,
-            "Enter search · Esc cancel",
-        ),
         Prompt::Rename { input, cursor, .. } => cursor_input_modal(
             frame,
             "Rename",
@@ -1282,6 +1275,15 @@ fn draw_search_progress(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_search_form(frame: &mut Frame, form: &SearchForm) {
+    let title = if form.advanced {
+        "Advanced search"
+    } else {
+        "Search"
+    };
+    input_modal(frame, title, &form.draft.name, "Enter search · Esc cancel");
+}
+
 fn draw_update_progress(frame: &mut Frame) {
     let area = centered(frame.area(), 68, 10);
     frame.render_widget(Clear, area);
@@ -1318,10 +1320,10 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
         .get(start..end)
         .unwrap_or_default()
         .iter()
-        .map(|path| Row::new([Cell::from(path.display().to_string())]));
+        .map(|hit| Row::new([Cell::from(hit.entry.path.display().to_string())]));
     let table = Table::new(rows, [Constraint::Min(20)])
         .header(
-            Row::new([format!("{} · {} result(s)", view.query, view.results.len())])
+            Row::new([format!("{} result(s)", view.results.len())])
                 .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
         )
         .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
@@ -1334,7 +1336,7 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
     let selected = (!view.results.is_empty()).then_some(view.selected.saturating_sub(start));
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
-    let footer = if view.limited {
+    let footer = if view.truncated {
         format!(
             "10,000 result limit reached · ↑/↓ {}/{} Move · Enter open · Esc return",
             app.config.hotkeys.down.display(),

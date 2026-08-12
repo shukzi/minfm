@@ -87,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || app.device_refreshing
             || app.network_refreshing
             || app.partition_refreshing
+            || app.search_running()
         {
             Duration::from_millis(16)
         } else {
