@@ -1376,7 +1376,7 @@ mod tests {
 
     fn benchmark_fixture_spec() -> BenchmarkFixtureSpec {
         BenchmarkFixtureSpec {
-            total_files: 1_024,
+            total_files: 256,
             rg_candidates: 128,
             matching_files: 32,
             retention_results: 20_000,
@@ -2836,17 +2836,30 @@ mod tests {
         candidates
     }
 
-    fn content_sample(
+    fn content_strategy_sample(
+        root: &Path,
         request: &CompiledSearch,
-        candidates: &[PathBuf],
+        cheap_filter_first: bool,
         batch_size: usize,
-    ) -> (BenchmarkSample, usize, usize) {
+    ) -> (BenchmarkSample, usize, usize, usize, usize) {
         let cpu_started = process_cpu_us();
         let started = std::time::Instant::now();
+        let candidates = content_candidates(
+            root,
+            cheap_filter_first,
+            cheap_filter_first.then_some(request),
+        );
         let mut first = None;
         let mut matches = 0;
         let mut subprocesses = 0;
+        let mut peak_proxy_bytes = 0;
         for batch in candidates.chunks(batch_size) {
+            peak_proxy_bytes = peak_proxy_bytes.max(
+                batch
+                    .iter()
+                    .map(|path| encoded_arg_bytes(path.as_os_str()))
+                    .sum(),
+            );
             let verified = run_rg_batch(request, batch, &AtomicBool::new(false)).unwrap();
             subprocesses += 1;
             if !verified.is_empty() {
@@ -2862,11 +2875,39 @@ mod tests {
             },
             matches,
             subprocesses,
+            candidates.len(),
+            peak_proxy_bytes,
         )
     }
 
+    fn cancellation_sample(
+        request: &CompiledSearch,
+        candidates: &[PathBuf],
+        batch_size: usize,
+    ) -> u128 {
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\necho $$ > '$CAPTURE'\nsleep 60 &\necho $! >> '$CAPTURE'\nwait\n",
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let request = request.clone();
+        let command = fake.command.clone();
+        let batch = candidates[..batch_size].to_vec();
+        let worker = thread::spawn(move || {
+            run_rg_batch_with_command(&request, &batch, &worker_cancel, &command)
+        });
+        let pids = wait_for_pids(&fake.capture, 2);
+        let started = std::time::Instant::now();
+        cancel.store(true, AtomicOrdering::Relaxed);
+        assert!(matches!(worker.join().unwrap(), Err(RgError::Cancelled)));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2));
+        assert_processes_gone(&pids);
+        elapsed.as_micros()
+    }
+
     /// Manual baseline (2026-08-12, release build, nine warm-cache runs):
-    /// first result 1,076 us; completion 2,148 us on the 1,024-file fixture.
+    /// first result 1,077 us; completion 1,085 us on the 256-file fixture.
     /// Compare trends, not absolute timings, across machines and filesystems.
     #[test]
     #[ignore]
@@ -2886,8 +2927,8 @@ mod tests {
     }
 
     /// Manual baseline (2026-08-12, release, nine runs): filtered batch 128
-    /// completed in 10,217 us with 128 candidates/one subprocess; unpruned
-    /// batch 128 took 81,987 us with 1,024 candidates/eight subprocesses.
+    /// completed end-to-end in 10,933 us with 128 candidates/one subprocess;
+    /// unpruned batch 128 took 20,951 us with 256 candidates/two subprocesses.
     /// Executes every required bounded batch size on the identical fixture.
     #[test]
     #[ignore]
@@ -2912,43 +2953,40 @@ mod tests {
         assert_eq!(filtered.len(), spec.rg_candidates);
         assert_eq!(unpruned.len(), spec.total_files);
 
-        for (label, candidates) in [("filtered", &filtered), ("unpruned", &unpruned)] {
+        for (label, cheap_filter_first) in [("filtered", true), ("unpruned", false)] {
             for batch_size in BENCHMARK_BATCH_SIZES {
                 let mut samples = Vec::with_capacity(BENCHMARK_RUNS);
                 let mut subprocesses = 0;
+                let mut candidate_count = 0;
+                let mut peak_proxy_bytes = 0;
                 for _ in 0..BENCHMARK_RUNS {
-                    let (sample, matches, spawned) =
-                        content_sample(&request, candidates, batch_size);
+                    let (sample, matches, spawned, candidates, peak_proxy) =
+                        content_strategy_sample(
+                            fixture.path(),
+                            &request,
+                            cheap_filter_first,
+                            batch_size,
+                        );
                     assert_eq!(matches, spec.matching_files);
                     subprocesses = spawned;
+                    candidate_count = candidates;
+                    peak_proxy_bytes = peak_proxy;
                     samples.push(sample);
                 }
                 let sample = median_sample(&samples);
-                let peak_proxy_bytes = candidates
-                    .chunks(batch_size)
-                    .map(|batch| {
-                        batch
-                            .iter()
-                            .map(|path| encoded_arg_bytes(path.as_os_str()))
-                            .sum()
-                    })
-                    .max()
-                    .unwrap_or(0);
                 assert!(batch_size <= RG_BATCH_MAX_PATHS);
                 assert!(peak_proxy_bytes <= RG_BATCH_MAX_ARG_BYTES);
                 eprintln!(
-                    "PERF search_compare mode={label} batch_size={batch_size} wall_us={} cpu_us={} peak_proxy_bytes={peak_proxy_bytes} candidates={} subprocesses={subprocesses} first_result_us={} completion_us={}",
+                    "PERF search_compare_end_to_end mode={label} batch_size={batch_size} wall_us={} cpu_us={} peak_proxy_bytes={peak_proxy_bytes} candidates={candidate_count} subprocesses={subprocesses} first_result_us={} completion_us={}",
                     sample.wall_us,
                     sample.cpu_us,
-                    candidates.len(),
                     sample.first_us,
                     sample.wall_us
                 );
                 if label == "filtered" && batch_size == RG_BATCH_MAX_PATHS {
                     eprintln!(
                         "PERF search_filtered_candidates={} search_filtered_complete_us={}",
-                        candidates.len(),
-                        sample.wall_us
+                        candidate_count, sample.wall_us
                     );
                     eprintln!(
                         "PERF search_content_batches={} search_content_complete_us={}",
@@ -2956,6 +2994,17 @@ mod tests {
                     );
                 }
             }
+        }
+
+        for batch_size in BENCHMARK_BATCH_SIZES {
+            let mut samples = Vec::with_capacity(BENCHMARK_RUNS);
+            for _ in 0..BENCHMARK_RUNS {
+                samples.push(cancellation_sample(&request, &unpruned, batch_size));
+            }
+            let cancel_us = median(samples);
+            eprintln!(
+                "PERF search_cancel batch_size={batch_size} cancel_to_reaped_us={cancel_us} candidates_in_child={batch_size}"
+            );
         }
     }
 
@@ -2980,7 +3029,7 @@ mod tests {
 
     /// Manual baseline (2026-08-12, release, nine runs): production-bounded
     /// 1,000 results used a 24,000-byte retained-structure proxy and completed
-    /// in 4,269 us versus 480,000 bytes/82,741 us for real collect-all traversal.
+    /// in 4,274 us versus 480,000 bytes/81,829 us for real collect-all traversal.
     /// Contrasts the production 1,000 cap with a test-only collect-all limit.
     #[test]
     #[ignore]
