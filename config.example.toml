@@ -1,0 +1,82 @@
+[ui]
+show_hidden = false
+directories_first = true
+sort = "name"
+reverse_sort = false
+show_size = true
+show_permissions = true
+show_modified = true
+
+# Override only the symbols you want to change. Each value must occupy one to
+# three terminal cells. Available names are: directory_closed, directory_open,
+# file, text, code, image, audio, video, archive, executable, symlink,
+# block_device, and other. Older action-icon overrides are accepted but no
+# longer displayed because the top action bar uses text.
+[icons.overrides]
+# directory_closed = ">"
+# directory_open = "v"
+
+[behavior]
+verify_copies = true
+read_only = false
+
+[open]
+editor = "xdg-open"
+opener = "xdg-open"
+
+# Letter and symbol shortcuts are configurable. Arrow keys, Enter, and Escape
+# remain universal controls. Values accept one character, a named key such as
+# "Space" or "F2", and optional Ctrl+/Alt+ modifiers.
+[hotkeys]
+force_quit = "Ctrl+c"
+quit = "q"
+down = "j"
+up = "k"
+expand = "l"
+collapse = "h"
+toggle_view = "v"
+select = "Space"
+hidden = "."
+sort = "s"
+reverse_sort = "S"
+go_to = "g"
+# Quick search here; press search_filesystem on an empty quick form for advanced search.
+search = "/"
+# Open advanced filesystem search (also expands an empty quick-search form).
+search_filesystem = "F"
+rename = "r"
+refresh = "r"
+create_directory = "a"
+create_file = "n"
+copy = "c"
+cut = "x"
+paste = "p"
+archive = "z"
+trash = "d"
+quick_trash = "D"
+trash_bin = "T"
+info = "I"
+help = "?"
+open = "o"
+edit = "e"
+tools = "M"
+devices = "m"
+network_shares = "N"
+device_eject = "e"
+device_action = "m"
+device_unmount = "u"
+network_add = "a"
+network_disconnect = "u"
+network_forget = "d"
+partition_actions = "a"
+restore = "r"
+permanent_delete = "d"
+quick_permanent_delete = "D"
+clear_trash = "C"
+confirm_yes = "y"
+confirm_no = "n"
+overwrite = "o"
+skip = "s"
+abort = "a"
+config_reload = "r"
+config_edit = "e"

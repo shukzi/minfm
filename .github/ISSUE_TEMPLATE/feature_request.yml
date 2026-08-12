@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a problem-focused improvement that fits minfm
+title: "[Feature]: "
+labels:
+  - enhancement
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        minfm is a focused, terminal-first Linux file manager with intuitive defaults, optional configuration, and integrated file, archive, storage, LUKS, and network-share workflows. Explain the user problem first so the simplest fitting solution can be discussed before implementation.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What workflow is difficult or impossible today, and who encounters it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe the outcome you want without assuming a particular internal implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Example workflow
+      description: Show how a user would discover and use the improvement in the TUI.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: What terminal tools, commands, configuration, or existing minfm behavior have you tried?
+
+  - type: textarea
+    id: fit
+    attributes:
+      label: Why this belongs in minfm
+      description: Explain how it fits minfm's focused scope and whether it adds dependencies, configuration, UI complexity, privileges, or safety implications.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add mockups, examples, related tools, or links after removing private data.
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues, pull requests, and the roadmap for this idea.
+          required: true
+        - label: I have not included credentials, keys, or private system information.
+          required: true

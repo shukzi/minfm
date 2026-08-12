@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  ICON_FONT_VERSION: "3.5.0"
+  ICON_FONT_ARCHIVE_SHA256: "b7ef2283462b435f1fe91d729dc412d5dbe34269dd2c7f4e1d803e4105c8d883"
+
+jobs:
+  release:
+    name: Build and publish Linux binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-musl
+
+      - name: Verify release version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo pkgid | sed -E 's/.*[#@]//')"
+          test "$tag_version" = "$package_version" || {
+            echo "Release tag v$tag_version does not match Cargo.toml version $package_version" >&2
+            exit 1
+          }
+
+      - name: Build static release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package binary and checksum
+        run: |
+          mkdir release
+          cp target/x86_64-unknown-linux-musl/release/minfm release/minfm-linux-x86_64
+          cd release
+          sha256sum minfm-linux-x86_64 > minfm-linux-x86_64.sha256
+
+      - name: Package verified icon font
+        run: |
+          archive="NerdFontsSymbolsOnly.tar.xz"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/ryanoasis/nerd-fonts/releases/download/v${ICON_FONT_VERSION}/${archive}" \
+            -o "$archive"
+          printf '%s  %s\n' "$ICON_FONT_ARCHIVE_SHA256" "$archive" | sha256sum --check --status -
+          mkdir icon-font
+          tar -xJf "$archive" -C icon-font SymbolsNerdFontMono-Regular.ttf
+          cp icon-font/SymbolsNerdFontMono-Regular.ttf release/minfm-icons.ttf
+          cp licenses/minfm-icons-font.txt release/minfm-icons-LICENSE.txt
+          cd release
+          sha256sum minfm-icons.ttf > minfm-icons.ttf.sha256
+
+      - name: Extract release notes
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          awk -v version="v$tag_version" '
+            $0 == "## " version { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release/release-notes.md
+          test -s release/release-notes.md || {
+            echo "No changelog section found for v$tag_version" >&2
+            exit 1
+          }
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release/release-notes.md
+          files: |
+            release/minfm-linux-x86_64
+            release/minfm-linux-x86_64.sha256
+            release/minfm-icons.ttf
+            release/minfm-icons.ttf.sha256
+            release/minfm-icons-LICENSE.txt

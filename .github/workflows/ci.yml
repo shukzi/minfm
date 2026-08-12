@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_OFFLINE: false
+
+jobs:
+  checks:
+    name: Format, lint, test, and release build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run debug tests
+        run: cargo test --locked
+
+      - name: Run release tests
+        run: cargo test --release --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+  dependency-policy:
+    name: Dependency advisories, licenses, and sources
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.97.1"
