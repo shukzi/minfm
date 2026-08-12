@@ -14,6 +14,10 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
+    archive::{
+        self, ArchiveEntry, ArchiveFormat, ArchiveOutcome, ArchiveRequest, ArchiveUpdate,
+        RunningArchive,
+    },
     browser_loader::{self, LoadRequest, LoadUpdate, RunningLoad},
     config::{self, Config, ConfigLoad, SortSetting},
     entry::{self, EntryKind, FileEntry},
@@ -62,6 +66,25 @@ pub enum Prompt {
         input: String,
     },
     CreateFile {
+        input: String,
+        cursor: usize,
+    },
+    ArchiveFormat {
+        sources: Vec<PathBuf>,
+        selected: usize,
+    },
+    ArchiveName {
+        sources: Vec<PathBuf>,
+        format: ArchiveFormat,
+        input: String,
+        cursor: usize,
+    },
+    ArchiveActions {
+        archive: PathBuf,
+        selected: usize,
+    },
+    ArchiveDestination {
+        archive: PathBuf,
         input: String,
         cursor: usize,
     },
@@ -186,6 +209,13 @@ pub struct SearchView {
     pub selected: usize,
     pub skipped: usize,
     pub limited: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveView {
+    pub archive: PathBuf,
+    pub entries: Vec<ArchiveEntry>,
+    pub selected: usize,
 }
 
 #[derive(Debug)]
@@ -509,6 +539,7 @@ pub enum PartitionOverlay {
 
 pub enum AppMode {
     Browser,
+    Archive(ArchiveView),
     Apps(AppsView),
     Prompt(Prompt),
     Progress,
@@ -612,6 +643,7 @@ pub struct App {
     status_expiry: Option<(String, Instant)>,
     pub progress: ProgressState,
     operation: Option<RunningOperation>,
+    archive_operation: Option<RunningArchive>,
     operation_trash_manager: Option<TrashManager>,
     luks_operation: Option<RunningLuks>,
     launch_sender: SyncSender<LaunchError>,
@@ -681,6 +713,7 @@ impl App {
             status_expiry: None,
             progress: ProgressState::default(),
             operation: None,
+            archive_operation: None,
             operation_trash_manager: None,
             luks_operation: None,
             launch_sender,
@@ -776,6 +809,7 @@ impl App {
         let mode = std::mem::replace(&mut self.mode, AppMode::Browser);
         self.mode = match mode {
             AppMode::Browser => self.handle_browser_key(key),
+            AppMode::Archive(view) => self.handle_archive_key(view, key),
             AppMode::Apps(view) => self.handle_apps_key(view, key),
             AppMode::Prompt(prompt) => self.handle_prompt_key(prompt, key),
             AppMode::Progress => self.handle_progress_key(key),
@@ -972,6 +1006,91 @@ impl App {
                 summary,
                 return_to_trash,
             });
+        }
+        true
+    }
+
+    pub fn poll_archive(&mut self) -> bool {
+        let Some(operation) = &self.archive_operation else {
+            return false;
+        };
+        let mut finished = None;
+        let mut changed = false;
+        for _ in 0..512 {
+            match operation.receiver.try_recv() {
+                Ok(ArchiveUpdate::Started {
+                    label,
+                    total_items,
+                    total_bytes,
+                }) => {
+                    self.progress.label = label;
+                    self.progress.total_items = total_items;
+                    self.progress.total_bytes = total_bytes;
+                    changed = true;
+                }
+                Ok(ArchiveUpdate::Progress {
+                    current,
+                    completed_items,
+                    completed_bytes,
+                }) => {
+                    self.progress.current = Some(current);
+                    self.progress.completed_items = completed_items;
+                    self.progress.completed_bytes = completed_bytes;
+                    changed = true;
+                }
+                Ok(ArchiveUpdate::Finished(result)) => {
+                    finished = Some(result);
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("Archive worker stopped unexpectedly".into()));
+                    break;
+                }
+            }
+        }
+        let Some(result) = finished else {
+            return changed;
+        };
+        self.archive_operation = None;
+        self.progress = ProgressState::default();
+        match result {
+            Ok(ArchiveOutcome::Created { archive, entries }) => {
+                self.refresh_browser(Some(archive));
+                self.set_notice(format!("Archive created: {entries} item(s)"));
+                self.mode = AppMode::Browser;
+            }
+            Ok(ArchiveOutcome::Listed { archive, entries }) => {
+                self.mode = AppMode::Archive(ArchiveView {
+                    archive,
+                    entries,
+                    selected: 0,
+                });
+            }
+            Ok(ArchiveOutcome::Extracted {
+                archive,
+                destination,
+                entries,
+            }) => {
+                self.refresh();
+                self.set_notice(format!(
+                    "Extracted {} item(s) from {} to {}",
+                    entries,
+                    archive.display(),
+                    destination.display()
+                ));
+                self.mode = AppMode::Browser;
+            }
+            Err(error) if error == "Archive operation cancelled" => {
+                self.set_notice("Archive operation cancelled");
+                self.mode = AppMode::Browser;
+            }
+            Err(error) => {
+                self.mode = AppMode::Prompt(Prompt::Message {
+                    title: "Archive operation failed".into(),
+                    body: error,
+                });
+            }
         }
         true
     }
@@ -1769,6 +1888,8 @@ impl App {
             self.set_clipboard(ClipboardMode::Cut);
         } else if hotkeys.paste.matches(key) {
             return self.prepare_paste();
+        } else if hotkeys.archive.matches(key) {
+            return self.prepare_archive();
         } else if hotkeys.trash.matches(key) {
             if let Some(paths) = self.mutation_targets() {
                 return AppMode::Prompt(Prompt::ConfirmTrash { paths });
@@ -1817,6 +1938,23 @@ impl App {
             }
         } else {
             AppMode::Apps(view)
+        }
+    }
+
+    fn handle_archive_key(&mut self, mut view: ArchiveView, key: KeyEvent) -> AppMode {
+        let hotkeys = self.config.hotkeys.clone();
+        if key.code == KeyCode::Esc || hotkeys.quit.matches(key) {
+            AppMode::Browser
+        } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+            if !view.entries.is_empty() {
+                view.selected = (view.selected + 1).min(view.entries.len() - 1);
+            }
+            AppMode::Archive(view)
+        } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+            view.selected = view.selected.saturating_sub(1);
+            AppMode::Archive(view)
+        } else {
+            AppMode::Archive(view)
         }
     }
 
@@ -1870,6 +2008,105 @@ impl App {
                 if key.code == KeyCode::Enter {
                     let input = input.clone();
                     return self.create_file(&input);
+                }
+            }
+            Prompt::ArchiveFormat { sources, selected } => {
+                if key.code == KeyCode::Esc {
+                    return AppMode::Browser;
+                }
+                if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+                    *selected = (*selected + 1).min(ArchiveFormat::ALL.len() - 1);
+                } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+                    *selected = selected.saturating_sub(1);
+                } else if key.code == KeyCode::Enter {
+                    let format = ArchiveFormat::ALL[*selected];
+                    let input = suggested_archive_name(sources, format);
+                    return AppMode::Prompt(Prompt::ArchiveName {
+                        sources: sources.clone(),
+                        format,
+                        cursor: input.chars().count(),
+                        input,
+                    });
+                }
+            }
+            Prompt::ArchiveName {
+                sources,
+                format,
+                input,
+                cursor,
+            } => {
+                if edit_cursor_input(input, cursor, key) {
+                    return AppMode::Browser;
+                }
+                if key.code == KeyCode::Enter {
+                    let name = format.append_extension(input.trim());
+                    if let Err(error) = validate_archive_name(&name) {
+                        self.status = error;
+                        return AppMode::Prompt(prompt);
+                    }
+                    let destination = self.current_dir.join(name);
+                    self.start_archive(ArchiveRequest::Create {
+                        sources: sources.clone(),
+                        destination,
+                        format: *format,
+                    });
+                    return AppMode::Progress;
+                }
+            }
+            Prompt::ArchiveActions { archive, selected } => {
+                if key.code == KeyCode::Esc {
+                    return AppMode::Browser;
+                }
+                if key.code == KeyCode::Down || hotkeys.down.matches(key) {
+                    *selected = (*selected + 1).min(1);
+                } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
+                    *selected = selected.saturating_sub(1);
+                } else if key.code == KeyCode::Enter {
+                    if *selected == 0 {
+                        self.start_archive(ArchiveRequest::List {
+                            archive: archive.clone(),
+                        });
+                        return AppMode::Progress;
+                    }
+                    if self.config.behavior.read_only {
+                        self.status = "Read-only mode: archive extraction is disabled".into();
+                        return AppMode::Browser;
+                    }
+                    let input = self.current_dir.display().to_string();
+                    return AppMode::Prompt(Prompt::ArchiveDestination {
+                        archive: archive.clone(),
+                        cursor: input.chars().count(),
+                        input,
+                    });
+                }
+            }
+            Prompt::ArchiveDestination {
+                archive,
+                input,
+                cursor,
+            } => {
+                if edit_cursor_input(input, cursor, key) {
+                    return AppMode::Browser;
+                }
+                if key.code == KeyCode::Enter {
+                    let destination = PathBuf::from(expand_home(input.trim()));
+                    let destination = if destination.is_absolute() {
+                        destination
+                    } else {
+                        self.current_dir.join(destination)
+                    };
+                    if !destination.is_dir() {
+                        self.status = format!(
+                            "Extraction destination is not a directory: {}",
+                            destination.display()
+                        );
+                        return AppMode::Prompt(prompt);
+                    }
+                    self.start_archive(ArchiveRequest::Extract {
+                        archive: archive.clone(),
+                        destination,
+                    });
+                    return AppMode::Progress;
                 }
             }
             Prompt::Rename {
@@ -2291,6 +2528,10 @@ impl App {
     fn handle_progress_key(&mut self, key: KeyEvent) -> AppMode {
         if key.code == KeyCode::Esc && self.progress.cancellable {
             if let Some(operation) = &self.operation {
+                operation.cancel.store(true, Ordering::Relaxed);
+                self.progress.cancelling = true;
+            }
+            if let Some(operation) = &self.archive_operation {
                 operation.cancel.store(true, Ordering::Relaxed);
                 self.progress.cancelling = true;
             }
@@ -5163,6 +5404,31 @@ impl App {
         }
     }
 
+    fn prepare_archive(&mut self) -> AppMode {
+        let paths = self.selected_paths();
+        if paths.len() == 1 && paths[0].is_file() && ArchiveFormat::detect(&paths[0]).is_some() {
+            return AppMode::Prompt(Prompt::ArchiveActions {
+                archive: paths[0].clone(),
+                selected: 0,
+            });
+        }
+        let Some(sources) = self.mutation_targets() else {
+            return AppMode::Browser;
+        };
+        AppMode::Prompt(Prompt::ArchiveFormat {
+            sources,
+            selected: 0,
+        })
+    }
+
+    fn start_archive(&mut self, request: ArchiveRequest) {
+        self.progress = ProgressState {
+            cancellable: true,
+            ..ProgressState::default()
+        };
+        self.archive_operation = Some(archive::spawn(request));
+    }
+
     fn set_clipboard(&mut self, mode: ClipboardMode) {
         let Some(paths) = self.mutation_targets() else {
             return;
@@ -5702,6 +5968,33 @@ fn expand_home(input: &str) -> String {
     input.into()
 }
 
+fn suggested_archive_name(sources: &[PathBuf], format: ArchiveFormat) -> String {
+    let base = if sources.len() == 1 {
+        sources[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("archive")
+    } else {
+        "archive"
+    };
+    format.append_extension(base)
+}
+
+fn validate_archive_name(name: &str) -> Result<(), String> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || path.is_absolute()
+        || path.components().count() != 1
+        || path.file_name().is_none()
+    {
+        return Err("Archive name must be a single filename".into());
+    }
+    Ok(())
+}
+
 fn search_filesystem(
     root: &Path,
     query: &str,
@@ -5798,7 +6091,7 @@ fn command_available(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{fs::File, os::unix::fs::PermissionsExt};
 
     fn test_app(root: &Path) -> App {
         let config = Config::default();
@@ -5830,6 +6123,127 @@ mod tests {
         }
     }
 
+    fn wait_for_archive(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.archive_operation.is_some() && Instant::now() < deadline {
+            if !app.poll_archive() {
+                thread::yield_now();
+            }
+        }
+        assert!(app.archive_operation.is_none(), "archive worker timed out");
+    }
+
+    #[test]
+    fn archive_hotkey_creates_and_inspects_an_archive_without_external_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, b"archive me").unwrap();
+        let mut app = test_app(temp.path());
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == source)
+            .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::ArchiveFormat { selected: 0, .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::ArchiveName {
+                format: ArchiveFormat::TarGz,
+                ..
+            })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Progress));
+        wait_for_archive(&mut app);
+
+        let archive = temp.path().join("source.txt.tar.gz");
+        assert!(archive.is_file());
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == archive)
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            AppMode::Prompt(Prompt::ArchiveActions { selected: 0, .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_archive(&mut app);
+        assert!(matches!(
+            app.mode,
+            AppMode::Archive(ArchiveView { ref entries, .. })
+                if entries.iter().any(|entry| entry.path == Path::new("source.txt"))
+        ));
+    }
+
+    #[test]
+    fn archive_actions_respect_read_only_mode_but_allow_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("bundle.tar");
+        let file = File::create(&archive).unwrap();
+        tar::Builder::new(file).finish().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            true,
+        );
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == archive)
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Browser));
+        assert_eq!(app.status, "Read-only mode: archive extraction is disabled");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_archive(&mut app);
+        assert!(matches!(app.mode, AppMode::Archive(_)));
+    }
+
+    #[test]
+    fn archive_progress_escape_requests_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.archive_operation = Some(RunningArchive {
+            receiver,
+            cancel: Arc::clone(&cancel),
+        });
+        app.progress.cancellable = true;
+        app.mode = AppMode::Progress;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.progress.cancelling);
+        drop(sender);
+    }
+
+    #[test]
+    fn archive_names_are_single_safe_filenames() {
+        assert!(validate_archive_name("backup.tar.gz").is_ok());
+        assert!(validate_archive_name("").is_err());
+        assert!(validate_archive_name("../backup.zip").is_err());
+        assert!(validate_archive_name("folder/backup.zip").is_err());
+        assert_eq!(
+            suggested_archive_name(&[PathBuf::from("photos")], ArchiveFormat::Zip),
+            "photos.zip"
+        );
+    }
+
     #[test]
     fn modal_isolation_prevents_browser_shortcuts() {
         let temp = tempfile::tempdir().unwrap();
@@ -5840,7 +6254,7 @@ mod tests {
             input: String::new(),
         });
 
-        for ch in ['d', 'D', 'x', 'c', 'p', 'r', 'm', 'v', 'q'] {
+        for ch in ['d', 'D', 'x', 'c', 'p', 'z', 'r', 'm', 'v', 'q'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
 

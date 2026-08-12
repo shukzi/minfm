@@ -1,4 +1,5 @@
 mod app;
+mod archive;
 mod block;
 mod browser_loader;
 mod config;
@@ -62,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while app.running {
         redraw |= app.poll_browser_load();
         redraw |= app.poll_operation();
+        redraw |= app.poll_archive();
         redraw |= app.poll_luks_operation();
         redraw |= app.poll_search();
         redraw |= app.poll_update();
