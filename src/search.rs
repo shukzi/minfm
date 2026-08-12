@@ -1453,26 +1453,58 @@ fn parse_size(raw: &str) -> Option<Option<u64>> {
     if input.is_empty() {
         return Some(None);
     }
-    let (number, multiplier) = [
-        ("KiB", 1024_u64),
-        ("MiB", 1024_u64.pow(2)),
-        ("GiB", 1024_u64.pow(3)),
-    ]
-    .into_iter()
-    .find_map(|(suffix, multiplier)| {
-        input
-            .strip_suffix(suffix)
-            .map(|number| (number.trim(), multiplier))
-    })
-    .unwrap_or((input, 1));
-    if number.is_empty() || number.starts_with('-') {
+
+    let mut tokens = input.split_whitespace();
+    let number = tokens.next()?;
+    let multiplier = match tokens.next() {
+        None => 1_u64,
+        Some("B") => 1,
+        Some("KB") => 1_000,
+        Some("MB") => 1_000_000,
+        Some("GB") => 1_000_000_000,
+        Some("KiB") => 1_024,
+        Some("MiB") => 1_048_576,
+        Some("GiB") => 1_073_741_824,
+        Some(_) => return None,
+    };
+    if tokens.next().is_some() {
         return None;
     }
-    number
-        .parse::<u64>()
-        .ok()?
-        .checked_mul(multiplier)
-        .map(Some)
+
+    let mut components = number.split('.');
+    let whole = components.next()?;
+    let fraction = components.next();
+    if components.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|digit| digit.is_ascii_digit())
+        || fraction.is_some_and(|digits| {
+            digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+
+    let whole_bytes = whole.parse::<u64>().ok()?.checked_mul(multiplier)?;
+    let fractional_bytes = if let Some(digits) = fraction {
+        let fraction = digits.parse::<u64>().ok()?;
+        let scale = (0..digits.len()).try_fold(1_u64, |scale, _| scale.checked_mul(10))?;
+        let common_factor = gcd(scale, multiplier);
+        let reduced_scale = scale / common_factor;
+        if fraction % reduced_scale != 0 {
+            return None;
+        }
+        (fraction / reduced_scale).checked_mul(multiplier / common_factor)?
+    } else {
+        0
+    };
+    whole_bytes.checked_add(fractional_bytes).map(Some)
+}
+
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn parse_time(raw: &str, now: SystemTime, end_of_day: bool) -> Option<Option<SystemTime>> {
@@ -2542,13 +2574,13 @@ mod tests {
 
     #[test]
     fn parsers_accept_supported_forms_and_reject_invalid_values() {
-        for value in ["1", "1 KiB", "2 MiB", "3 GiB"] {
+        for value in ["1", "1 KB", "1 KiB", "2 MiB", "3 GiB"] {
             let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
             draft.name = "x".into();
             draft.minimum_size = value.into();
             assert!(draft.compile(true).is_ok(), "{value}");
         }
-        for value in ["-1", "1 KB", "1 TiB", "word"] {
+        for value in ["-1", "1 TiB", "word"] {
             let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
             draft.name = "x".into();
             draft.minimum_size = value.into();
@@ -2577,6 +2609,26 @@ mod tests {
                 ),
                 "{value}"
             );
+        }
+    }
+
+    #[test]
+    fn size_parser_accepts_documented_si_iec_and_decimal_forms() {
+        for (raw, expected) in [
+            ("500 B", 500),
+            ("20 KB", 20_000),
+            ("5 MB", 5_000_000),
+            ("1.5 GB", 1_500_000_000),
+            ("2 GiB", 2_147_483_648),
+        ] {
+            assert_eq!(parse_size(raw), Some(Some(expected)), "{raw}");
+        }
+    }
+
+    #[test]
+    fn size_parser_rejects_fractional_bytes_bad_units_and_overflow() {
+        for raw in ["0.5 B", "1 XB", "-1 KB", "NaN GB", "18446744073709551616 B"] {
+            assert_eq!(parse_size(raw), None, "{raw}");
         }
     }
 
