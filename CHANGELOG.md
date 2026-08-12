@@ -1,5 +1,13 @@
 # minfm changelog
 
+## v0.6.1
+
+### Fixed
+
+- Newly formatted ownership-capable filesystems, including filesystems inside
+  LUKS volumes, are assigned to the formatting user instead of remaining
+  root-owned.
+
 ## v0.6.0
 
 ### Added

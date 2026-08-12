@@ -680,6 +680,9 @@ pub fn execute(
     let mut inventory = discover()?;
     validate_action(action, &inventory)?;
     let commands = command_plan(action, &inventory)?;
+    if let Some(filesystem) = newly_created_filesystem(action) {
+        ensure_ownership_helpers(filesystem)?;
+    }
     let custom_elevated = matches!(
         action,
         PartitionAction::EncryptFormat { .. }
@@ -760,6 +763,20 @@ pub fn execute(
             let output = run_command(&command, use_sudo, administrator_password)?;
             if let PartitionAction::BackupTable { destination, .. } = action {
                 write_new_backup(destination, &output)?;
+            }
+        }
+        if let PartitionAction::Format {
+            target, filesystem, ..
+        } = action
+        {
+            if take_ownership_supported(*filesystem) {
+                report_phase("Assigning filesystem ownership");
+                take_filesystem_ownership(
+                    &target.path,
+                    *filesystem,
+                    use_sudo,
+                    administrator_password,
+                )?;
             }
         }
     }
@@ -1233,10 +1250,16 @@ fn execute_encrypted_format(
     let mapping = Path::new("/dev/mapper").join(&mapping_name);
     report_phase("Creating filesystem inside encryption");
     let format_result = run_command(
-        &format_command(mapping.into_os_string(), filesystem, label),
+        &format_command(mapping.as_os_str().to_owned(), filesystem, label),
         use_sudo,
         administrator_password,
     );
+    let access_result = if format_result.is_ok() {
+        report_phase("Assigning filesystem ownership");
+        take_filesystem_ownership(&mapping, filesystem, use_sudo, administrator_password)
+    } else {
+        Ok(())
+    };
     report_phase("Closing encrypted container");
     let close_result = run_command(
         &CommandSpec::elevated(
@@ -1247,8 +1270,93 @@ fn execute_encrypted_format(
         administrator_password,
     );
     format_result?;
+    access_result?;
     close_result?;
     Ok(())
+}
+
+fn take_filesystem_ownership(
+    device: &Path,
+    filesystem: Filesystem,
+    use_sudo: bool,
+    administrator_password: Option<&[u8]>,
+) -> Result<()> {
+    if !take_ownership_supported(filesystem) {
+        return Ok(());
+    }
+
+    let mountpoint = tempfile::Builder::new()
+        .prefix("minfm-filesystem-access-")
+        .tempdir()
+        .map_err(|error| crate::error::io_error("could not prepare filesystem access", error))?;
+    let commands = ownership_commands(device, mountpoint.path(), Uid::current(), Gid::current());
+    run_command(&commands[0], use_sudo, administrator_password)?;
+    let ownership_result = run_command(&commands[1], use_sudo, administrator_password);
+    let unmount_result = run_command(&commands[2], use_sudo, administrator_password);
+    match (ownership_result, unmount_result) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(ownership_error), Err(unmount_error)) => Err(MinfmError::Message(format!(
+            "{ownership_error}; additionally failed to unmount the temporary filesystem: {unmount_error}"
+        ))),
+    }
+}
+
+fn take_ownership_supported(filesystem: Filesystem) -> bool {
+    matches!(
+        filesystem,
+        Filesystem::Ext4 | Filesystem::Xfs | Filesystem::Btrfs | Filesystem::F2fs | Filesystem::Udf
+    )
+}
+
+fn newly_created_filesystem(action: &PartitionAction) -> Option<Filesystem> {
+    match action {
+        PartitionAction::Format { filesystem, .. }
+        | PartitionAction::EncryptFormat { filesystem, .. }
+        | PartitionAction::CreateEncryptedDisk { filesystem, .. } => Some(*filesystem),
+        _ => None,
+    }
+}
+
+fn ensure_ownership_helpers(filesystem: Filesystem) -> Result<()> {
+    if take_ownership_supported(filesystem) {
+        for helper in ["mount", "chown", "umount"] {
+            let _ = trusted_program(&OsString::from(helper))?;
+        }
+    }
+    Ok(())
+}
+
+fn ownership_commands(
+    device: &Path,
+    mountpoint: &Path,
+    owner: Uid,
+    group: Gid,
+) -> [CommandSpec; 3] {
+    [
+        CommandSpec::elevated(
+            "mount",
+            [
+                OsString::from("--options"),
+                OsString::from("nosuid,nodev,noexec"),
+                OsString::from("--"),
+                device.as_os_str().to_owned(),
+                mountpoint.as_os_str().to_owned(),
+            ],
+        ),
+        CommandSpec::elevated(
+            "chown",
+            [
+                OsString::from(format!("{owner}:{group}")),
+                OsString::from("--"),
+                mountpoint.as_os_str().to_owned(),
+            ],
+        ),
+        CommandSpec::elevated(
+            "umount",
+            [OsString::from("--"), mountpoint.as_os_str().to_owned()],
+        ),
+    ]
 }
 
 fn command_phase(command: &CommandSpec) -> &'static str {
@@ -3215,6 +3323,46 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("different kernel device"));
+    }
+
+    #[test]
+    fn ownership_capable_filesystems_are_assigned_to_the_formatting_user() {
+        for filesystem in [
+            Filesystem::Ext4,
+            Filesystem::Xfs,
+            Filesystem::Btrfs,
+            Filesystem::F2fs,
+            Filesystem::Udf,
+        ] {
+            assert!(take_ownership_supported(filesystem));
+        }
+        for filesystem in [
+            Filesystem::Fat32,
+            Filesystem::Exfat,
+            Filesystem::Ntfs,
+            Filesystem::Swap,
+            Filesystem::None,
+        ] {
+            assert!(!take_ownership_supported(filesystem));
+        }
+
+        let commands = ownership_commands(
+            Path::new("/dev/mapper/test-volume"),
+            Path::new("/tmp/test-mountpoint"),
+            Uid::from_raw(1000),
+            Gid::from_raw(1001),
+        );
+        assert_eq!(commands[0].program, OsString::from("mount"));
+        assert_eq!(commands[1].program, OsString::from("chown"));
+        assert_eq!(commands[1].arguments[0], OsString::from("1000:1001"));
+        assert_eq!(commands[2].program, OsString::from("umount"));
+        assert!(commands.iter().all(|command| command.elevated));
+        assert!(commands.iter().all(|command| {
+            command
+                .arguments
+                .iter()
+                .any(|argument| argument == "/tmp/test-mountpoint")
+        }));
     }
 
     #[test]
