@@ -43,10 +43,11 @@ integrated way I wanted to mount drives or safely unlock encrypted volumes from
 the same terminal interface.
 
 minfm brings those needs together in one TUI without requiring Lua or plugins.
-If you feel something is missing or should be improved without overcomplicating
-the core functionality, open a pull request. minfm is designed to be
-approachable for everyday file work and configurable for people who want to tune
-their workflow.
+Small, focused improvements are welcome as pull requests. For substantial
+features, open a feature request first so the problem and fit can be discussed
+without overcomplicating the core functionality. minfm is designed to be
+approachable for everyday file work and configurable for people who want to
+tune their workflow.
 
 Terminal applications are complex enough on their own. A graphical application
 often adds a large dependency stack, background services, and another interface
@@ -227,7 +228,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 Download, build, and run minfm:
 
 ```sh
-git clone https://github.com/shukzi/minfm.git
+git clone git@github.com:shukzi/minfm.git
 cd minfm
 cargo build --release --locked
 ./target/release/minfm
@@ -256,6 +257,19 @@ cargo build --release --locked
   output privately, and refuses to overwrite existing destination items.
 - Keep independent backups of important data. Safety checks reduce risk but do
   not make partitioning, formatting, or erasure reversible.
+
+## Contributing
+
+- [Report a bug](https://github.com/shukzi/minfm/issues/new?template=bug_report.yml)
+  with reproducible, sanitized system details.
+- [Request a feature](https://github.com/shukzi/minfm/issues/new?template=feature_request.yml)
+  before implementing a substantial change.
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) to build, test, and submit a focused
+  code or documentation change. Small obvious fixes can go directly to a pull
+  request.
+- See the [roadmap](ROADMAP.md) for project direction and [TODO](TODO.md) for
+  small maintainer notes that are not yet public work items.
+- Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
 
 ## License
 

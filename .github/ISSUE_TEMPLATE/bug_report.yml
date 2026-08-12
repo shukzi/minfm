@@ -1,0 +1,134 @@
+name: Bug report
+description: Report reproducible incorrect behavior in minfm
+title: "[Bug]: "
+labels:
+  - bug
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Search existing issues first and use disposable data or devices when reproducing storage-sensitive behavior.
+
+        Remove passwords, credentials, encryption keys, hostnames, usernames, private paths, UUIDs, network details, and other sensitive information before submitting.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What went wrong? Include the affected file, archive, device, or workflow only when relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe sequence that reproduces the problem.
+      placeholder: |
+        1. Start minfm in ...
+        2. Navigate to ...
+        3. Press ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exact sanitized error text when possible.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: minfm version
+      description: Run `minfm --version` or provide the commit used for a source build.
+      placeholder: minfm 0.6.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Official installer
+        - In-app update
+        - Built from source
+        - Manual release-binary installation
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: distribution
+    attributes:
+      label: Linux distribution and version
+      placeholder: Fedora 43
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel
+      description: Output of `uname -srmo` is usually sufficient.
+      placeholder: Linux 6.x.y-... x86_64 GNU/Linux
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal emulator
+      placeholder: GNOME Console, kitty, foot, Alacritty, etc.
+    validations:
+      required: true
+
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      placeholder: bash 5.x, zsh 5.x, fish 4.x, etc.
+
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Relevant configuration
+      description: Paste only relevant, sanitized differences from `config.example.toml`, or write “default”.
+      render: toml
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized errors and diagnostics
+      description: For storage problems, a sanitized `lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS` may help. Do not include secrets or unrelated private system information.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add screenshots, terminal dimensions, filesystem/archive details, or other context that materially helps reproduce the problem.
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and pull requests for this problem.
+          required: true
+        - label: I removed credentials, keys, private identifiers, and other sensitive data.
+          required: true
+        - label: I used disposable data or hardware for any destructive reproduction steps.
+          required: false
