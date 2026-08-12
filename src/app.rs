@@ -198,8 +198,10 @@ pub enum Prompt {
 #[allow(dead_code)] // Task 5 consumes the full section navigation state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchSection {
-    Query,
+    Scope,
+    Match,
     Filters,
+    Traversal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +227,7 @@ pub struct SearchForm {
     pub section: SearchSection,
     #[allow(dead_code)] // Task 5 owns full field navigation.
     pub field: usize,
+    pub cursor: usize,
     pub error: Option<String>,
     pub return_to: SearchReturn,
 }
@@ -234,21 +237,133 @@ impl SearchForm {
         Self {
             draft: SearchDraft::quick(root),
             advanced: false,
-            section: SearchSection::Query,
+            section: SearchSection::Match,
             field: 0,
+            cursor: 0,
             error: None,
             return_to,
         }
     }
 
-    fn advanced(root: PathBuf, scope: SearchScope, return_to: SearchReturn) -> Self {
+    pub(crate) fn advanced(root: PathBuf, scope: SearchScope, return_to: SearchReturn) -> Self {
         Self {
             draft: SearchDraft::advanced(root, scope),
             advanced: true,
-            section: SearchSection::Query,
+            section: SearchSection::Scope,
             field: 0,
+            cursor: 0,
             error: None,
             return_to,
+        }
+    }
+
+    fn active_text(&self) -> Option<&str> {
+        match (self.section, self.field) {
+            (SearchSection::Match, 1) => Some(&self.draft.content),
+            (SearchSection::Filters, 5) => Some(&self.draft.minimum_size),
+            (SearchSection::Filters, 6) => Some(&self.draft.maximum_size),
+            (SearchSection::Filters, 7) => Some(&self.draft.modified_after),
+            (SearchSection::Filters, 8) => Some(&self.draft.modified_before),
+            _ => None,
+        }
+    }
+
+    fn edit_active_text(&mut self, key: KeyEvent) -> bool {
+        let input = match (self.section, self.field) {
+            (SearchSection::Match, 1) => &mut self.draft.content,
+            (SearchSection::Filters, 5) => &mut self.draft.minimum_size,
+            (SearchSection::Filters, 6) => &mut self.draft.maximum_size,
+            (SearchSection::Filters, 7) => &mut self.draft.modified_after,
+            (SearchSection::Filters, 8) => &mut self.draft.modified_before,
+            _ => return false,
+        };
+        edit_cursor_input(input, &mut self.cursor, key);
+        true
+    }
+
+    fn handle_choice_key(&mut self, key: KeyEvent) {
+        use search::{ContentMode, NameMode, ResultLimit};
+        let forward = key.code == KeyCode::Right;
+        if !matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+        ) {
+            return;
+        }
+        match (self.section, self.field) {
+            (SearchSection::Scope, 0) => {
+                self.draft.scope = match (self.draft.scope, forward) {
+                    (SearchScope::CurrentDirectory, true) => SearchScope::RecursiveHere,
+                    (SearchScope::RecursiveHere, true) => SearchScope::Filesystem,
+                    (SearchScope::Filesystem, true) => SearchScope::CurrentDirectory,
+                    (SearchScope::CurrentDirectory, false) => SearchScope::Filesystem,
+                    (SearchScope::RecursiveHere, false) => SearchScope::CurrentDirectory,
+                    (SearchScope::Filesystem, false) => SearchScope::RecursiveHere,
+                };
+            }
+            (SearchSection::Match, 0) => {
+                self.draft.name_mode = match (self.draft.name_mode, forward) {
+                    (NameMode::Smart, true) => NameMode::Glob,
+                    (NameMode::Glob, true) => NameMode::Regex,
+                    (NameMode::Regex, true) => NameMode::Smart,
+                    (NameMode::Smart, false) => NameMode::Regex,
+                    (NameMode::Glob, false) => NameMode::Smart,
+                    (NameMode::Regex, false) => NameMode::Glob,
+                };
+            }
+            (SearchSection::Match, 2) => {
+                self.draft.content_mode = match self.draft.content_mode {
+                    ContentMode::Literal => ContentMode::Regex,
+                    ContentMode::Regex => ContentMode::Literal,
+                };
+            }
+            (SearchSection::Filters, field @ 0..=4) if key.code == KeyCode::Char(' ') => {
+                let kind = match field {
+                    0 => crate::entry::EntryKind::File,
+                    1 => crate::entry::EntryKind::Directory,
+                    2 => crate::entry::EntryKind::Symlink,
+                    3 => crate::entry::EntryKind::BlockDevice,
+                    _ => crate::entry::EntryKind::Other,
+                };
+                self.draft.types.toggle(kind);
+            }
+            (SearchSection::Filters, 9) => {
+                self.draft.include_ignored_hidden = !self.draft.include_ignored_hidden;
+            }
+            (SearchSection::Traversal, 0) => {
+                self.draft.result_limit = match (self.draft.result_limit, forward) {
+                    (ResultLimit::OneThousand, true) => ResultLimit::FiveThousand,
+                    (ResultLimit::FiveThousand, true) => ResultLimit::TenThousand,
+                    (ResultLimit::TenThousand, true) => ResultLimit::OneThousand,
+                    (ResultLimit::OneThousand, false) => ResultLimit::TenThousand,
+                    (ResultLimit::FiveThousand, false) => ResultLimit::OneThousand,
+                    (ResultLimit::TenThousand, false) => ResultLimit::FiveThousand,
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SearchSection {
+    fn moved(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Scope, true) => Self::Match,
+            (Self::Match, true) => Self::Filters,
+            (Self::Filters, true) => Self::Traversal,
+            (Self::Traversal, true) => Self::Scope,
+            (Self::Scope, false) => Self::Traversal,
+            (Self::Match, false) => Self::Scope,
+            (Self::Filters, false) => Self::Match,
+            (Self::Traversal, false) => Self::Filters,
+        }
+    }
+
+    fn field_count(self) -> usize {
+        match self {
+            Self::Scope | Self::Traversal => 1,
+            Self::Match => 3,
+            Self::Filters => 10,
         }
     }
 }
@@ -2617,16 +2732,64 @@ impl App {
         if key.code == KeyCode::Esc {
             return form.return_to.mode();
         }
-        if !form.advanced && form.draft.name.is_empty() && key.code == KeyCode::Char('F') {
+        if !form.advanced
+            && form.draft.name.is_empty()
+            && self.config.hotkeys.search_filesystem.matches(key)
+        {
             form.advanced = true;
+            form.section = SearchSection::Scope;
+            form.field = 0;
             return AppMode::SearchForm(form);
         }
         if key.code == KeyCode::Enter {
             return self.submit_search(form);
         }
-        if edit_input(&mut form.draft.name, key) {
-            return form.return_to.mode();
+        if !form.advanced {
+            edit_cursor_input(&mut form.draft.name, &mut form.cursor, key);
+            form.error = None;
+            return AppMode::SearchForm(form);
         }
+
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            form.section = form.section.moved(key.code == KeyCode::Down);
+            form.field = 0;
+            form.cursor = 0;
+            form.error = None;
+            return AppMode::SearchForm(form);
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let count = form.section.field_count();
+            form.field = if key.code == KeyCode::BackTab {
+                (form.field + count - 1) % count
+            } else {
+                (form.field + 1) % count
+            };
+            form.cursor = form.active_text().map_or(0, |text| text.chars().count());
+            form.error = None;
+            return AppMode::SearchForm(form);
+        }
+        if form.edit_active_text(key) {
+            form.error = None;
+            return AppMode::SearchForm(form);
+        }
+        let entry_kind_toggle = form.section == SearchSection::Filters
+            && form.field <= 4
+            && key.code == KeyCode::Char(' ');
+        if !entry_kind_toggle
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+        {
+            edit_cursor_input(&mut form.draft.name, &mut form.cursor, key);
+            form.error = None;
+            return AppMode::SearchForm(form);
+        }
+        form.handle_choice_key(key);
         form.error = None;
         AppMode::SearchForm(form)
     }
@@ -7066,6 +7229,79 @@ mod tests {
         app.handle_key(key('F'));
         assert!(matches!(app.mode, AppMode::SearchForm(ref form)
             if form.advanced && form.draft.scope == SearchScope::CurrentDirectory));
+    }
+
+    #[test]
+    fn advanced_search_up_down_selects_sections_and_tab_stays_within_section() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Match && form.field == 0));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Match && form.field == 1));
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Match && form.field == 0));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Scope));
+    }
+
+    #[test]
+    fn advanced_search_cycles_choices_and_toggles_entry_kinds() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.scope == SearchScope::CurrentDirectory));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.name_mode == crate::search::NameMode::Glob));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if !form.draft.types.contains(crate::entry::EntryKind::Directory)));
+        for _ in 0..9 {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.include_ignored_hidden));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.result_limit == crate::search::ResultLimit::TenThousand));
+    }
+
+    #[test]
+    fn advanced_search_enter_validates_from_every_section_and_keeps_error_inline() {
+        for section_moves in 0..4 {
+            let mut app = test_app(tempfile::tempdir().unwrap().path());
+            app.handle_key(key('F'));
+            for _ in 0..section_moves {
+                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            if let AppMode::SearchForm(form) = &mut app.mode {
+                form.draft.minimum_size = "not-a-size".into();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+                if form.error.as_deref().is_some_and(|error| error.contains("invalid minimum size"))));
+            if let AppMode::SearchForm(form) = &mut app.mode {
+                form.draft.minimum_size.clear();
+                form.draft.name = "needle".into();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchProgress));
+            app.search
+                .take()
+                .unwrap()
+                .cancel
+                .store(true, Ordering::Relaxed);
+        }
     }
 
     #[test]
