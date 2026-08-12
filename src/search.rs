@@ -39,6 +39,39 @@ struct RgBatch {
     budget: RgArgBudget,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SearchMetrics {
+    candidates_examined: usize,
+    candidates_passed_metadata: usize,
+    current_batch_paths: usize,
+    current_batch_bytes: usize,
+    max_batch_paths: usize,
+    max_batch_bytes: usize,
+    rg_subprocesses: usize,
+    matches: usize,
+    first_match_us: Option<u128>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct RunOptions {
+    max_batch_paths_override: Option<usize>,
+}
+
+#[cfg(test)]
+struct MetricsContext<'a> {
+    metrics: &'a Arc<std::sync::Mutex<SearchMetrics>>,
+    worker_started: std::time::Instant,
+}
+
+#[cfg(test)]
+impl RunOptions {
+    fn max_batch_paths(self) -> usize {
+        self.max_batch_paths_override.unwrap_or(RG_BATCH_MAX_PATHS)
+    }
+}
+
 impl RgBatch {
     fn new(budget: RgArgBudget) -> Self {
         Self {
@@ -49,7 +82,11 @@ impl RgBatch {
     }
 
     fn try_push(&mut self, path: PathBuf) -> bool {
-        if self.paths.len() == RG_BATCH_MAX_PATHS || !self.budget.can_add(self.arg_bytes, &path) {
+        self.try_push_with_limit(path, RG_BATCH_MAX_PATHS)
+    }
+
+    fn try_push_with_limit(&mut self, path: PathBuf, max_paths: usize) -> bool {
+        if self.paths.len() == max_paths || !self.budget.can_add(self.arg_bytes, &path) {
             return false;
         }
         self.arg_bytes += encoded_arg_bytes(path.as_os_str());
@@ -522,11 +559,42 @@ impl SearchReceiver {
 }
 
 pub fn spawn(request: CompiledSearch) -> RunningSearch {
+    #[cfg(test)]
+    return spawn_with_options(request, RunOptions::default(), None);
+    #[cfg(not(test))]
+    {
+        let (match_sender, match_receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let (control_sender, control_receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        thread::spawn(move || run(request, match_sender, control_sender, worker_cancel));
+        RunningSearch {
+            receiver: SearchReceiver::new(match_receiver, control_receiver),
+            cancel,
+        }
+    }
+}
+
+#[cfg(test)]
+fn spawn_with_options(
+    request: CompiledSearch,
+    options: RunOptions,
+    metrics: Option<Arc<std::sync::Mutex<SearchMetrics>>>,
+) -> RunningSearch {
     let (match_sender, match_receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
     let (control_sender, control_receiver) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
-    thread::spawn(move || run(request, match_sender, control_sender, worker_cancel));
+    thread::spawn(move || {
+        run_with_options(
+            request,
+            match_sender,
+            control_sender,
+            worker_cancel,
+            options,
+            metrics,
+        )
+    });
     RunningSearch {
         receiver: SearchReceiver::new(match_receiver, control_receiver),
         cancel,
@@ -567,6 +635,131 @@ fn run(
     control_sender: Sender<SearchUpdate>,
     cancel: Arc<AtomicBool>,
 ) {
+    #[cfg(test)]
+    return run_with_options(
+        request,
+        match_sender,
+        control_sender,
+        cancel,
+        RunOptions::default(),
+        None,
+    );
+    #[cfg(not(test))]
+    run_inner(
+        request,
+        match_sender,
+        control_sender,
+        cancel,
+        RG_BATCH_MAX_PATHS,
+    )
+}
+
+#[cfg(test)]
+fn run_with_options(
+    request: CompiledSearch,
+    match_sender: SyncSender<SearchUpdate>,
+    control_sender: Sender<SearchUpdate>,
+    cancel: Arc<AtomicBool>,
+    options: RunOptions,
+    metrics: Option<Arc<std::sync::Mutex<SearchMetrics>>>,
+) {
+    run_inner(
+        request,
+        match_sender,
+        control_sender,
+        cancel,
+        options.max_batch_paths(),
+        metrics,
+    )
+}
+
+#[cfg(not(test))]
+fn run_inner(
+    request: CompiledSearch,
+    match_sender: SyncSender<SearchUpdate>,
+    control_sender: Sender<SearchUpdate>,
+    cancel: Arc<AtomicBool>,
+    max_batch_paths: usize,
+) {
+    run_worker(
+        request,
+        match_sender,
+        control_sender,
+        cancel,
+        max_batch_paths,
+    )
+}
+
+#[cfg(test)]
+fn run_inner(
+    request: CompiledSearch,
+    match_sender: SyncSender<SearchUpdate>,
+    control_sender: Sender<SearchUpdate>,
+    cancel: Arc<AtomicBool>,
+    max_batch_paths: usize,
+    metrics: Option<Arc<std::sync::Mutex<SearchMetrics>>>,
+) {
+    run_worker(
+        request,
+        match_sender,
+        control_sender,
+        cancel,
+        max_batch_paths,
+        metrics,
+    )
+}
+
+#[cfg(not(test))]
+fn run_worker(
+    request: CompiledSearch,
+    match_sender: SyncSender<SearchUpdate>,
+    control_sender: Sender<SearchUpdate>,
+    cancel: Arc<AtomicBool>,
+    max_batch_paths: usize,
+) {
+    run_worker_body(
+        request,
+        match_sender,
+        control_sender,
+        cancel,
+        max_batch_paths,
+    )
+}
+
+#[cfg(test)]
+fn run_worker(
+    request: CompiledSearch,
+    match_sender: SyncSender<SearchUpdate>,
+    control_sender: Sender<SearchUpdate>,
+    cancel: Arc<AtomicBool>,
+    max_batch_paths: usize,
+    metrics: Option<Arc<std::sync::Mutex<SearchMetrics>>>,
+) {
+    run_worker_body(
+        request,
+        match_sender,
+        control_sender,
+        cancel,
+        max_batch_paths,
+        metrics,
+    )
+}
+
+fn run_worker_body(
+    request: CompiledSearch,
+    match_sender: SyncSender<SearchUpdate>,
+    control_sender: Sender<SearchUpdate>,
+    cancel: Arc<AtomicBool>,
+    max_batch_paths: usize,
+    #[cfg(test)] metrics: Option<Arc<std::sync::Mutex<SearchMetrics>>>,
+) {
+    #[cfg(test)]
+    let worker_started = std::time::Instant::now();
+    #[cfg(test)]
+    let metrics_context = metrics.as_ref().map(|metrics| MetricsContext {
+        metrics,
+        worker_started,
+    });
     let mut builder = ignore::WalkBuilder::new(request.root());
     builder.follow_links(false);
     if request.scope() == SearchScope::CurrentDirectory {
@@ -617,6 +810,10 @@ fn run(
         if path == request.root() {
             continue;
         }
+        #[cfg(test)]
+        if let Some(metrics) = &metrics {
+            metrics.lock().unwrap().candidates_examined += 1;
+        }
         if request.scope() == SearchScope::CurrentDirectory
             && item
                 .file_type()
@@ -656,7 +853,11 @@ fn run(
             if kind != EntryKind::File {
                 continue;
             }
-            if !rg_batch.try_push(entry.path.clone()) {
+            #[cfg(test)]
+            if let Some(metrics) = &metrics {
+                metrics.lock().unwrap().candidates_passed_metadata += 1;
+            }
+            if !rg_batch.try_push_with_limit(entry.path.clone(), max_batch_paths) {
                 if rg_batch.paths.is_empty() {
                     rg_error = Some(RgError::Failed(format!(
                         "path exceeds the {} byte ripgrep argument limit",
@@ -671,6 +872,8 @@ fn run(
                     &match_sender,
                     Arc::as_ref(&cancel),
                     &mut matches,
+                    #[cfg(test)]
+                    metrics_context.as_ref(),
                 ) {
                     Ok(limit_reached) => {
                         if limit_reached {
@@ -683,7 +886,7 @@ fn run(
                         break;
                     }
                 }
-                if !rg_batch.try_push(entry.path.clone()) {
+                if !rg_batch.try_push_with_limit(entry.path.clone(), max_batch_paths) {
                     rg_error = Some(RgError::Failed(format!(
                         "path exceeds the {} byte ripgrep argument limit",
                         RG_BATCH_MAX_ARG_BYTES
@@ -691,6 +894,8 @@ fn run(
                     break;
                 }
             }
+            #[cfg(test)]
+            update_batch_metrics(metrics.as_ref(), &rg_batch);
             rg_hits.push(SearchHit { entry, rank });
             continue;
         }
@@ -723,6 +928,8 @@ fn run(
             &match_sender,
             Arc::as_ref(&cancel),
             &mut matches,
+            #[cfg(test)]
+            metrics_context.as_ref(),
         ) {
             Ok(limit_reached) => truncated = limit_reached,
             Err(error) => rg_error = Some(error),
@@ -749,7 +956,12 @@ fn emit_rg_batch(
     sender: &SyncSender<SearchUpdate>,
     cancel: &AtomicBool,
     emitted: &mut usize,
+    #[cfg(test)] metrics: Option<&MetricsContext<'_>>,
 ) -> Result<bool, RgError> {
+    #[cfg(test)]
+    if let Some(metrics) = metrics {
+        metrics.metrics.lock().unwrap().rg_subprocesses += 1;
+    }
     let verified = run_rg_batch(request, &batch.paths, cancel)?;
     batch.clear();
     for hit in hits.drain(..) {
@@ -764,11 +976,30 @@ fn emit_rg_batch(
             return Err(RgError::Cancelled);
         }
         *emitted += 1;
+        #[cfg(test)]
+        if let Some(metrics) = metrics {
+            let mut values = metrics.metrics.lock().unwrap();
+            values.matches += 1;
+            values
+                .first_match_us
+                .get_or_insert_with(|| metrics.worker_started.elapsed().as_micros());
+        }
         if *emitted == request.selected_result_limit() {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+fn update_batch_metrics(metrics: Option<&Arc<std::sync::Mutex<SearchMetrics>>>, batch: &RgBatch) {
+    if let Some(metrics) = metrics {
+        let mut metrics = metrics.lock().unwrap();
+        metrics.current_batch_paths = batch.paths.len();
+        metrics.current_batch_bytes = batch.arg_bytes;
+        metrics.max_batch_paths = metrics.max_batch_paths.max(batch.paths.len());
+        metrics.max_batch_bytes = metrics.max_batch_bytes.max(batch.arg_bytes);
+    }
 }
 
 fn send_match_cancellable(
@@ -1390,6 +1621,13 @@ mod tests {
         assert!(benchmark_fixture_spec().total_files > benchmark_fixture_spec().rg_candidates);
         assert!(benchmark_fixture_spec().matching_files > 0);
         assert!(benchmark_fixture_spec().retention_results > ResultLimit::TenThousand.get());
+    }
+
+    #[test]
+    fn search_metrics_record_streaming_worker_boundaries() {
+        let metrics = SearchMetrics::default();
+        assert_eq!(metrics.candidates_examined, 0);
+        assert_eq!(RunOptions::default().max_batch_paths(), RG_BATCH_MAX_PATHS);
     }
 
     #[test]
@@ -2802,82 +3040,56 @@ mod tests {
         )
     }
 
-    fn content_candidates(
-        root: &Path,
-        cheap_filter_first: bool,
-        request: Option<&CompiledSearch>,
-    ) -> Vec<PathBuf> {
-        let mut candidates = ignore::WalkBuilder::new(root)
-            .build()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-            .map(|entry| entry.into_path())
-            .filter(|path| {
-                if !cheap_filter_first {
-                    return true;
-                }
-                let request = request.expect("filtered candidates need a request");
-                let relative = path.strip_prefix(root).unwrap_or(path);
-                let basename = path.file_name().unwrap_or(path.as_os_str());
-                let Some(_) = request.matches_name(relative, basename) else {
-                    return false;
-                };
-                let Ok(metadata) = fs::symlink_metadata(path) else {
-                    return false;
-                };
-                request.matches_metadata(
-                    FileEntry::kind_from_metadata(&metadata),
-                    metadata.len(),
-                    metadata.modified().ok(),
-                )
-            })
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates
+    #[derive(Clone, Copy, Debug)]
+    struct StreamingSample {
+        timing: BenchmarkSample,
+        candidates_examined: usize,
+        candidates_passed: usize,
+        max_batch_paths: usize,
+        max_batch_bytes: usize,
+        subprocesses: usize,
+        matches: usize,
+        retained_results: usize,
     }
 
-    fn content_strategy_sample(
-        root: &Path,
-        request: &CompiledSearch,
-        cheap_filter_first: bool,
-        batch_size: usize,
-    ) -> (BenchmarkSample, usize, usize, usize, usize) {
+    fn streaming_content_sample(request: CompiledSearch, batch_size: usize) -> StreamingSample {
+        let metrics = Arc::new(std::sync::Mutex::new(SearchMetrics::default()));
         let cpu_started = process_cpu_us();
         let started = std::time::Instant::now();
-        let candidates = content_candidates(
-            root,
-            cheap_filter_first,
-            cheap_filter_first.then_some(request),
+        let running = spawn_with_options(
+            request,
+            RunOptions {
+                max_batch_paths_override: Some(batch_size),
+            },
+            Some(Arc::clone(&metrics)),
         );
-        let mut first = None;
-        let mut matches = 0;
-        let mut subprocesses = 0;
-        let mut peak_proxy_bytes = 0;
-        for batch in candidates.chunks(batch_size) {
-            peak_proxy_bytes = peak_proxy_bytes.max(
-                batch
-                    .iter()
-                    .map(|path| encoded_arg_bytes(path.as_os_str()))
-                    .sum(),
-            );
-            let verified = run_rg_batch(request, batch, &AtomicBool::new(false)).unwrap();
-            subprocesses += 1;
-            if !verified.is_empty() {
-                first.get_or_insert_with(|| started.elapsed().as_micros());
-                matches += verified.len();
+        let mut retained_results = 0;
+        loop {
+            match running.receiver.recv().unwrap() {
+                SearchUpdate::Match(_) => retained_results += 1,
+                SearchUpdate::Skipped(_) => {}
+                SearchUpdate::Finished(completion) => {
+                    assert_eq!(completion, SearchCompletion::default());
+                    break;
+                }
+                SearchUpdate::Failed(message) => panic!("search failed: {message}"),
             }
         }
-        (
-            BenchmarkSample {
+        let metrics = metrics.lock().unwrap();
+        StreamingSample {
+            timing: BenchmarkSample {
                 wall_us: started.elapsed().as_micros(),
                 cpu_us: process_cpu_us().saturating_sub(cpu_started),
-                first_us: first.expect("fixture must produce a content result"),
+                first_us: metrics.first_match_us.expect("fixture must match"),
             },
-            matches,
-            subprocesses,
-            candidates.len(),
-            peak_proxy_bytes,
-        )
+            candidates_examined: metrics.candidates_examined,
+            candidates_passed: metrics.candidates_passed_metadata,
+            max_batch_paths: metrics.max_batch_paths,
+            max_batch_bytes: metrics.max_batch_bytes,
+            subprocesses: metrics.rg_subprocesses,
+            matches: metrics.matches,
+            retained_results,
+        }
     }
 
     fn cancellation_sample(
@@ -2906,8 +3118,61 @@ mod tests {
         elapsed.as_micros()
     }
 
+    #[cfg(target_os = "linux")]
+    fn direct_child_pids() -> Vec<String> {
+        fs::read_to_string("/proc/self/task/1/children")
+            .or_else(|_| {
+                fs::read_to_string(format!("/proc/self/task/{}/children", std::process::id()))
+            })
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn real_rg_cancellation_sample(request: CompiledSearch) -> u128 {
+        let metrics = Arc::new(std::sync::Mutex::new(SearchMetrics::default()));
+        let running =
+            spawn_with_options(request, RunOptions::default(), Some(Arc::clone(&metrics)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while metrics.lock().unwrap().rg_subprocesses == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real rg did not launch"
+            );
+            thread::yield_now();
+        }
+        thread::park_timeout(Duration::from_millis(2));
+        #[cfg(target_os = "linux")]
+        let observed_children = direct_child_pids();
+        let started = std::time::Instant::now();
+        running.cancel.store(true, AtomicOrdering::Relaxed);
+        let completion = loop {
+            match running
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                SearchUpdate::Match(_) | SearchUpdate::Skipped(_) => {}
+                SearchUpdate::Failed(message) => panic!("real rg cancellation failed: {message}"),
+                SearchUpdate::Finished(completion) => break completion,
+            }
+        };
+        assert!(completion.cancelled);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2));
+        #[cfg(target_os = "linux")]
+        for pid in observed_children {
+            assert!(
+                !Path::new("/proc").join(pid).exists(),
+                "real rg child remains"
+            );
+        }
+        elapsed.as_micros()
+    }
+
     /// Manual baseline (2026-08-12, release build, nine warm-cache runs):
-    /// first result 1,077 us; completion 1,085 us on the 256-file fixture.
+    /// first result 1,074 us; completion 1,082 us on the 256-file fixture.
     /// Compare trends, not absolute timings, across machines and filesystems.
     #[test]
     #[ignore]
@@ -2927,9 +3192,11 @@ mod tests {
     }
 
     /// Manual baseline (2026-08-12, release, nine runs): filtered batch 128
-    /// completed end-to-end in 10,933 us with 128 candidates/one subprocess;
-    /// unpruned batch 128 took 20,951 us with 256 candidates/two subprocesses.
-    /// Executes every required bounded batch size on the identical fixture.
+    /// completed end-to-end in 11,593 us with 128 candidates/one subprocess;
+    /// unpruned batch 128 took 22,149 us with 256 candidates/two subprocesses.
+    /// Executes every required bounded batch size on the identical fixture;
+    /// each of nine rounds rotates the eight mode/batch cases to avoid a fixed
+    /// warm-cache ordering advantage.
     #[test]
     #[ignore]
     fn benchmark_search_content_comparisons() {
@@ -2947,65 +3214,121 @@ mod tests {
         draft.minimum_size = "1".into();
         draft.maximum_size = "64".into();
         draft.modified_after = "1970-01-01".into();
-        let request = draft.compile(true).unwrap();
-        let filtered = content_candidates(fixture.path(), true, Some(&request));
-        let unpruned = content_candidates(fixture.path(), false, None);
-        assert_eq!(filtered.len(), spec.rg_candidates);
-        assert_eq!(unpruned.len(), spec.total_files);
+        let filtered_request = draft.compile(true).unwrap();
+        let mut unpruned_draft =
+            SearchDraft::advanced(fixture.path().to_path_buf(), SearchScope::RecursiveHere);
+        unpruned_draft.content = "needle".into();
+        let unpruned_request = unpruned_draft.compile(true).unwrap();
+        let cases = [
+            ("filtered", filtered_request),
+            ("unpruned", unpruned_request),
+        ];
+        let mut all_samples = vec![vec![Vec::<StreamingSample>::new(); 4]; 2];
+        for round in 0..BENCHMARK_RUNS {
+            for offset in 0..8 {
+                let case_index = (round + offset) % 8;
+                let mode = case_index / 4;
+                let batch = case_index % 4;
+                let sample =
+                    streaming_content_sample(cases[mode].1.clone(), BENCHMARK_BATCH_SIZES[batch]);
+                all_samples[mode][batch].push(sample);
+            }
+        }
 
-        for (label, cheap_filter_first) in [("filtered", true), ("unpruned", false)] {
-            for batch_size in BENCHMARK_BATCH_SIZES {
-                let mut samples = Vec::with_capacity(BENCHMARK_RUNS);
-                let mut subprocesses = 0;
-                let mut candidate_count = 0;
-                let mut peak_proxy_bytes = 0;
-                for _ in 0..BENCHMARK_RUNS {
-                    let (sample, matches, spawned, candidates, peak_proxy) =
-                        content_strategy_sample(
-                            fixture.path(),
-                            &request,
-                            cheap_filter_first,
-                            batch_size,
-                        );
-                    assert_eq!(matches, spec.matching_files);
-                    subprocesses = spawned;
-                    candidate_count = candidates;
-                    peak_proxy_bytes = peak_proxy;
-                    samples.push(sample);
-                }
-                let sample = median_sample(&samples);
-                assert!(batch_size <= RG_BATCH_MAX_PATHS);
-                assert!(peak_proxy_bytes <= RG_BATCH_MAX_ARG_BYTES);
+        for (mode, (label, _)) in cases.iter().enumerate() {
+            for (batch, batch_size) in BENCHMARK_BATCH_SIZES.iter().copied().enumerate() {
+                let samples = &all_samples[mode][batch];
+                let sample = median_sample(
+                    &samples
+                        .iter()
+                        .map(|sample| sample.timing)
+                        .collect::<Vec<_>>(),
+                );
+                let representative = samples[BENCHMARK_RUNS / 2];
+                let expected_candidates = if *label == "filtered" {
+                    spec.rg_candidates
+                } else {
+                    spec.total_files
+                };
+                assert_eq!(representative.candidates_passed, expected_candidates);
+                assert_eq!(representative.matches, spec.matching_files);
+                assert_eq!(representative.retained_results, spec.matching_files);
+                assert!(representative.max_batch_paths <= batch_size);
+                assert!(representative.max_batch_bytes <= RG_BATCH_MAX_ARG_BYTES);
                 eprintln!(
-                    "PERF search_compare_end_to_end mode={label} batch_size={batch_size} wall_us={} cpu_us={} peak_proxy_bytes={peak_proxy_bytes} candidates={candidate_count} subprocesses={subprocesses} first_result_us={} completion_us={}",
+                    "PERF search_streaming mode={label} batch_size={batch_size} wall_us={} cpu_us={} candidates_examined={} candidates_passed={} max_batch_paths={} max_batch_bytes={} subprocesses={} matches={} retained_results={} retained_proxy_bytes={} first_result_us={} completion_us={}",
                     sample.wall_us,
                     sample.cpu_us,
+                    representative.candidates_examined,
+                    representative.candidates_passed,
+                    representative.max_batch_paths,
+                    representative.max_batch_bytes,
+                    representative.subprocesses,
+                    representative.matches,
+                    representative.retained_results,
+                    representative.retained_results * std::mem::size_of::<SearchHit>(),
                     sample.first_us,
                     sample.wall_us
                 );
-                if label == "filtered" && batch_size == RG_BATCH_MAX_PATHS {
+                if *label == "filtered" && batch_size == RG_BATCH_MAX_PATHS {
                     eprintln!(
                         "PERF search_filtered_candidates={} search_filtered_complete_us={}",
-                        candidate_count, sample.wall_us
+                        representative.candidates_passed, sample.wall_us
                     );
                     eprintln!(
                         "PERF search_content_batches={} search_content_complete_us={}",
-                        subprocesses, sample.wall_us
+                        representative.subprocesses, sample.wall_us
                     );
                 }
             }
         }
 
+        let unpruned = (0..spec.total_files)
+            .map(|index| {
+                fixture
+                    .path()
+                    .join(format!("group-{:02}", index % 16))
+                    .join(if index < spec.rg_candidates {
+                        format!("report-{index:04}.txt")
+                    } else {
+                        format!("other-{index:04}.txt")
+                    })
+            })
+            .collect::<Vec<_>>();
         for batch_size in BENCHMARK_BATCH_SIZES {
             let mut samples = Vec::with_capacity(BENCHMARK_RUNS);
             for _ in 0..BENCHMARK_RUNS {
-                samples.push(cancellation_sample(&request, &unpruned, batch_size));
+                samples.push(cancellation_sample(&cases[1].1, &unpruned, batch_size));
             }
             let cancel_us = median(samples);
             eprintln!(
                 "PERF search_cancel batch_size={batch_size} cancel_to_reaped_us={cancel_us} candidates_in_child={batch_size}"
             );
         }
+
+        let real_cancel_root = fixture.path().join("real-rg-cancel");
+        fs::create_dir(&real_cancel_root).unwrap();
+        let contents = vec![b'x'; 512 * 1024];
+        for index in 0..RG_BATCH_MAX_PATHS {
+            fs::write(
+                real_cancel_root.join(format!("large-{index:03}.txt")),
+                &contents,
+            )
+            .unwrap();
+        }
+        let mut real_cancel_draft =
+            SearchDraft::advanced(real_cancel_root, SearchScope::RecursiveHere);
+        real_cancel_draft.content = "needle-not-present".into();
+        let real_cancel_request = real_cancel_draft.compile(true).unwrap();
+        let mut real_cancel_samples = Vec::with_capacity(BENCHMARK_RUNS);
+        for _ in 0..BENCHMARK_RUNS {
+            real_cancel_samples.push(real_rg_cancellation_sample(real_cancel_request.clone()));
+        }
+        eprintln!(
+            "PERF search_cancel_real_rg batch_size=128 cancel_to_finished_us={} fixture_bytes={} child_cleanup=verified_where_observable",
+            median(real_cancel_samples),
+            contents.len() * RG_BATCH_MAX_PATHS
+        );
     }
 
     fn retention_sample(root: &Path, limit: usize) -> (BenchmarkSample, usize) {
@@ -3029,7 +3352,7 @@ mod tests {
 
     /// Manual baseline (2026-08-12, release, nine runs): production-bounded
     /// 1,000 results used a 24,000-byte retained-structure proxy and completed
-    /// in 4,274 us versus 480,000 bytes/81,829 us for real collect-all traversal.
+    /// in 4,268 us versus 480,000 bytes/82,722 us for real collect-all traversal.
     /// Contrasts the production 1,000 cap with a test-only collect-all limit.
     #[test]
     #[ignore]
