@@ -1,9 +1,14 @@
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::PermissionsExt,
+    io::{Read, Write},
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+};
+
+use rustix::{
+    process::{ioctl_tiocsctty, setsid},
+    pty::{grantpt, ioctl_tiocgptpeer, openpt, unlockpt, OpenptFlags},
 };
 
 fn write_executable(path: &Path, contents: &str) {
@@ -140,22 +145,27 @@ esac
         );
     }
 
+    fn make_package_install_chatty(&self) {
+        write_executable(
+            &self.fake_bin.join("sudo"),
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$MINFM_PACKAGE_LOG"
+i=0
+while [ "$i" -lt 10000 ]; do
+    printf 'simulated package-manager output line %s\n' "$i"
+    i=$((i + 1))
+done
+"#,
+        );
+    }
+
     fn run(&self, answer: Option<&str>) -> std::process::Output {
         let installer = format!("{}/install.sh", env!("CARGO_MANIFEST_DIR"));
-        let mut command = if answer.is_some() {
-            let mut command = Command::new("/usr/bin/script");
-            command.args([
-                "-qec",
-                &format!("/bin/sh '{}'", installer.replace('\'', "'\\''")),
-                "/dev/null",
-            ]);
-            command.stdin(Stdio::piped());
-            command
-        } else {
-            let mut command = Command::new("/bin/sh");
-            command.arg(installer);
-            command
-        };
+        if let Some(answer) = answer {
+            return self.run_interactive(&installer, answer);
+        }
+        let mut command = Command::new("/bin/sh");
+        command.arg(installer);
         command
             .env("HOME", &self.home)
             .env("PATH", &self.fake_bin)
@@ -165,16 +175,67 @@ esac
             .env_remove("XDG_CONFIG_HOME")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        if let Some(answer) = answer {
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(format!("{answer}\n").as_bytes())
-                .unwrap();
+        command.output().unwrap()
+    }
+
+    fn run_interactive(&self, installer: &str, answer: &str) -> std::process::Output {
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
+            .expect("open PTY master");
+        grantpt(&master).expect("grant PTY slave access");
+        unlockpt(&master).expect("unlock PTY slave");
+        let slave = ioctl_tiocgptpeer(
+            &master,
+            OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC,
+        )
+        .expect("open PTY slave");
+        let stdin = rustix::io::dup(&slave).expect("duplicate PTY stdin");
+        let stdout = rustix::io::dup(&slave).expect("duplicate PTY stdout");
+        let stderr = rustix::io::dup(&slave).expect("duplicate PTY stderr");
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg(installer)
+            .env("HOME", &self.home)
+            .env("PATH", &self.fake_bin)
+            .env("MINFM_VERSION", "v-test")
+            .env("MINFM_PACKAGE_LOG", &self.package_log)
+            .env_remove("XDG_BIN_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        unsafe {
+            command.pre_exec(move || {
+                setsid()?;
+                ioctl_tiocsctty(&slave)?;
+                Ok(())
+            });
         }
-        child.wait_with_output().unwrap()
+        let mut child = command.spawn().expect("spawn installer on PTY");
+        drop(command);
+        let mut master = fs::File::from(master);
+        master
+            .write_all(format!("{answer}\n").as_bytes())
+            .expect("answer installer prompt");
+        let (status, output) = std::thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                let mut output = Vec::new();
+                match master.read_to_end(&mut output) {
+                    Ok(_) => {}
+                    Err(error) if error.raw_os_error() == Some(5) => {}
+                    Err(error) => panic!("read installer PTY output: {error}"),
+                }
+                output
+            });
+            let status = child.wait().expect("wait for interactive installer");
+            let output = reader.join().expect("join installer PTY reader");
+            (status, output)
+        });
+        std::process::Output {
+            status,
+            stdout: output,
+            stderr: Vec::new(),
+        }
     }
 
     fn package_commands(&self) -> String {
@@ -373,4 +434,18 @@ fn failed_ripgrep_install_keeps_core_installation_available() {
     assert!(fixture.home.join(".local/bin/minfm").is_file());
     assert_eq!(fixture.package_commands(), "dnf install -y ripgrep\n");
     assert!(String::from_utf8_lossy(&output.stdout).contains("Content search remains unavailable"));
+}
+
+#[test]
+fn interactive_installer_drains_verbose_package_output_without_deadlocking() {
+    let fixture = InstallerFixture::new();
+    fixture.add_command("dnf");
+    fixture.make_package_install_chatty();
+
+    let output = fixture.run(Some("y"));
+
+    assert!(output.status.success());
+    assert!(fixture.home.join(".local/bin/minfm").is_file());
+    assert_eq!(fixture.package_commands(), "dnf install -y ripgrep\n");
+    assert!(output.stdout.len() > 256 * 1024);
 }
