@@ -1225,10 +1225,17 @@ impl App {
             return false;
         };
         let mut finished = None;
+        let mut disconnected = false;
         let mut changed = false;
+        let mut hits_changed = false;
         for _ in 0..UPDATES_PER_UI_TICK {
-            let Ok(update) = search.receiver.try_recv() else {
-                break;
+            let update = match search.receiver.try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             };
             changed = true;
             match update {
@@ -1238,12 +1245,13 @@ impl App {
                     };
                     view.results.push(hit);
                     self.search_matches = view.results.len();
+                    hits_changed = true;
                 }
-                SearchUpdate::Skipped => {
+                SearchUpdate::Skipped(count) => {
                     let Some(view) = &mut self.search_results else {
                         continue;
                     };
-                    view.skipped += 1;
+                    view.skipped += count;
                     self.search_skipped = view.skipped;
                 }
                 SearchUpdate::Finished(completion) => finished = Some(completion),
@@ -1257,7 +1265,7 @@ impl App {
             }
         }
         if let Some(view) = &mut self.search_results {
-            if changed {
+            if hits_changed {
                 let selected_path = view.selected_path.clone().or_else(|| {
                     view.results
                         .get(view.selected)
@@ -1274,20 +1282,30 @@ impl App {
                     .map(|hit| hit.entry.path.clone());
             }
         }
+        if disconnected && finished.is_none() {
+            self.search.take();
+            if self.search_cancelling {
+                self.restore_previous_search_results();
+                self.mode = self.search_return.mode();
+                self.search_cancelling = false;
+                self.set_notice("Search cancelled");
+            } else {
+                if let Some(view) = &mut self.search_results {
+                    view.incomplete = true;
+                }
+                self.mode = AppMode::SearchResults;
+                self.search_cancelling = false;
+                self.status = "Search worker stopped unexpectedly".into();
+            }
+            return true;
+        }
         let Some(completion) = finished else {
             return changed;
         };
         self.search.take();
         self.search_cancelling = false;
         if completion.cancelled {
-            if self.search_return == SearchReturn::Results {
-                self.search_results = self.previous_search_results.take();
-                self.search_matches = self
-                    .search_results
-                    .as_ref()
-                    .map_or(0, |view| view.results.len());
-                self.search_skipped = self.search_results.as_ref().map_or(0, |view| view.skipped);
-            }
+            self.restore_previous_search_results();
             self.mode = self.search_return.mode();
             self.set_notice("Search cancelled");
         } else {
@@ -1302,6 +1320,17 @@ impl App {
             }
         }
         true
+    }
+
+    fn restore_previous_search_results(&mut self) {
+        if let Some(previous) = self.previous_search_results.take() {
+            self.search_results = Some(previous);
+        }
+        self.search_matches = self
+            .search_results
+            .as_ref()
+            .map_or(0, |view| view.results.len());
+        self.search_skipped = self.search_results.as_ref().map_or(0, |view| view.skipped);
     }
 
     pub fn poll_update(&mut self) -> bool {
@@ -2614,7 +2643,7 @@ impl App {
             }
         };
         self.search_return = form.return_to;
-        if form.return_to == SearchReturn::Results {
+        if self.search_results.is_some() {
             self.previous_search_results = self.search_results.take();
         } else {
             self.previous_search_results = None;
@@ -7131,6 +7160,9 @@ mod tests {
     #[test]
     fn poll_search_is_bounded_to_updates_per_tick() {
         let temp = tempfile::tempdir().unwrap();
+        for index in 0..UPDATES_PER_UI_TICK + 20 {
+            std::fs::write(temp.path().join(format!("needle-{index}.txt")), b"").unwrap();
+        }
         let mut app = test_app(temp.path());
         let mut draft = SearchDraft::quick(temp.path().to_path_buf());
         draft.name = "needle".into();
@@ -7145,17 +7177,46 @@ mod tests {
             incomplete: false,
         });
         app.mode = AppMode::SearchProgress;
-        app.search = Some(search::running_search_for_test(
-            (0..UPDATES_PER_UI_TICK + 20)
-                .map(|_| SearchUpdate::Skipped)
-                .chain(std::iter::once(SearchUpdate::Finished(Default::default())))
-                .collect(),
-        ));
+        let updates = (0..UPDATES_PER_UI_TICK + 20)
+            .map(|index| {
+                SearchUpdate::Match(search::hit_for_test(
+                    temp.path().join(format!("needle-{index}.txt")),
+                    "needle",
+                ))
+            })
+            .chain(std::iter::once(SearchUpdate::Finished(Default::default())))
+            .collect();
+        app.search = Some(search::running_search_for_test(updates));
 
         assert!(app.poll_search());
-        assert_eq!(app.search_skipped, UPDATES_PER_UI_TICK);
+        assert_eq!(app.search_matches, UPDATES_PER_UI_TICK);
         assert!(app.search.is_some());
         assert!(matches!(app.mode, AppMode::SearchProgress));
+    }
+
+    #[test]
+    fn poll_search_adds_aggregate_skipped_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "needle".into();
+        app.search_results = Some(SearchView {
+            request: draft.compile(true).unwrap(),
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 2,
+            truncated: false,
+            incomplete: false,
+        });
+        app.search = Some(search::running_search_for_test(vec![
+            SearchUpdate::Skipped(7),
+            SearchUpdate::Finished(Default::default()),
+        ]));
+
+        assert!(app.poll_search());
+        assert_eq!(app.search_skipped, 9);
+        assert_eq!(app.search_results.as_ref().unwrap().skipped, 9);
     }
 
     #[test]
@@ -7224,6 +7285,111 @@ mod tests {
         assert_eq!(view.results[0].entry.path, better);
         assert_eq!(view.results[view.selected].entry.path, selected);
         assert_eq!(view.selected_path.as_deref(), Some(selected.as_path()));
+    }
+
+    #[test]
+    fn disconnected_search_preserves_hits_and_marks_results_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("needle.txt");
+        std::fs::write(&path, b"").unwrap();
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let hit = search::hit_for_test(path.clone(), "needle");
+        let mut app = test_app(temp.path());
+        app.search_results = Some(SearchView {
+            request,
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchProgress;
+        app.search = Some(search::running_search_for_test(vec![SearchUpdate::Match(
+            hit,
+        )]));
+
+        assert!(app.poll_search());
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search.is_none());
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.results[0].entry.path, path);
+        assert!(view.incomplete);
+        assert_eq!(app.status, "Search worker stopped unexpectedly");
+    }
+
+    #[test]
+    fn disconnected_cancelling_search_restores_prior_browser_results() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("needle.txt"), b"").unwrap();
+        let mut app = test_app(temp.path());
+        app.handle_key(key('/'));
+        for character in "needle".chars() {
+            app.handle_key(key(character));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_search(&mut app);
+        let old_paths = app
+            .search_results
+            .as_ref()
+            .unwrap()
+            .results
+            .iter()
+            .map(|hit| hit.entry.path.clone())
+            .collect::<Vec<_>>();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.search_cancelling = true;
+        app.search = Some(search::running_search_for_test(Vec::new()));
+
+        assert!(app.poll_search());
+        assert!(matches!(app.mode, AppMode::Browser));
+        assert!(app.search.is_none());
+        assert_eq!(
+            app.search_results
+                .as_ref()
+                .unwrap()
+                .results
+                .iter()
+                .map(|hit| hit.entry.path.clone())
+                .collect::<Vec<_>>(),
+            old_paths
+        );
+    }
+
+    #[test]
+    fn browser_search_cancellation_restores_existing_results() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("needle.txt"), b"").unwrap();
+        let mut app = test_app(temp.path());
+        app.handle_key(key('/'));
+        for character in "needle".chars() {
+            app.handle_key(key(character));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_search(&mut app);
+        let old_count = app.search_results.as_ref().unwrap().results.len();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.search = Some(search::running_search_for_test(vec![
+            SearchUpdate::Finished(search::SearchCompletion {
+                cancelled: true,
+                ..Default::default()
+            }),
+        ]));
+
+        assert!(app.poll_search());
+        assert!(matches!(app.mode, AppMode::Browser));
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results.len(),
+            old_count
+        );
     }
 
     #[test]

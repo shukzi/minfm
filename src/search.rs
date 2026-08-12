@@ -445,7 +445,7 @@ fn cleanup_rg_process_group(
 #[derive(Debug)]
 pub enum SearchUpdate {
     Match(SearchHit),
-    Skipped,
+    Skipped(usize),
     Finished(SearchCompletion),
     Failed(String),
 }
@@ -539,8 +539,8 @@ pub(crate) fn running_search_for_test(updates: Vec<SearchUpdate>) -> RunningSear
     let (control_sender, control_receiver) = mpsc::channel();
     for update in updates {
         match update {
-            SearchUpdate::Match(_) | SearchUpdate::Skipped => match_sender.send(update).unwrap(),
-            SearchUpdate::Finished(_) | SearchUpdate::Failed(_) => {
+            SearchUpdate::Match(_) => match_sender.send(update).unwrap(),
+            SearchUpdate::Skipped(_) | SearchUpdate::Finished(_) | SearchUpdate::Failed(_) => {
                 control_sender.send(update).unwrap()
             }
         }
@@ -729,7 +729,7 @@ fn run(
         }
     }
     if skipped > 0 {
-        let _ = control_sender.send(SearchUpdate::Skipped);
+        let _ = control_sender.send(SearchUpdate::Skipped(skipped));
     }
     if let Some(RgError::Failed(message)) = &rg_error {
         let _ = control_sender.send(SearchUpdate::Failed(message.clone()));
@@ -1485,7 +1485,7 @@ mod tests {
         loop {
             match running.receiver.recv().unwrap() {
                 SearchUpdate::Match(hit) => hits.push(hit),
-                SearchUpdate::Skipped => {}
+                SearchUpdate::Skipped(_) => {}
                 SearchUpdate::Finished(completion) => return (hits, completion),
                 SearchUpdate::Failed(message) => panic!("search failed: {message}"),
             }
@@ -1977,7 +1977,7 @@ mod tests {
         while let Ok(update) = running.receiver.recv() {
             match update {
                 SearchUpdate::Match(_) => matches += 1,
-                SearchUpdate::Skipped => {}
+                SearchUpdate::Skipped(_) => {}
                 SearchUpdate::Failed(message) => failure = Some(message),
                 SearchUpdate::Finished(value) => completion = Some(value),
             }
@@ -2357,7 +2357,7 @@ mod tests {
             {
                 SearchUpdate::Finished(completion) => break completion,
                 SearchUpdate::Failed(message) => panic!("search failed: {message}"),
-                SearchUpdate::Match(_) | SearchUpdate::Skipped => {}
+                SearchUpdate::Match(_) | SearchUpdate::Skipped(_) => {}
             }
         };
         assert!(completion.cancelled);
@@ -2402,7 +2402,7 @@ mod tests {
         let completion = loop {
             match receiver.try_recv() {
                 Ok(SearchUpdate::Match(_)) => matches += 1,
-                Ok(SearchUpdate::Skipped) => {}
+                Ok(SearchUpdate::Skipped(_)) => {}
                 Ok(SearchUpdate::Finished(completion)) => break completion,
                 Ok(SearchUpdate::Failed(message)) => panic!("search failed: {message}"),
                 Err(mpsc::TryRecvError::Empty) => thread::yield_now(),
@@ -2444,7 +2444,7 @@ mod tests {
                 }))
                 .unwrap();
         }
-        control_sender.send(SearchUpdate::Skipped).unwrap();
+        control_sender.send(SearchUpdate::Skipped(7)).unwrap();
         control_sender
             .send(SearchUpdate::Finished(SearchCompletion {
                 truncated: true,
@@ -2458,7 +2458,7 @@ mod tests {
         for _ in 0..UPDATE_QUEUE_CAPACITY {
             assert!(matches!(receiver.try_recv(), Ok(SearchUpdate::Match(_))));
         }
-        assert!(matches!(receiver.try_recv(), Ok(SearchUpdate::Skipped)));
+        assert!(matches!(receiver.try_recv(), Ok(SearchUpdate::Skipped(7))));
         assert!(matches!(
             receiver.try_recv(),
             Ok(SearchUpdate::Finished(SearchCompletion {
@@ -2494,7 +2494,7 @@ mod tests {
                 .unwrap()
             {
                 SearchUpdate::Match(_) => matches += 1,
-                SearchUpdate::Skipped => {}
+                SearchUpdate::Skipped(_) => {}
                 SearchUpdate::Finished(completion) => break completion,
                 SearchUpdate::Failed(message) => panic!("search failed: {message}"),
             }
