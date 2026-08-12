@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.7.0
+
 ### Added
 
 - Advanced search across the current directory, recursively from the current

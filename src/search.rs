@@ -2252,11 +2252,15 @@ mod tests {
 
     #[test]
     fn rg_cancellation_race_treats_esrch_after_reap_as_cancelled() {
-        let fake = FakeRg::from_script("#!/bin/sh\nexit 0\n");
         let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
         draft.content = "needle".into();
         let request = draft.compile(true).unwrap();
-        let mut command = fake.command.clone();
+        let mut command = RgCommand {
+            program: PathBuf::from("/bin/true"),
+            inject_supervision_error: false,
+            inject_cleanup_esrch: false,
+            inject_cancel_after_spawn: false,
+        };
         command.inject_cleanup_esrch = true;
         command.inject_cancel_after_spawn = true;
 
