@@ -159,8 +159,12 @@ pub struct RunningArchive {
 }
 
 pub fn spawn(request: ArchiveRequest) -> RunningArchive {
-    let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
     let cancel = Arc::new(AtomicBool::new(false));
+    spawn_with_cancel(request, cancel)
+}
+
+fn spawn_with_cancel(request: ArchiveRequest, cancel: Arc<AtomicBool>) -> RunningArchive {
+    let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
     let worker_cancel = Arc::clone(&cancel);
     thread::spawn(move || {
         let result = run(request, &sender, &worker_cancel);
@@ -1714,27 +1718,30 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_cancellation_cleans_partial_archive_files() {
+    fn asynchronous_precancellation_returns_cleanly_without_output() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("large.bin");
         let file = File::create(&source).unwrap();
         file.set_len(16 * 1024 * 1024).unwrap();
         let destination = temp.path().join("cancelled.tar.gz");
-        let running = spawn(ArchiveRequest::Create {
-            sources: vec![source],
-            destination: destination.clone(),
-            format: ArchiveFormat::TarGz,
-        });
+        let cancel = Arc::new(AtomicBool::new(true));
+        let running = spawn_with_cancel(
+            ArchiveRequest::Create {
+                sources: vec![source],
+                destination: destination.clone(),
+                format: ArchiveFormat::TarGz,
+            },
+            cancel,
+        );
         let started = running
             .receiver
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         assert!(matches!(started, ArchiveUpdate::Started { .. }));
-        running.cancel.store(true, Ordering::Relaxed);
         let result = loop {
             match running
                 .receiver
-                .recv_timeout(std::time::Duration::from_secs(15))
+                .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap()
             {
                 ArchiveUpdate::Finished(result) => break result,
