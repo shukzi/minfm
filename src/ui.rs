@@ -1737,7 +1737,7 @@ fn search_help_text(form: &SearchForm) -> &'static str {
                 "Searches the current directory and all subfolders. Symbolic links are listed but never followed."
             }
             SearchScope::Filesystem => {
-                "Searches the entire filesystem from /. Symbolic links are listed but never followed."
+                "Searches recursively from the shown root and all subfolders. Virtual system trees /proc, /sys, /dev, and most of /run are skipped. Symbolic links are listed but never followed."
             }
         },
         (crate::app::SearchSection::Match, 0) => match form.draft.name_mode {
@@ -4185,7 +4185,11 @@ mod performance_tests {
         assert_ne!(recursive, filesystem);
         assert!(current.contains("current directory only"));
         assert!(recursive.contains("all subfolders"));
-        assert!(filesystem.contains("entire filesystem"));
+        assert!(filesystem.contains("shown root and all subfolders"));
+        for skipped_tree in ["/proc", "/sys", "/dev", "/run"] {
+            assert!(filesystem.contains(skipped_tree));
+        }
+        assert!(filesystem.contains("never followed"));
 
         form.section = crate::app::SearchSection::Match;
         form.field = 0;
