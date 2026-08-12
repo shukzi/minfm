@@ -263,7 +263,10 @@ def quick_and_fuzzy():
     root=fixture("quick")
     s=Session(root,name="quick")
     try:
-        s.send("/"); s.wait_for("Search")
+        s.send("/"); s.wait_for("Search current directory")
+        s.assert_has("Enter a value:")
+        s.assert_has("│> │")
+        s.assert_has("F advanced")
         s.send("report"); s.send(ENTER, .4); s.wait_for(RESULTS)
         s.assert_has("report-final.txt")
         s.send(ESC); s.send("/"); s.send("rpeort"); s.send(ENTER,.4); s.wait_for(RESULTS)
@@ -295,7 +298,7 @@ def selector_help_size_units_and_dialog_appearance():
     (root/"large.bin").write_bytes(b"x" * (24 * 1024))
     s=Session(root,name="selector-help")
     try:
-        quick_rect = centered_rect(s.width, s.height, 72, 11)
+        quick_rect = centered_rect(s.width, s.height, 72, 9)
         quick_surroundings = surrounding_cells(s.screen, quick_rect)
         s.send("/"); s.wait_for("Search")
         assert_dialog_preserves_surroundings(s, quick_surroundings, quick_rect)
