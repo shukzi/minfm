@@ -533,6 +533,34 @@ pub fn spawn(request: CompiledSearch) -> RunningSearch {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn running_search_for_test(updates: Vec<SearchUpdate>) -> RunningSearch {
+    let (match_sender, match_receiver) = mpsc::channel();
+    let (control_sender, control_receiver) = mpsc::channel();
+    for update in updates {
+        match update {
+            SearchUpdate::Match(_) | SearchUpdate::Skipped => match_sender.send(update).unwrap(),
+            SearchUpdate::Finished(_) | SearchUpdate::Failed(_) => {
+                control_sender.send(update).unwrap()
+            }
+        }
+    }
+    drop(match_sender);
+    drop(control_sender);
+    RunningSearch {
+        receiver: SearchReceiver::new(match_receiver, control_receiver),
+        cancel: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hit_for_test(path: PathBuf, query: &str) -> SearchHit {
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    let entry = FileEntry::from_path_metadata(path, metadata).unwrap();
+    let rank = smart_rank(&case_fold(query), &case_fold(&entry.name)).unwrap();
+    SearchHit { entry, rank }
+}
+
 fn run(
     request: CompiledSearch,
     match_sender: SyncSender<SearchUpdate>,
@@ -948,7 +976,7 @@ fn compare_basenames(left: &Path, right: &Path) -> Ordering {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum NameMatcher {
     Any,
     Smart(String),
@@ -956,7 +984,7 @@ enum NameMatcher {
     Regex(Regex),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledSearch {
     root: PathBuf,
     scope: SearchScope,
@@ -2494,6 +2522,34 @@ mod tests {
         assert!(hits.is_empty());
         assert_eq!(completion, SearchCompletion::default());
         assert_eq!(constructions.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cloned_compiled_search_preserves_request_and_matching() {
+        let root = PathBuf::from("/tmp/search-clone");
+        let mut draft = SearchDraft::advanced(root.clone(), SearchScope::RecursiveHere);
+        draft.name = "Report".into();
+        draft.types = EntryKinds::FILES;
+        draft.minimum_size = "10".into();
+        draft.result_limit = ResultLimit::TenThousand;
+        let request = draft.compile(true).unwrap();
+        let cloned = request.clone();
+
+        assert_eq!(cloned.root(), root);
+        assert_eq!(cloned.scope(), SearchScope::RecursiveHere);
+        assert_eq!(cloned.result_limit(), ResultLimit::TenThousand);
+        assert_eq!(
+            cloned.matches_name(Path::new("Report.txt"), OsStr::new("Report.txt")),
+            request.matches_name(Path::new("Report.txt"), OsStr::new("Report.txt"))
+        );
+        assert_eq!(
+            cloned.matches_metadata(EntryKind::File, 10, None),
+            request.matches_metadata(EntryKind::File, 10, None)
+        );
+        assert_eq!(
+            cloned.matches_metadata(EntryKind::Directory, 10, None),
+            request.matches_metadata(EntryKind::Directory, 10, None)
+        );
     }
 
     #[test]
