@@ -28,6 +28,7 @@ use crate::entry::{EntryKind, FileEntry};
 const UPDATE_QUEUE_CAPACITY: usize = 256;
 const RG_BATCH_MAX_PATHS: usize = 128;
 const RG_BATCH_MAX_ARG_BYTES: usize = 256 * 1024;
+const RG_STDERR_MAX_BYTES: usize = 64 * 1024;
 const RG_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const UPDATES_PER_UI_TICK: usize = 512;
 
@@ -118,6 +119,10 @@ struct RgCommand {
     program: PathBuf,
     #[cfg(test)]
     inject_supervision_error: bool,
+    #[cfg(test)]
+    inject_cleanup_esrch: bool,
+    #[cfg(test)]
+    inject_cancel_after_spawn: bool,
 }
 
 impl Default for RgCommand {
@@ -126,6 +131,10 @@ impl Default for RgCommand {
             program: PathBuf::from("rg"),
             #[cfg(test)]
             inject_supervision_error: false,
+            #[cfg(test)]
+            inject_cleanup_esrch: false,
+            #[cfg(test)]
+            inject_cancel_after_spawn: false,
         }
     }
 }
@@ -156,6 +165,8 @@ fn rg_command(request: &CompiledSearch) -> RgCommand {
         .map(|program| RgCommand {
             program: program.clone(),
             inject_supervision_error: false,
+            inject_cleanup_esrch: false,
+            inject_cancel_after_spawn: false,
         })
         .unwrap_or_default()
 }
@@ -186,6 +197,18 @@ fn run_rg_batch_with_command(
             RG_BATCH_MAX_ARG_BYTES
         )));
     }
+    let stdout_file = tempfile::NamedTempFile::new().map_err(|error| {
+        RgError::Failed(format!("could not create ripgrep stdout file: {error}"))
+    })?;
+    let stderr_file = tempfile::NamedTempFile::new().map_err(|error| {
+        RgError::Failed(format!("could not create ripgrep stderr file: {error}"))
+    })?;
+    let stdout_writer = stdout_file
+        .reopen()
+        .map_err(|error| RgError::Failed(format!("could not open ripgrep stdout file: {error}")))?;
+    let stderr_writer = stderr_file
+        .reopen()
+        .map_err(|error| RgError::Failed(format!("could not open ripgrep stderr file: {error}")))?;
     let mut process = Command::new(&command.program);
     if request.content_mode() == ContentMode::Literal {
         process.arg("--fixed-strings");
@@ -195,35 +218,27 @@ fn run_rg_batch_with_command(
         .arg(request.content())
         .arg("--")
         .args(paths.iter().map(|path| path.as_os_str()))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_writer))
+        .stderr(Stdio::from(stderr_writer))
         .process_group(0);
     let mut child = process
         .spawn()
         .map_err(|error| RgError::Failed(error.to_string()))?;
-    let stdout = child.stdout.take().expect("piped ripgrep stdout");
-    let stderr = child.stderr.take().expect("piped ripgrep stderr");
 
-    let stdout_reader = thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(stderr));
     #[cfg(test)]
     let mut supervision_polls = 0_usize;
     let status = loop {
-        if cancel.load(AtomicOrdering::Relaxed) {
-            cleanup_rg_process_group(&mut child).map_err(|error| {
-                RgError::Failed(format!("ripgrep cancellation cleanup failed: {error}"))
-            })?;
-            join_reader(stdout_reader, "stdout")?;
-            join_reader(stderr_reader, "stderr")?;
+        if cancel.load(AtomicOrdering::Relaxed) || inject_cancel_after_spawn(command) {
+            cleanup_rg_process_group(&mut child, cleanup_signal_override(command)).map_err(
+                |error| RgError::Failed(format!("ripgrep cancellation cleanup failed: {error}")),
+            )?;
             return Err(RgError::Cancelled);
         }
         #[cfg(test)]
         if command.inject_supervision_error && supervision_polls == 10 {
-            cleanup_rg_process_group(&mut child).map_err(|error| {
-                RgError::Failed(format!("ripgrep supervision cleanup failed: {error}"))
-            })?;
-            join_reader(stdout_reader, "stdout")?;
-            join_reader(stderr_reader, "stderr")?;
+            cleanup_rg_process_group(&mut child, cleanup_signal_override(command)).map_err(
+                |error| RgError::Failed(format!("ripgrep supervision cleanup failed: {error}")),
+            )?;
             return Err(RgError::Failed("injected supervision failure".into()));
         }
         match child.try_wait() {
@@ -236,21 +251,26 @@ fn run_rg_batch_with_command(
                 thread::park_timeout(Duration::from_millis(10));
             }
             Err(error) => {
-                cleanup_rg_process_group(&mut child).map_err(|cleanup| {
-                    RgError::Failed(format!(
-                        "ripgrep supervision failed: {error}; cleanup failed: {cleanup}"
-                    ))
-                })?;
-                join_reader(stdout_reader, "stdout")?;
-                join_reader(stderr_reader, "stderr")?;
+                cleanup_rg_process_group(&mut child, cleanup_signal_override(command)).map_err(
+                    |cleanup| {
+                        RgError::Failed(format!(
+                            "ripgrep supervision failed: {error}; cleanup failed: {cleanup}"
+                        ))
+                    },
+                )?;
                 return Err(RgError::Failed(format!(
                     "ripgrep supervision failed: {error}"
                 )));
             }
         }
     };
-    let stdout = join_reader(stdout_reader, "stdout")?;
-    let stderr = join_reader(stderr_reader, "stderr")?;
+    let stdout_cap = paths.iter().try_fold(0_usize, |bytes, path| {
+        bytes.checked_add(encoded_arg_bytes(path.as_os_str()))
+    });
+    let stdout_cap =
+        stdout_cap.ok_or_else(|| RgError::Failed("ripgrep stdout limit overflow".into()))?;
+    let stdout = read_bounded_output(stdout_file, stdout_cap, "stdout")?;
+    let stderr = read_bounded_output(stderr_file, RG_STDERR_MAX_BYTES, "stderr")?;
     match status.code() {
         Some(0) => {
             let candidates: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
@@ -268,24 +288,54 @@ fn run_rg_batch_with_command(
     }
 }
 
-fn read_pipe(mut pipe: impl Read) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = pipe.read_to_end(&mut bytes);
-    bytes
+fn read_bounded_output(
+    file: tempfile::NamedTempFile,
+    limit: usize,
+    stream: &str,
+) -> Result<Vec<u8>, RgError> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024).saturating_add(1));
+    file.as_file()
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| RgError::Failed(format!("could not read ripgrep {stream}: {error}")))?;
+    if bytes.len() > limit {
+        return Err(RgError::Failed(format!(
+            "ripgrep {stream} exceeds the {limit} byte output limit"
+        )));
+    }
+    Ok(bytes)
 }
 
-fn join_reader(reader: thread::JoinHandle<Vec<u8>>, stream: &str) -> Result<Vec<u8>, RgError> {
-    reader
-        .join()
-        .map_err(|_| RgError::Failed(format!("ripgrep {stream} reader panicked")))
+#[cfg(test)]
+fn cleanup_signal_override(command: &RgCommand) -> Option<rustix::io::Errno> {
+    command
+        .inject_cleanup_esrch
+        .then_some(rustix::io::Errno::SRCH)
 }
 
-fn cleanup_rg_process_group(child: &mut std::process::Child) -> Result<(), String> {
+#[cfg(test)]
+fn inject_cancel_after_spawn(command: &RgCommand) -> bool {
+    command.inject_cancel_after_spawn
+}
+
+#[cfg(not(test))]
+fn inject_cancel_after_spawn(_command: &RgCommand) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn cleanup_signal_override(_command: &RgCommand) -> Option<rustix::io::Errno> {
+    None
+}
+
+fn cleanup_rg_process_group(
+    child: &mut std::process::Child,
+    signal_override: Option<rustix::io::Errno>,
+) -> Result<(), String> {
     let pid = rustix::process::Pid::from_raw(child.id() as i32)
         .ok_or_else(|| "invalid child process id".to_owned())?;
-    let signal_error = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
-        .err()
-        .map(|error| error.to_string());
+    let signal_error = signal_override
+        .or_else(|| rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).err());
     if signal_error.is_some() {
         let _ = child.kill();
     }
@@ -293,20 +343,24 @@ fn cleanup_rg_process_group(child: &mut std::process::Child) -> Result<(), Strin
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
-                return signal_error.map_or(Ok(()), |error| {
-                    Err(format!("could not signal ripgrep process group: {error}"))
-                });
+                return match signal_error {
+                    None | Some(rustix::io::Errno::SRCH) => Ok(()),
+                    Some(error) => Err(format!("could not signal ripgrep process group: {error}")),
+                };
             }
             Ok(None) if std::time::Instant::now() < deadline => {
                 thread::park_timeout(Duration::from_millis(10));
             }
             Ok(None) => {
-                return Err(signal_error.unwrap_or_else(|| {
-                    format!(
-                        "child did not exit within {} ms",
-                        RG_CLEANUP_TIMEOUT.as_millis()
-                    )
-                }));
+                return Err(signal_error.map_or_else(
+                    || {
+                        format!(
+                            "child did not exit within {} ms",
+                            RG_CLEANUP_TIMEOUT.as_millis()
+                        )
+                    },
+                    |error| error.to_string(),
+                ));
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -1209,6 +1263,8 @@ mod tests {
                 command: RgCommand {
                     program,
                     inject_supervision_error: false,
+                    inject_cleanup_esrch: false,
+                    inject_cancel_after_spawn: false,
                 },
                 capture,
             }
@@ -1231,6 +1287,8 @@ mod tests {
                 command: RgCommand {
                     program,
                     inject_supervision_error: false,
+                    inject_cleanup_esrch: false,
+                    inject_cancel_after_spawn: false,
                 },
                 capture,
             }
@@ -1536,6 +1594,118 @@ mod tests {
         assert!(matches!(result, Err(RgError::Failed(message)) if message.contains("supervision")));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_processes_gone(&pids);
+    }
+
+    #[test]
+    fn rg_normal_completion_does_not_wait_for_escaped_output_holder() {
+        if Command::new("setsid").arg("--version").output().is_err() {
+            return;
+        }
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\nsetsid sh -c 'sleep 1' &\necho $! > '$CAPTURE'\nexit 1\n",
+        );
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let started = std::time::Instant::now();
+
+        let result = run_rg_batch_with_command(
+            &request,
+            &[PathBuf::from("/tmp/candidate")],
+            &AtomicBool::new(false),
+            &fake.command,
+        );
+
+        assert!(matches!(result, Ok(matches) if matches.is_empty()));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn rg_cancellation_does_not_wait_for_escaped_output_holder() {
+        if Command::new("setsid").arg("--version").output().is_err() {
+            return;
+        }
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\nsetsid sh -c 'printf escaped-output; sleep 1' &\necho $! > '$CAPTURE'\nwait\n",
+        );
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let command = fake.command.clone();
+        let worker = thread::spawn(move || {
+            run_rg_batch_with_command(
+                &request,
+                &[PathBuf::from("/tmp/candidate")],
+                &worker_cancel,
+                &command,
+            )
+        });
+        wait_for_pids(&fake.capture, 1);
+        let started = std::time::Instant::now();
+        cancel.store(true, AtomicOrdering::Relaxed);
+
+        assert!(matches!(worker.join().unwrap(), Err(RgError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn rg_cancellation_race_treats_esrch_after_reap_as_cancelled() {
+        let fake = FakeRg::from_script("#!/bin/sh\nexit 0\n");
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let mut command = fake.command.clone();
+        command.inject_cleanup_esrch = true;
+        command.inject_cancel_after_spawn = true;
+
+        let result = run_rg_batch_with_command(
+            &request,
+            &[PathBuf::from("/tmp/candidate")],
+            &AtomicBool::new(false),
+            &command,
+        );
+
+        assert!(matches!(result, Err(RgError::Cancelled)));
+    }
+
+    #[test]
+    fn rg_rejects_stdout_larger_than_the_current_batch_can_encode() {
+        let fake = FakeRg::from_script("#!/bin/sh\nhead -c 70000 /dev/zero\nexit 0\n");
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+
+        let result = run_rg_batch_with_command(
+            &request,
+            &[PathBuf::from("/tmp/candidate")],
+            &AtomicBool::new(false),
+            &fake.command,
+        );
+
+        assert!(
+            matches!(result, Err(RgError::Failed(message)) if message.contains("stdout") && message.contains("limit"))
+        );
+    }
+
+    #[test]
+    fn rg_rejects_stderr_larger_than_the_diagnostic_cap() {
+        let fake = FakeRg::from_script("#!/bin/sh\nhead -c 70000 /dev/zero >&2\nexit 2\n");
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+
+        let result = run_rg_batch_with_command(
+            &request,
+            &[PathBuf::from("/tmp/candidate")],
+            &AtomicBool::new(false),
+            &fake.command,
+        );
+
+        assert!(
+            matches!(result, Err(RgError::Failed(message)) if message.contains("stderr") && message.contains("limit"))
+        );
     }
 
     #[test]
