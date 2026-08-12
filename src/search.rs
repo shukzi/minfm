@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
     thread,
@@ -39,19 +39,87 @@ pub struct SearchCompletion {
 }
 
 pub struct RunningSearch {
-    pub receiver: Receiver<SearchUpdate>,
+    pub receiver: SearchReceiver,
     pub cancel: Arc<AtomicBool>,
 }
 
-pub fn spawn(request: CompiledSearch) -> RunningSearch {
-    let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let worker_cancel = Arc::clone(&cancel);
-    thread::spawn(move || run(request, sender, worker_cancel));
-    RunningSearch { receiver, cancel }
+pub struct SearchReceiver {
+    matches: Receiver<SearchUpdate>,
+    control: Receiver<SearchUpdate>,
 }
 
-fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<AtomicBool>) {
+impl SearchReceiver {
+    fn new(matches: Receiver<SearchUpdate>, control: Receiver<SearchUpdate>) -> Self {
+        Self { matches, control }
+    }
+
+    pub fn try_recv(&self) -> Result<SearchUpdate, TryRecvError> {
+        match self.matches.try_recv() {
+            Ok(update) => return Ok(update),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                return self.control.try_recv();
+            }
+        }
+        match self.control.try_recv() {
+            Ok(update) => Ok(update),
+            Err(TryRecvError::Empty) => Err(TryRecvError::Empty),
+            Err(TryRecvError::Disconnected) => match self.matches.try_recv() {
+                Ok(update) => Ok(update),
+                Err(TryRecvError::Empty) => Err(TryRecvError::Empty),
+                Err(TryRecvError::Disconnected) => Err(TryRecvError::Disconnected),
+            },
+        }
+    }
+
+    pub fn recv(&self) -> Result<SearchUpdate, mpsc::RecvError> {
+        loop {
+            match self.try_recv() {
+                Ok(update) => return Ok(update),
+                Err(TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+                Err(TryRecvError::Empty) => thread::park_timeout(Duration::from_millis(1)),
+            }
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<SearchUpdate, mpsc::RecvTimeoutError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.try_recv() {
+                Ok(update) => return Ok(update),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(mpsc::RecvTimeoutError::Disconnected);
+                }
+                Err(TryRecvError::Empty) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Err(mpsc::RecvTimeoutError::Timeout);
+                    }
+                    thread::park_timeout((deadline - now).min(Duration::from_millis(1)));
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn(request: CompiledSearch) -> RunningSearch {
+    let (match_sender, match_receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+    let (control_sender, control_receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    thread::spawn(move || run(request, match_sender, control_sender, worker_cancel));
+    RunningSearch {
+        receiver: SearchReceiver::new(match_receiver, control_receiver),
+        cancel,
+    }
+}
+
+fn run(
+    request: CompiledSearch,
+    match_sender: SyncSender<SearchUpdate>,
+    control_sender: Sender<SearchUpdate>,
+    cancel: Arc<AtomicBool>,
+) {
     let mut builder = ignore::WalkBuilder::new(request.root());
     builder.follow_links(false);
     if request.scope() == SearchScope::CurrentDirectory {
@@ -130,7 +198,11 @@ fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<At
         if let Some(counter) = &request.send_attempt_counter {
             counter.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        if !send_match_cancellable(&sender, SearchHit { entry, rank }, Arc::as_ref(&cancel)) {
+        if !send_match_cancellable(
+            &match_sender,
+            SearchHit { entry, rank },
+            Arc::as_ref(&cancel),
+        ) {
             return;
         }
         matches += 1;
@@ -140,9 +212,9 @@ fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<At
         }
     }
     if skipped > 0 {
-        let _ = sender.try_send(SearchUpdate::Skipped);
+        let _ = control_sender.send(SearchUpdate::Skipped);
     }
-    let _ = sender.try_send(SearchUpdate::Finished(SearchCompletion {
+    let _ = control_sender.send(SearchUpdate::Finished(SearchCompletion {
         cancelled: cancel.load(AtomicOrdering::Relaxed),
         truncated,
         incomplete: skipped > 0,
@@ -1100,11 +1172,20 @@ mod tests {
     fn cancellation_pre_set_before_traversal_emits_no_matches() {
         let fixture = TraversalFixture::new();
         let request = traversal_request(fixture.root(), SearchScope::RecursiveHere, true);
-        let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let (match_sender, match_receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let (control_sender, control_receiver) = mpsc::channel();
+        let receiver = SearchReceiver::new(match_receiver, control_receiver);
         let cancel = Arc::new(AtomicBool::new(true));
 
-        run(request, sender, cancel);
-        let updates: Vec<_> = receiver.into_iter().collect();
+        run(request, match_sender, control_sender, cancel);
+        let mut updates = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(TryRecvError::Empty) => thread::yield_now(),
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
 
         assert!(updates
             .iter()
@@ -1162,12 +1243,14 @@ mod tests {
         let mut request = draft.compile(true).unwrap();
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         request.send_attempt_counter = Some(Arc::clone(&attempts));
-        let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let (sender, match_receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let (control_sender, control_receiver) = mpsc::channel();
+        let receiver = SearchReceiver::new(match_receiver, control_receiver);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (done_sender, done_receiver) = mpsc::channel();
         thread::spawn(move || {
-            run(request, sender, worker_cancel);
+            run(request, sender, control_sender, worker_cancel);
             done_sender.send(()).unwrap();
         });
 
@@ -1182,11 +1265,111 @@ mod tests {
         cancel.store(true, AtomicOrdering::Relaxed);
 
         done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        let updates: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(updates.len(), UPDATE_QUEUE_CAPACITY);
-        assert!(updates
-            .iter()
-            .all(|update| matches!(update, SearchUpdate::Match(_))));
+        let mut matches = 0;
+        let completion = loop {
+            match receiver.try_recv() {
+                Ok(SearchUpdate::Match(_)) => matches += 1,
+                Ok(SearchUpdate::Skipped) => {}
+                Ok(SearchUpdate::Finished(completion)) => break completion,
+                Ok(SearchUpdate::Failed(message)) => panic!("search failed: {message}"),
+                Err(mpsc::TryRecvError::Empty) => thread::yield_now(),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("receiver disconnected before completion")
+                }
+            }
+        };
+        assert_eq!(matches, UPDATE_QUEUE_CAPACITY);
+        assert!(completion.cancelled);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn saturated_receiver_drains_matches_then_aggregate_skip_and_finished() {
+        let (match_sender, match_receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let (control_sender, control_receiver) = mpsc::channel();
+        let receiver = SearchReceiver::new(match_receiver, control_receiver);
+        for index in 0..UPDATE_QUEUE_CAPACITY {
+            let path = PathBuf::from(format!("item-{index}.txt"));
+            match_sender
+                .send(SearchUpdate::Match(SearchHit {
+                    entry: FileEntry {
+                        name: path.to_string_lossy().into_owned(),
+                        path,
+                        kind: EntryKind::File,
+                        size: 0,
+                        mode: 0,
+                        modified: None,
+                        selected: false,
+                    },
+                    rank: MatchRank {
+                        tier: 0,
+                        penalty: 0,
+                    },
+                }))
+                .unwrap();
+        }
+        control_sender.send(SearchUpdate::Skipped).unwrap();
+        control_sender
+            .send(SearchUpdate::Finished(SearchCompletion {
+                truncated: true,
+                incomplete: true,
+                ..SearchCompletion::default()
+            }))
+            .unwrap();
+        drop(match_sender);
+        drop(control_sender);
+
+        for _ in 0..UPDATE_QUEUE_CAPACITY {
+            assert!(matches!(receiver.try_recv(), Ok(SearchUpdate::Match(_))));
+        }
+        assert!(matches!(receiver.try_recv(), Ok(SearchUpdate::Skipped)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SearchUpdate::Finished(SearchCompletion {
+                truncated: true,
+                incomplete: true,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn saturated_normal_completion_preserves_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..UPDATE_QUEUE_CAPACITY {
+            fs::write(temp.path().join(format!("item-{index}.txt")), "item").unwrap();
+        }
+        let mut draft =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::RecursiveHere);
+        draft.name = "item".into();
+        let mut request = draft.compile(true).unwrap();
+        request.result_limit_override = Some(UPDATE_QUEUE_CAPACITY);
+        let running = spawn(request);
+
+        let mut matches = 0;
+        let completion = loop {
+            match running
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                SearchUpdate::Match(_) => matches += 1,
+                SearchUpdate::Skipped => {}
+                SearchUpdate::Finished(completion) => break completion,
+                SearchUpdate::Failed(message) => panic!("search failed: {message}"),
+            }
+        };
+
+        assert_eq!(matches, UPDATE_QUEUE_CAPACITY);
+        assert!(completion.truncated);
+        assert!(!completion.cancelled);
     }
 
     #[test]
