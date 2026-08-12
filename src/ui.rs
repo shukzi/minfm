@@ -1397,11 +1397,27 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
         Paragraph::new(navigation).block(Block::default().borders(Borders::RIGHT)),
         columns[0],
     );
-    let control_area = columns[1].inner(Margin {
+    let content_area = columns[1].inner(Margin {
         horizontal: 2,
         vertical: 0,
     });
-    let (controls, active_line) = if area.height < 16 {
+    let help = search_help_text(form);
+    let help_inner_width = content_area.width.saturating_sub(2);
+    let wrapped_help_rows = if help_inner_width == 0 {
+        0
+    } else {
+        wrapped_line_count(help, usize::from(help_inner_width)).min(u16::MAX as usize) as u16
+    };
+    let desired_help_height = wrapped_help_rows.saturating_add(2);
+    let help_height = if content_area.width >= 3 && content_area.height >= 6 {
+        desired_help_height.min(content_area.height.saturating_sub(1))
+    } else {
+        0
+    };
+    let content_rows =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(help_height)]).split(content_area);
+    let control_area = content_rows[0];
+    let (controls, active_line) = if control_area.height <= 1 {
         (
             active_search_control_text(form, usize::from(control_area.width)),
             0,
@@ -1409,13 +1425,33 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     } else {
         search_control_text(form, usize::from(control_area.width))
     };
-    let scroll = active_line.saturating_sub(usize::from(control_area.height).saturating_sub(1));
+    let rendered_through_active = if control_area.width == 0 {
+        0
+    } else {
+        wrapped_line_count(
+            &controls
+                .lines()
+                .take(active_line.saturating_add(1))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            usize::from(control_area.width),
+        )
+    };
+    let scroll = rendered_through_active.saturating_sub(usize::from(control_area.height));
     frame.render_widget(
         Paragraph::new(controls)
             .scroll((scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false }),
         control_area,
     );
+    if help_height >= 3 {
+        frame.render_widget(
+            Paragraph::new(help)
+                .block(Block::default().borders(Borders::ALL).title(" Help "))
+                .wrap(Wrap { trim: false }),
+            content_rows[1],
+        );
+    }
     if let Some(error) = &form.error {
         frame.render_widget(
             Paragraph::new(error.as_str()).style(Style::default().fg(ACCENT)),
@@ -1445,6 +1481,15 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
         rows[3],
     );
     let _ = app;
+}
+
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    text.lines()
+        .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(width))
+        .sum()
 }
 
 fn active_search_control_text(form: &SearchForm, width: usize) -> String {
@@ -1724,7 +1769,6 @@ fn search_control_text(form: &SearchForm, width: usize) -> (String, usize) {
     }
 }
 
-#[allow(dead_code)] // Responsive composition consumes this in the next task.
 fn search_help_text(form: &SearchForm) -> &'static str {
     use crate::search::{ContentMode, NameMode, ResultLimit, SearchScope};
 
@@ -3863,6 +3907,18 @@ mod performance_tests {
             .join("")
     }
 
+    fn rendered_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (area.y..area.y.saturating_add(area.height))
+            .map(|y| {
+                (area.x..area.x.saturating_add(area.width))
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
     #[test]
     fn entry_icons_are_high_contrast_without_a_background_fill() {
         let icon = icon_span("󰉋  ".into());
@@ -4209,7 +4265,7 @@ mod performance_tests {
     }
 
     #[test]
-    fn search_advanced_wide_renders_persistent_query_and_all_sections() {
+    fn search_advanced_wide_renders_vertical_controls_and_contextual_help_for_each_section() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = App::new(
             temp.path().to_path_buf(),
@@ -4219,24 +4275,62 @@ mod performance_tests {
             },
             false,
         );
-        app.mode = AppMode::SearchForm(SearchForm::advanced(
+        let mut form = SearchForm::advanced(
             temp.path().to_path_buf(),
             crate::search::SearchScope::CurrentDirectory,
             crate::app::SearchReturn::Browser,
-        ));
-        let backend = TestBackend::new(140, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let text = rendered_text(&terminal);
-        for label in ["Query", "Scope", "Match", "Filters", "Traversal"] {
-            assert!(text.contains(label), "missing {label}");
+        );
+        for (section, expected_rows, help) in [
+            (
+                crate::app::SearchSection::Scope,
+                &[
+                    "[x] Current directory",
+                    "[ ] Recursive here",
+                    "[ ] Entire filesystem",
+                ][..],
+                "current directory only",
+            ),
+            (
+                crate::app::SearchSection::Match,
+                &["[x] Smart", "[ ] Glob", "[ ] Regex"][..],
+                "exact matches first",
+            ),
+            (
+                crate::app::SearchSection::Filters,
+                &["[x] Files", "[x] Directories", "[x] Symlinks"][..],
+                "regular files",
+            ),
+            (
+                crate::app::SearchSection::Traversal,
+                &["[ ] 1,000", "[x] 5,000", "[ ] 10,000"][..],
+                "Retains at most",
+            ),
+        ] {
+            form.section = section;
+            form.field = 0;
+            app.mode = AppMode::SearchForm(form.clone());
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let rows = rendered_rows(&terminal);
+            for expected in expected_rows {
+                assert!(
+                    rows.iter().any(|row| row.contains(expected)),
+                    "missing separate row {expected} for {section:?}: {rows:?}"
+                );
+            }
+            assert!(
+                rows.iter().any(|row| row.contains("Help")),
+                "missing Help title"
+            );
+            assert!(
+                rendered_text(&terminal).contains(help),
+                "missing active help for {section:?}"
+            );
         }
-        assert!(text.contains("Enter search"));
-        assert!(text.contains("Esc cancel"));
     }
 
     #[test]
-    fn search_advanced_narrow_keeps_active_section_error_and_footer() {
+    fn search_advanced_narrow_renders_size_help_inside_the_outer_border() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = App::new(
             temp.path().to_path_buf(),
@@ -4262,11 +4356,66 @@ mod performance_tests {
         for label in [
             "Filters",
             "Minimum size",
+            "KB",
+            "GB",
+            "GiB",
+            "inclusive",
             "invalid minimum size",
             "Enter search",
             "Esc cancel",
         ] {
             assert!(text.contains(label), "missing {label}");
+        }
+        let rows = rendered_rows(&terminal);
+        for row in rows.iter().filter(|row| {
+            ["KB", "GB", "GiB", "inclusive"]
+                .iter()
+                .any(|needle| row.contains(needle))
+        }) {
+            let first = row.find('│').expect("advanced-search left border");
+            let last = row.rfind('│').expect("advanced-search right border");
+            assert!(
+                first < last,
+                "help must remain inside outer border: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_advanced_short_preserves_active_control_error_footer_and_caret() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let mut form = SearchForm::advanced(
+            temp.path().to_path_buf(),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        form.section = crate::app::SearchSection::Filters;
+        form.field = 5;
+        form.draft.minimum_size = "500".into();
+        form.cursors.minimum_size = 3;
+        form.error = Some("invalid size".into());
+        app.mode = AppMode::SearchForm(form);
+        let mut terminal = Terminal::new(TestBackend::new(52, 14)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = rendered_text(&terminal);
+        for expected in [
+            "Minimum size",
+            "500│",
+            "invalid size",
+            "Enter search",
+            "Esc cancel",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
         }
     }
 
