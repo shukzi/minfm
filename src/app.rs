@@ -1056,6 +1056,9 @@ impl App {
         self.progress = ProgressState::default();
         match result {
             Ok(ArchiveOutcome::Created { archive, entries }) => {
+                for entry in &mut self.entries {
+                    entry.selected = false;
+                }
                 self.refresh_browser(Some(archive));
                 self.set_notice(format!("Archive created: {entries} item(s)"));
                 self.mode = AppMode::Browser;
@@ -6181,6 +6184,32 @@ mod tests {
             AppMode::Archive(ArchiveView { ref entries, .. })
                 if entries.iter().any(|entry| entry.path == Path::new("source.txt"))
         ));
+    }
+
+    #[test]
+    fn successful_multi_selection_archive_clears_marked_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let mut app = test_app(temp.path());
+        for entry in &mut app.entries {
+            entry.selected = entry.path == first || entry.path == second;
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_archive(&mut app);
+
+        let archive = temp.path().join("archive.tar.gz");
+        assert!(archive.is_file());
+        assert!(app.entries.iter().all(|entry| !entry.selected));
+        assert_eq!(
+            app.selected_entry().map(|entry| entry.path.as_path()),
+            Some(archive.as_path())
+        );
     }
 
     #[test]
