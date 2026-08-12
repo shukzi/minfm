@@ -4,6 +4,9 @@ These instructions apply to the entire public minfm repository. Keep this file
 focused on project work; personal setup, credentials, private backups, and
 machine-specific paths do not belong here.
 
+Contributor-facing setup and pull-request expectations are documented in
+`CONTRIBUTING.md`; keep this file and that guide consistent.
+
 ## Project overview
 
 minfm is a Linux terminal file manager written in Rust 2021. It combines file
