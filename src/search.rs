@@ -4,7 +4,7 @@ use std::{
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs,
-    io::Read,
+    io::{self, Read},
     os::unix::ffi::{OsStrExt, OsStringExt},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -197,18 +197,26 @@ fn run_rg_batch_with_command(
             RG_BATCH_MAX_ARG_BYTES
         )));
     }
-    let stdout_file = tempfile::NamedTempFile::new().map_err(|error| {
-        RgError::Failed(format!("could not create ripgrep stdout file: {error}"))
+    let stdout_cap = paths.iter().try_fold(0_usize, |bytes, path| {
+        bytes.checked_add(encoded_arg_bytes(path.as_os_str()))
+    });
+    let stdout_cap =
+        stdout_cap.ok_or_else(|| RgError::Failed("ripgrep stdout limit overflow".into()))?;
+    let pipe_flags = rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC;
+    let (stdout_reader, stdout_writer) = rustix::pipe::pipe_with(pipe_flags).map_err(|error| {
+        RgError::Failed(format!("could not create ripgrep stdout pipe: {error}"))
     })?;
-    let stderr_file = tempfile::NamedTempFile::new().map_err(|error| {
-        RgError::Failed(format!("could not create ripgrep stderr file: {error}"))
+    let (stderr_reader, stderr_writer) = rustix::pipe::pipe_with(pipe_flags).map_err(|error| {
+        RgError::Failed(format!("could not create ripgrep stderr pipe: {error}"))
     })?;
-    let stdout_writer = stdout_file
-        .reopen()
-        .map_err(|error| RgError::Failed(format!("could not open ripgrep stdout file: {error}")))?;
-    let stderr_writer = stderr_file
-        .reopen()
-        .map_err(|error| RgError::Failed(format!("could not open ripgrep stderr file: {error}")))?;
+    set_pipe_writer_blocking(&stdout_writer, "stdout")?;
+    set_pipe_writer_blocking(&stderr_writer, "stderr")?;
+    let mut stdout = RgOutput::new(std::fs::File::from(stdout_reader), stdout_cap, "stdout");
+    let mut stderr = RgOutput::new(
+        std::fs::File::from(stderr_reader),
+        RG_STDERR_MAX_BYTES,
+        "stderr",
+    );
     let mut process = Command::new(&command.program);
     if request.content_mode() == ContentMode::Literal {
         process.arg("--fixed-strings");
@@ -228,17 +236,32 @@ fn run_rg_batch_with_command(
     #[cfg(test)]
     let mut supervision_polls = 0_usize;
     let status = loop {
+        if let Err(error) = drain_rg_output_round(&mut stdout, &mut stderr) {
+            drop(stdout);
+            drop(stderr);
+            let cleanup = cleanup_rg_process_group(&mut child, cleanup_signal_override(command));
+            cleanup.map_err(|cleanup| {
+                RgError::Failed(format!("{error}; ripgrep cleanup failed: {cleanup}"))
+            })?;
+            return Err(error);
+        }
         if cancel.load(AtomicOrdering::Relaxed) || inject_cancel_after_spawn(command) {
-            cleanup_rg_process_group(&mut child, cleanup_signal_override(command)).map_err(
-                |error| RgError::Failed(format!("ripgrep cancellation cleanup failed: {error}")),
-            )?;
+            drop(stdout);
+            drop(stderr);
+            let cleanup = cleanup_rg_process_group(&mut child, cleanup_signal_override(command));
+            cleanup.map_err(|error| {
+                RgError::Failed(format!("ripgrep cancellation cleanup failed: {error}"))
+            })?;
             return Err(RgError::Cancelled);
         }
         #[cfg(test)]
         if command.inject_supervision_error && supervision_polls == 10 {
-            cleanup_rg_process_group(&mut child, cleanup_signal_override(command)).map_err(
-                |error| RgError::Failed(format!("ripgrep supervision cleanup failed: {error}")),
-            )?;
+            drop(stdout);
+            drop(stderr);
+            let cleanup = cleanup_rg_process_group(&mut child, cleanup_signal_override(command));
+            cleanup.map_err(|error| {
+                RgError::Failed(format!("ripgrep supervision cleanup failed: {error}"))
+            })?;
             return Err(RgError::Failed("injected supervision failure".into()));
         }
         match child.try_wait() {
@@ -251,26 +274,24 @@ fn run_rg_batch_with_command(
                 thread::park_timeout(Duration::from_millis(10));
             }
             Err(error) => {
-                cleanup_rg_process_group(&mut child, cleanup_signal_override(command)).map_err(
-                    |cleanup| {
-                        RgError::Failed(format!(
-                            "ripgrep supervision failed: {error}; cleanup failed: {cleanup}"
-                        ))
-                    },
-                )?;
+                drop(stdout);
+                drop(stderr);
+                let cleanup =
+                    cleanup_rg_process_group(&mut child, cleanup_signal_override(command));
+                cleanup.map_err(|cleanup| {
+                    RgError::Failed(format!(
+                        "ripgrep supervision failed: {error}; cleanup failed: {cleanup}"
+                    ))
+                })?;
                 return Err(RgError::Failed(format!(
                     "ripgrep supervision failed: {error}"
                 )));
             }
         }
     };
-    let stdout_cap = paths.iter().try_fold(0_usize, |bytes, path| {
-        bytes.checked_add(encoded_arg_bytes(path.as_os_str()))
-    });
-    let stdout_cap =
-        stdout_cap.ok_or_else(|| RgError::Failed("ripgrep stdout limit overflow".into()))?;
-    let stdout = read_bounded_output(stdout_file, stdout_cap, "stdout")?;
-    let stderr = read_bounded_output(stderr_file, RG_STDERR_MAX_BYTES, "stderr")?;
+    drain_available_rg_outputs(&mut stdout, &mut stderr)?;
+    let stdout = stdout.finish();
+    let stderr = stderr.finish();
     match status.code() {
         Some(0) => {
             let candidates: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
@@ -288,22 +309,76 @@ fn run_rg_batch_with_command(
     }
 }
 
-fn read_bounded_output(
-    file: tempfile::NamedTempFile,
+fn set_pipe_writer_blocking(writer: &std::os::fd::OwnedFd, stream: &str) -> Result<(), RgError> {
+    let mut flags = rustix::fs::fcntl_getfl(writer).map_err(|error| {
+        RgError::Failed(format!("could not inspect ripgrep {stream} pipe: {error}"))
+    })?;
+    flags.remove(rustix::fs::OFlags::NONBLOCK);
+    rustix::fs::fcntl_setfl(writer, flags).map_err(|error| {
+        RgError::Failed(format!(
+            "could not configure ripgrep {stream} pipe: {error}"
+        ))
+    })
+}
+
+struct RgOutput {
+    reader: std::fs::File,
+    bytes: Vec<u8>,
     limit: usize,
-    stream: &str,
-) -> Result<Vec<u8>, RgError> {
-    let mut bytes = Vec::with_capacity(limit.min(8 * 1024).saturating_add(1));
-    file.as_file()
-        .take(limit.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| RgError::Failed(format!("could not read ripgrep {stream}: {error}")))?;
-    if bytes.len() > limit {
-        return Err(RgError::Failed(format!(
-            "ripgrep {stream} exceeds the {limit} byte output limit"
-        )));
+    stream: &'static str,
+}
+
+impl RgOutput {
+    fn new(reader: std::fs::File, limit: usize, stream: &'static str) -> Self {
+        Self {
+            reader,
+            bytes: Vec::with_capacity(limit.min(8 * 1024).saturating_add(1)),
+            limit,
+            stream,
+        }
     }
-    Ok(bytes)
+
+    fn drain_once(&mut self) -> Result<bool, RgError> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        let mut chunk = [0_u8; 8 * 1024];
+        let read_limit = chunk.len().min(remaining.saturating_add(1));
+        match self.reader.read(&mut chunk[..read_limit]) {
+            Ok(0) => Ok(false),
+            Ok(read) => {
+                self.bytes.extend_from_slice(&chunk[..read]);
+                if self.bytes.len() > self.limit {
+                    return Err(RgError::Failed(format!(
+                        "ripgrep {} exceeds the {} byte output limit",
+                        self.stream, self.limit
+                    )));
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(RgError::Failed(format!(
+                "could not read ripgrep {}: {error}",
+                self.stream
+            ))),
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+fn drain_rg_output_round(stdout: &mut RgOutput, stderr: &mut RgOutput) -> Result<bool, RgError> {
+    let stdout_progress = stdout.drain_once()?;
+    let stderr_progress = stderr.drain_once()?;
+    Ok(stdout_progress || stderr_progress)
+}
+
+fn drain_available_rg_outputs(stdout: &mut RgOutput, stderr: &mut RgOutput) -> Result<(), RgError> {
+    loop {
+        if !drain_rg_output_round(stdout, stderr)? {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1328,6 +1403,20 @@ mod tests {
         }
     }
 
+    fn wait_for_processes_gone(pids: &[String]) {
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while pids.iter().any(|pid| Path::new("/proc").join(pid).exists()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "escaped writer did not exit after reader closure"
+                );
+                thread::yield_now();
+            }
+        }
+    }
+
     struct TraversalFixture {
         temp: tempfile::TempDir,
     }
@@ -1626,7 +1715,7 @@ mod tests {
             return;
         }
         let fake = FakeRg::from_script(
-            "#!/bin/sh\nsetsid sh -c 'printf escaped-output; sleep 1' &\necho $! > '$CAPTURE'\nwait\n",
+            "#!/bin/sh\nsetsid sh -c 'sleep 0.1; while printf x; do :; done' &\necho $! > '$CAPTURE'\nwait\n",
         );
         let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
         draft.content = "needle".into();
@@ -1642,12 +1731,13 @@ mod tests {
                 &command,
             )
         });
-        wait_for_pids(&fake.capture, 1);
+        let pids = wait_for_pids(&fake.capture, 1);
         let started = std::time::Instant::now();
         cancel.store(true, AtomicOrdering::Relaxed);
 
         assert!(matches!(worker.join().unwrap(), Err(RgError::Cancelled)));
         assert!(started.elapsed() < Duration::from_millis(500));
+        wait_for_processes_gone(&pids);
     }
 
     #[test]
@@ -1706,6 +1796,57 @@ mod tests {
         assert!(
             matches!(result, Err(RgError::Failed(message)) if message.contains("stderr") && message.contains("limit"))
         );
+    }
+
+    #[test]
+    fn rg_escaped_writer_exits_after_parent_closes_stream_readers() {
+        if Command::new("setsid").arg("--version").output().is_err() {
+            return;
+        }
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\nsetsid sh -c 'trap \"\" PIPE; while printf x; do :; done; exit 0' &\necho $! > '$CAPTURE'\nexit 1\n",
+        );
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let started = std::time::Instant::now();
+
+        let result = run_rg_batch_with_command(
+            &request,
+            &[PathBuf::from("/tmp/candidate")],
+            &AtomicBool::new(false),
+            &fake.command,
+        );
+        let pids = wait_for_pids(&fake.capture, 1);
+
+        assert!(
+            matches!(result, Err(RgError::Failed(message)) if message.contains("stdout") && message.contains("limit"))
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        wait_for_processes_gone(&pids);
+    }
+
+    #[test]
+    fn rg_simultaneous_stream_flood_is_bounded_without_starvation() {
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\n(head -c 70000 /dev/zero >&2) &\nhead -c 70000 /dev/zero\nwait\n",
+        );
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let started = std::time::Instant::now();
+
+        let result = run_rg_batch_with_command(
+            &request,
+            &[PathBuf::from("/tmp/candidate")],
+            &AtomicBool::new(false),
+            &fake.command,
+        );
+
+        assert!(
+            matches!(result, Err(RgError::Failed(message)) if message.contains("output limit"))
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
