@@ -41,18 +41,7 @@ impl FileEntry {
         path: PathBuf,
         metadata: fs::Metadata,
     ) -> std::io::Result<Self> {
-        let file_type = metadata.file_type();
-        let kind = if file_type.is_symlink() {
-            EntryKind::Symlink
-        } else if file_type.is_dir() {
-            EntryKind::Directory
-        } else if file_type.is_file() {
-            EntryKind::File
-        } else if file_type.is_block_device() {
-            EntryKind::BlockDevice
-        } else {
-            EntryKind::Other
-        };
+        let kind = Self::kind_from_metadata(&metadata);
         let name = path
             .file_name()
             .unwrap_or(path.as_os_str())
@@ -67,6 +56,21 @@ impl FileEntry {
             modified: metadata.modified().ok(),
             selected: false,
         })
+    }
+
+    pub(crate) fn kind_from_metadata(metadata: &fs::Metadata) -> EntryKind {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            EntryKind::Symlink
+        } else if file_type.is_dir() {
+            EntryKind::Directory
+        } else if file_type.is_file() {
+            EntryKind::File
+        } else if file_type.is_block_device() {
+            EntryKind::BlockDevice
+        } else {
+            EntryKind::Other
+        }
     }
 
     pub fn is_hidden(&self) -> bool {
