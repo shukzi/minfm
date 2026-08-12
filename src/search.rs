@@ -1,9 +1,13 @@
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     error::Error,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fmt, fs,
+    io::Read,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError},
@@ -21,7 +25,147 @@ use unicode_casefold::UnicodeCaseFold;
 use crate::entry::{EntryKind, FileEntry};
 
 const UPDATE_QUEUE_CAPACITY: usize = 256;
+const RG_BATCH_MAX_PATHS: usize = 128;
+const RG_BATCH_MAX_ARG_BYTES: usize = 256 * 1024;
 pub(crate) const UPDATES_PER_UI_TICK: usize = 512;
+
+#[derive(Debug)]
+struct RgBatch {
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+enum RgError {
+    Failed(String),
+    Cancelled,
+}
+
+impl fmt::Display for RgError {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(message) => write!(output, "{message}"),
+            Self::Cancelled => write!(output, "content search cancelled"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RgCommand {
+    program: PathBuf,
+}
+
+impl Default for RgCommand {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from("rg"),
+        }
+    }
+}
+
+pub fn ripgrep_available() -> bool {
+    Command::new("rg")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn run_rg_batch(
+    request: &CompiledSearch,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+) -> Result<HashSet<PathBuf>, RgError> {
+    #[cfg(test)]
+    let command = request
+        .rg_program
+        .as_ref()
+        .map(|program| RgCommand {
+            program: program.clone(),
+        })
+        .unwrap_or_default();
+    #[cfg(not(test))]
+    let command = RgCommand::default();
+    run_rg_batch_with_command(request, paths, cancel, &command)
+}
+
+fn run_rg_batch_with_command(
+    request: &CompiledSearch,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    command: &RgCommand,
+) -> Result<HashSet<PathBuf>, RgError> {
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return Err(RgError::Cancelled);
+    }
+    let mut process = Command::new(&command.program);
+    if request.content_mode() == ContentMode::Literal {
+        process.arg("--fixed-strings");
+    }
+    process
+        .args(["--null", "--files-with-matches", "--no-messages"])
+        .arg(request.content())
+        .arg("--")
+        .args(paths.iter().map(|path| path.as_os_str()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process
+        .spawn()
+        .map_err(|error| RgError::Failed(error.to_string()))?;
+    let stdout = child.stdout.take().expect("piped ripgrep stdout");
+    let stderr = child.stderr.take().expect("piped ripgrep stderr");
+
+    let (status, stdout, stderr, cancelled) = thread::scope(|scope| {
+        let stdout_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.take(u64::MAX).read_to_end(&mut bytes);
+            bytes
+        });
+        let stderr_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.take(u64::MAX).read_to_end(&mut bytes);
+            bytes
+        });
+        let mut cancelled = false;
+        let status = loop {
+            if cancel.load(AtomicOrdering::Relaxed) {
+                cancelled = true;
+                let _ = child.kill();
+                break child.wait();
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => thread::park_timeout(Duration::from_millis(10)),
+                Err(error) => break Err(error),
+            }
+        };
+        (
+            status,
+            stdout_reader.join().unwrap_or_default(),
+            stderr_reader.join().unwrap_or_default(),
+            cancelled,
+        )
+    });
+    if cancelled {
+        return Err(RgError::Cancelled);
+    }
+    let status = status.map_err(|error| RgError::Failed(error.to_string()))?;
+    match status.code() {
+        Some(0) => {
+            let candidates: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
+            Ok(stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
+                .filter(|path| candidates.contains(path.as_path()))
+                .collect())
+        }
+        Some(1) => Ok(HashSet::new()),
+        _ => Err(RgError::Failed(
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )),
+    }
+}
 
 #[derive(Debug)]
 pub enum SearchUpdate {
@@ -141,6 +285,10 @@ fn run(
     let mut skipped = 0_usize;
     let mut matches = 0_usize;
     let mut truncated = false;
+    let mut rg_batch = RgBatch { paths: Vec::new() };
+    let mut rg_hits = Vec::new();
+    let mut rg_arg_bytes = 0_usize;
+    let mut rg_error = None;
     for item in builder.build() {
         if cancel.load(AtomicOrdering::Relaxed) {
             break;
@@ -192,6 +340,38 @@ fn run(
             }
         };
         if !request.content().is_empty() {
+            if kind != EntryKind::File {
+                continue;
+            }
+            let path_bytes = entry.path.as_os_str().as_bytes().len();
+            if !rg_batch.paths.is_empty()
+                && (rg_batch.paths.len() == RG_BATCH_MAX_PATHS
+                    || rg_arg_bytes.saturating_add(path_bytes) > RG_BATCH_MAX_ARG_BYTES)
+            {
+                match emit_rg_batch(
+                    &request,
+                    &mut rg_batch,
+                    &mut rg_hits,
+                    &match_sender,
+                    Arc::as_ref(&cancel),
+                    &mut matches,
+                ) {
+                    Ok(limit_reached) => {
+                        rg_arg_bytes = 0;
+                        if limit_reached {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        rg_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            rg_arg_bytes = rg_arg_bytes.saturating_add(path_bytes);
+            rg_batch.paths.push(entry.path.clone());
+            rg_hits.push(SearchHit { entry, rank });
             continue;
         }
         #[cfg(test)]
@@ -211,14 +391,64 @@ fn run(
             break;
         }
     }
+    if rg_error.is_none()
+        && !truncated
+        && !rg_batch.paths.is_empty()
+        && !cancel.load(AtomicOrdering::Relaxed)
+    {
+        match emit_rg_batch(
+            &request,
+            &mut rg_batch,
+            &mut rg_hits,
+            &match_sender,
+            Arc::as_ref(&cancel),
+            &mut matches,
+        ) {
+            Ok(limit_reached) => truncated = limit_reached,
+            Err(error) => rg_error = Some(error),
+        }
+    }
     if skipped > 0 {
         let _ = control_sender.send(SearchUpdate::Skipped);
     }
+    if let Some(RgError::Failed(message)) = &rg_error {
+        let _ = control_sender.send(SearchUpdate::Failed(message.clone()));
+    }
     let _ = control_sender.send(SearchUpdate::Finished(SearchCompletion {
-        cancelled: cancel.load(AtomicOrdering::Relaxed),
+        cancelled: cancel.load(AtomicOrdering::Relaxed)
+            || matches!(rg_error, Some(RgError::Cancelled)),
         truncated,
-        incomplete: skipped > 0,
+        incomplete: skipped > 0 || matches!(rg_error, Some(RgError::Failed(_))),
     }));
+}
+
+fn emit_rg_batch(
+    request: &CompiledSearch,
+    batch: &mut RgBatch,
+    hits: &mut Vec<SearchHit>,
+    sender: &SyncSender<SearchUpdate>,
+    cancel: &AtomicBool,
+    emitted: &mut usize,
+) -> Result<bool, RgError> {
+    let verified = run_rg_batch(request, &batch.paths, cancel)?;
+    batch.paths.clear();
+    for hit in hits.drain(..) {
+        if !verified.contains(&hit.entry.path) {
+            continue;
+        }
+        #[cfg(test)]
+        if let Some(counter) = &request.send_attempt_counter {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        if !send_match_cancellable(sender, hit, cancel) {
+            return Err(RgError::Cancelled);
+        }
+        *emitted += 1;
+        if *emitted == request.selected_result_limit() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn send_match_cancellable(
@@ -452,6 +682,8 @@ pub struct CompiledSearch {
     construction_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     send_attempt_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    rg_program: Option<PathBuf>,
 }
 
 impl SearchDraft {
@@ -541,6 +773,8 @@ impl SearchDraft {
             construction_counter: None,
             #[cfg(test)]
             send_attempt_counter: None,
+            #[cfg(test)]
+            rg_program: None,
         })
     }
 }
@@ -780,9 +1014,68 @@ mod tests {
         ffi::{OsStr, OsString},
         fs,
         os::unix::ffi::OsStringExt,
-        os::unix::fs::symlink,
+        os::unix::fs::{symlink, PermissionsExt},
         path::{Path, PathBuf},
     };
+
+    struct FakeRg {
+        _temp: tempfile::TempDir,
+        command: RgCommand,
+        capture: PathBuf,
+    }
+
+    impl FakeRg {
+        fn capturing_arguments() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let program = temp.path().join("rg");
+            let capture = temp.path().join("arguments");
+            fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\n: > '{}'\nafter_separator=\nfor argument do\n  printf '%s\\0' \"$argument\" >> '{}'\n  if [ \"$after_separator\" = yes ]; then\n    printf '%s\\0' \"$argument\"\n  fi\n  if [ \"$argument\" = -- ]; then after_separator=yes; fi\ndone\n",
+                    capture.display(),
+                    capture.display()
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&program).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&program, permissions).unwrap();
+            Self {
+                _temp: temp,
+                command: RgCommand { program },
+                capture,
+            }
+        }
+
+        fn from_script(script: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let program = temp.path().join("rg");
+            let capture = temp.path().join("capture");
+            fs::write(
+                &program,
+                script.replace("$CAPTURE", &capture.to_string_lossy()),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&program).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&program, permissions).unwrap();
+            Self {
+                _temp: temp,
+                command: RgCommand { program },
+                capture,
+            }
+        }
+
+        fn arguments(&self) -> Vec<OsString> {
+            fs::read(&self.capture)
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| OsString::from_vec(argument.to_vec()))
+                .collect()
+        }
+    }
 
     struct TraversalFixture {
         temp: tempfile::TempDir,
@@ -861,6 +1154,201 @@ mod tests {
     fn local_time(value: &str) -> SystemTime {
         let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap();
         Local.from_local_datetime(&naive).single().unwrap().into()
+    }
+
+    #[test]
+    fn rg_arguments_literal_mode_are_safe_and_explicit() {
+        let fake = FakeRg::capturing_arguments();
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "literal needle".into();
+        let request = draft.compile(true).unwrap();
+        let candidates = [PathBuf::from("/tmp/one file"), PathBuf::from("-leading")];
+
+        let matches = run_rg_batch_with_command(
+            &request,
+            &candidates,
+            &AtomicBool::new(false),
+            &fake.command,
+        )
+        .unwrap();
+
+        assert_eq!(matches, HashSet::from(candidates.clone()));
+        assert_eq!(
+            fake.arguments(),
+            [
+                "--fixed-strings".into(),
+                "--null".into(),
+                "--files-with-matches".into(),
+                "--no-messages".into(),
+                "literal needle".into(),
+                "--".into(),
+                candidates[0].as_os_str().to_owned(),
+                candidates[1].as_os_str().to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rg_arguments_regex_mode_omits_fixed_strings() {
+        let fake = FakeRg::capturing_arguments();
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle.+thread".into();
+        draft.content_mode = ContentMode::Regex;
+        let request = draft.compile(true).unwrap();
+        let candidates = [PathBuf::from("/tmp/one")];
+
+        run_rg_batch_with_command(
+            &request,
+            &candidates,
+            &AtomicBool::new(false),
+            &fake.command,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fake.arguments(),
+            [
+                "--null".into(),
+                "--files-with-matches".into(),
+                "--no-messages".into(),
+                "needle.+thread".into(),
+                "--".into(),
+                candidates[0].as_os_str().to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rg_unusual_paths_round_trip_and_binary_files_are_excluded() {
+        let temp = tempfile::tempdir().unwrap();
+        let names = [
+            OsString::from("with space"),
+            OsString::from("with\ttab"),
+            OsString::from("with\nnewline"),
+            OsString::from("-leading"),
+            OsString::from_vec(vec![b'i', b'n', b'v', 0x80]),
+        ];
+        let mut paths = Vec::new();
+        for name in names {
+            let path = temp.path().join(name);
+            fs::write(&path, "find this needle").unwrap();
+            paths.push(path);
+        }
+        let binary = temp.path().join("binary");
+        fs::write(&binary, b"\0binary contents without the query").unwrap();
+        paths.push(binary.clone());
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.content = "needle".into();
+
+        let matches = run_rg_batch(
+            &draft.compile(true).unwrap(),
+            &paths,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(matches.len(), 5);
+        assert!(paths[..5].iter().all(|path| matches.contains(path)));
+        assert!(!matches.contains(&binary));
+    }
+
+    #[test]
+    fn rg_cancellation_kills_and_reaps_the_child() {
+        let fake =
+            FakeRg::from_script("#!/bin/sh\necho $$ > '$CAPTURE'\nwhile :; do sleep 1; done\n");
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let command = fake.command.clone();
+        let started = std::time::Instant::now();
+        let worker = thread::spawn(move || {
+            run_rg_batch_with_command(
+                &request,
+                &[PathBuf::from("/tmp/candidate")],
+                &worker_cancel,
+                &command,
+            )
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let pid = loop {
+            assert!(std::time::Instant::now() < deadline, "rg did not launch");
+            if let Ok(pid) = fs::read_to_string(&fake.capture) {
+                if !pid.trim().is_empty() {
+                    break pid;
+                }
+            }
+            thread::yield_now();
+        };
+        let pid = pid.trim();
+        cancel.store(true, AtomicOrdering::Relaxed);
+
+        assert!(matches!(worker.join().unwrap(), Err(RgError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        #[cfg(target_os = "linux")]
+        assert!(!Path::new("/proc").join(pid).exists());
+    }
+
+    #[test]
+    fn content_search_emits_only_rg_verified_regular_files() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("matching.txt"), "contains needle").unwrap();
+        fs::write(temp.path().join("other.txt"), "nothing relevant").unwrap();
+        fs::create_dir(temp.path().join("directory.txt")).unwrap();
+        let mut draft =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::CurrentDirectory);
+        draft.name = ".txt".into();
+        draft.content = "needle".into();
+
+        let (hits, completion) = run_traversal(draft.compile(true).unwrap());
+
+        assert_eq!(
+            paths(temp.path(), &hits),
+            BTreeSet::from(["matching.txt".into()])
+        );
+        assert_eq!(completion, SearchCompletion::default());
+    }
+
+    #[test]
+    fn content_failure_preserves_completed_batches_and_reports_incomplete() {
+        let fake = FakeRg::from_script(
+            "#!/bin/sh\ncount_file='$CAPTURE'\ncount=0\n[ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\ncount=$((count + 1))\necho \"$count\" > \"$count_file\"\nif [ \"$count\" -eq 1 ]; then\n  after=\n  for argument do\n    if [ \"$after\" = yes ]; then printf '%s\\0' \"$argument\"; fi\n    [ \"$argument\" = -- ] && after=yes\n  done\n  exit 0\nfi\necho 'bad pattern' >&2\nexit 2\n",
+        );
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..(RG_BATCH_MAX_PATHS + 1) {
+            fs::write(temp.path().join(format!("item-{index}.txt")), "needle").unwrap();
+        }
+        let mut draft =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::CurrentDirectory);
+        draft.name = "item".into();
+        draft.content = "needle".into();
+        let mut request = draft.compile(true).unwrap();
+        request.rg_program = Some(fake.command.program.clone());
+        let running = spawn(request);
+        let mut matches = 0;
+        let mut failure = None;
+        let mut completion = None;
+        while let Ok(update) = running.receiver.recv() {
+            match update {
+                SearchUpdate::Match(_) => matches += 1,
+                SearchUpdate::Skipped => {}
+                SearchUpdate::Failed(message) => failure = Some(message),
+                SearchUpdate::Finished(value) => completion = Some(value),
+            }
+        }
+
+        assert_eq!(matches, RG_BATCH_MAX_PATHS);
+        assert!(failure
+            .as_deref()
+            .is_some_and(|message| message.contains("bad pattern")));
+        assert_eq!(
+            completion,
+            Some(SearchCompletion {
+                incomplete: true,
+                ..SearchCompletion::default()
+            })
+        );
     }
 
     #[test]
