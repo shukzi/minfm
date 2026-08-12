@@ -267,6 +267,16 @@ cargo build --release --locked
 ./target/release/minfm
 ```
 
+Run the automated search acceptance suite through a real pseudo-terminal:
+
+```sh
+python3 tests/tui/search_acceptance.py
+```
+
+The script drives the release binary with keyboard input and verifies rendered
+TUI state plus filesystem side effects. It uses only the Python standard
+library; build `target/release/minfm` first as shown above.
+
 ## Safety
 
 - Normal deletion moves items to the desktop trash. Permanent deletion is only
