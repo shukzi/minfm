@@ -267,7 +267,7 @@ impl SearchForm {
         }
     }
 
-    fn edit_active_text(&mut self, key: KeyEvent) -> bool {
+    fn edit_active_text(&mut self, key: KeyEvent) -> Option<bool> {
         let (input, cursor) = match (self.section, self.field) {
             (SearchSection::Match, 1) => (&mut self.draft.content, &mut self.cursors.content),
             (SearchSection::Filters, 5) => {
@@ -284,20 +284,21 @@ impl SearchForm {
                 &mut self.draft.modified_before,
                 &mut self.cursors.modified_before,
             ),
-            _ => return false,
+            _ => return None,
         };
+        let before = input.clone();
         edit_cursor_input(input, cursor, key);
-        true
+        Some(*input != before)
     }
 
-    fn handle_choice_key(&mut self, key: KeyEvent) {
+    fn handle_choice_key(&mut self, key: KeyEvent) -> bool {
         use search::{ContentMode, NameMode, ResultLimit};
         let forward = key.code == KeyCode::Right;
         if !matches!(
             key.code,
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
         ) {
-            return;
+            return false;
         }
         if key.code == KeyCode::Char(' ') {
             if let (SearchSection::Filters, field @ 0..=4) = (self.section, self.field) {
@@ -309,8 +310,9 @@ impl SearchForm {
                     crate::entry::EntryKind::Other,
                 ][field];
                 self.draft.types.toggle(kind);
+                return true;
             }
-            return;
+            return false;
         }
         match (self.section, self.field) {
             (SearchSection::Scope, 0) => {
@@ -352,8 +354,9 @@ impl SearchForm {
                     (ResultLimit::TenThousand, false) => ResultLimit::FiveThousand,
                 };
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 }
 
@@ -2776,8 +2779,10 @@ impl App {
             };
             return AppMode::SearchForm(form);
         }
-        if form.edit_active_text(key) {
-            form.error = None;
+        if let Some(changed) = form.edit_active_text(key) {
+            if changed {
+                form.error = None;
+            }
             return AppMode::SearchForm(form);
         }
         let space = key.code == KeyCode::Char(' ');
@@ -2792,12 +2797,16 @@ impl App {
                     | KeyCode::End
             )
         {
+            let before = form.draft.name.clone();
             edit_cursor_input(&mut form.draft.name, &mut form.cursors.name, key);
-            form.error = None;
+            if form.draft.name != before {
+                form.error = None;
+            }
             return AppMode::SearchForm(form);
         }
-        if entry_kind_toggle || matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            form.handle_choice_key(key);
+        if (entry_kind_toggle || matches!(key.code, KeyCode::Left | KeyCode::Right))
+            && form.handle_choice_key(key)
+        {
             form.error = None;
         }
         AppMode::SearchForm(form)
@@ -7388,6 +7397,41 @@ mod tests {
         assert!(
             matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.scope == SearchScope::Filesystem)
         );
+    }
+
+    #[test]
+    fn advanced_search_error_survives_caret_moves_and_noop_controls() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.minimum_size = "bad".into();
+            form.draft.content = "a界b".into();
+            form.cursors.content = 2;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+    }
+
+    #[test]
+    fn advanced_search_error_clears_only_after_value_mutation() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.minimum_size = "bad".into();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_none()));
     }
 
     #[test]

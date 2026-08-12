@@ -1607,9 +1607,17 @@ fn draw_update_progress(frame: &mut Frame) {
 }
 
 fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
-    let area = frame.area();
+    let screen = frame.area();
+    let reserved = 1_u16.saturating_add(shortcut_bar_height(app, screen.width));
+    let area = Rect {
+        height: screen.height.saturating_sub(reserved),
+        ..screen
+    };
     frame.render_widget(Clear, area);
-    let visible_count = usize::from(area.height.saturating_sub(4)).max(1);
+    let regions = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let table_area = regions[0];
+    let footer_area = regions[1];
+    let visible_count = usize::from(table_area.height.saturating_sub(3));
     let start = viewport_start(view.selected, view.results.len(), visible_count);
     let end = (start + visible_count).min(view.results.len());
     let wide = area.width >= 100;
@@ -1680,7 +1688,7 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
         )));
     let selected = (!view.results.is_empty()).then_some(view.selected.saturating_sub(start));
     let mut state = TableState::default().with_selected(selected);
-    frame.render_stateful_widget(table, area, &mut state);
+    frame.render_stateful_widget(table, table_area, &mut state);
     let footer = if view.truncated {
         format!(
             "{} result limit reached · ↑/↓ {}/{} Move · Enter open · Esc return",
@@ -1703,12 +1711,6 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
             app.config.hotkeys.up.display(),
             view.skipped
         )
-    };
-    let footer_area = Rect {
-        x: area.x + 1,
-        y: area.bottom().saturating_sub(3),
-        width: area.width.saturating_sub(2),
-        height: 1,
     };
     frame.render_widget(
         Paragraph::new(footer)
@@ -3754,6 +3756,88 @@ mod performance_tests {
             let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
             terminal.draw(|frame| draw(frame, &app)).unwrap();
             assert!(rendered_text(&terminal).contains(label));
+        }
+    }
+
+    #[test]
+    fn search_results_reserve_footer_below_last_visible_row() {
+        for (width, height) in [(80, 24), (40, 12)] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = App::new(
+                temp.path().to_path_buf(),
+                ConfigLoad::Valid {
+                    config: Config::default(),
+                    path: temp.path().join("config.toml"),
+                },
+                false,
+            );
+            let mut draft = crate::search::SearchDraft::quick(temp.path().to_path_buf());
+            draft.name = "row".into();
+            let results = (0..30)
+                .map(|index| {
+                    let path = temp.path().join(format!("row-{index:02}-unique"));
+                    std::fs::write(&path, []).unwrap();
+                    crate::search::hit_for_test(path, "row")
+                })
+                .collect::<Vec<_>>();
+            let selected = results.len() - 1;
+            app.search_results = Some(crate::app::SearchView {
+                request: draft.compile(true).unwrap(),
+                results,
+                selected,
+                selected_path: None,
+                skipped: 0,
+                truncated: true,
+                incomplete: false,
+            });
+            app.mode = AppMode::SearchResults;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let result_row = rows
+                .iter()
+                .position(|row| row.contains("│>"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "last selected result visible: {}x{} {:?}",
+                        width, height, rows
+                    )
+                });
+            let footer_row = rows
+                .iter()
+                .position(|row| row.contains("result limit reached"))
+                .expect("footer visible");
+            assert_ne!(result_row, footer_row);
+            assert!(result_row < footer_row);
+        }
+    }
+
+    #[test]
+    fn search_views_do_not_panic_on_tiny_terminals() {
+        for (width, height) in [(1, 1), (10, 3), (20, 6)] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = App::new(
+                temp.path().to_path_buf(),
+                ConfigLoad::Valid {
+                    config: Config::default(),
+                    path: temp.path().join("config.toml"),
+                },
+                false,
+            );
+            app.mode = AppMode::SearchForm(SearchForm::advanced(
+                temp.path().to_path_buf(),
+                crate::search::SearchScope::CurrentDirectory,
+                crate::app::SearchReturn::Browser,
+            ));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
         }
     }
 
