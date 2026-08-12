@@ -1306,33 +1306,58 @@ fn draw_search_form(frame: &mut Frame, app: &App, form: &SearchForm) {
 }
 
 fn draw_quick_search(frame: &mut Frame, app: &App, form: &SearchForm) {
-    let title = "Search";
-    let area = centered(frame.area(), 72, 11);
+    let area = centered(frame.area(), 72, if form.error.is_some() { 10 } else { 9 });
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {title} "));
+        .title(" Search current directory ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let rows = Layout::vertical(if form.error.is_some() {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ]
+    })
+    .split(inner);
+    frame.render_widget(Paragraph::new("Enter a value:"), rows[0]);
     let query = cursor_window(
         &form.draft.name,
         form.cursors.name,
         "<name or pattern>",
-        usize::from(inner.width.saturating_sub(2)),
+        usize::from(rows[1].width.saturating_sub(6)),
     );
-    let body = match &form.error {
-        Some(error) => format!("{}\n\n{}\n\nEnter search · Esc cancel", query, error),
-        None => format!(
-            "{}\n\nEnter search · {} advanced · Esc cancel",
-            query,
-            app.config.hotkeys.search_filesystem.display()
-        ),
+    frame.render_widget(
+        Paragraph::new(format!("> {query}"))
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+    let footer_row = if let Some(error) = &form.error {
+        frame.render_widget(
+            Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red)),
+            rows[2],
+        );
+        rows[3]
+    } else {
+        rows[2]
     };
     frame.render_widget(
-        Paragraph::new(body)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        inner,
+        Paragraph::new(format!(
+            "Enter search · {} advanced · Esc cancel",
+            app.config.hotkeys.search_filesystem.display()
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(MUTED)),
+        footer_row,
     );
 }
 
@@ -3965,6 +3990,75 @@ mod performance_tests {
     }
 
     #[test]
+    fn quick_search_matches_original_compact_prompt() {
+        const SENTINEL: Color = Color::Rgb(0x12, 0x34, 0x56);
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let mut form = SearchForm {
+            draft: crate::search::SearchDraft::quick(temp.path().to_path_buf()),
+            advanced: false,
+            section: crate::app::SearchSection::Match,
+            field: 0,
+            cursors: crate::app::SearchCursors::default(),
+            error: None,
+            return_to: crate::app::SearchReturn::Browser,
+        };
+        form.draft.name = "report".into();
+        form.cursors.name = form.draft.name.chars().count();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(SENTINEL)),
+                    frame.area(),
+                );
+                draw_quick_search(frame, &app, &form);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(24, 15)].symbol(), "┌");
+        assert_eq!(buffer[(95, 15)].symbol(), "┐");
+        assert_eq!(buffer[(24, 23)].symbol(), "└");
+        assert_eq!(buffer[(95, 23)].symbol(), "┘");
+        assert_eq!(buffer[(23, 15)].bg, SENTINEL);
+        assert_eq!(buffer[(96, 23)].bg, SENTINEL);
+        let rows = rendered_rows(&terminal);
+        assert!(rows[15].contains("Search current directory"));
+        assert!(rows[16].contains("Enter a value:"));
+        assert!(rows.iter().any(|row| row.contains("│> report│")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Enter search · F advanced · Esc cancel")));
+
+        app.config = toml::from_str::<Config>("[hotkeys]\nsearch_filesystem = 'G'").unwrap();
+        terminal
+            .draw(|frame| draw_quick_search(frame, &app, &form))
+            .unwrap();
+        let remapped = rendered_text(&terminal);
+        assert!(remapped.contains("Enter search · G advanced · Esc cancel"));
+        assert!(!remapped.contains("F advanced"));
+
+        form.error = Some("enter a search or choose a filter".into());
+        terminal
+            .draw(|frame| draw_quick_search(frame, &app, &form))
+            .unwrap();
+        let validation = rendered_text(&terminal);
+        assert!(validation.contains("enter a search or choose a filter"));
+        for advanced_only in ["Scope", "Match", "Filters", "Traversal", "Help"] {
+            assert!(!validation.contains(advanced_only));
+        }
+    }
+
+    #[test]
     fn search_dialogs_have_no_popup_halo() {
         const SENTINEL: Color = Color::Rgb(0x12, 0x34, 0x56);
         let temp = tempfile::tempdir().unwrap();
@@ -4001,9 +4095,9 @@ mod performance_tests {
                 draw_quick_search(frame, &app, &quick);
             })
             .unwrap();
-        assert_eq!(quick_terminal.backend().buffer()[(23, 14)].bg, SENTINEL);
-        assert!(rendered_text(&quick_terminal).contains("Search"));
-        assert_eq!(quick_terminal.backend().buffer()[(24, 14)].symbol(), "┌");
+        assert_eq!(quick_terminal.backend().buffer()[(23, 15)].bg, SENTINEL);
+        assert!(rendered_text(&quick_terminal).contains("Search current directory"));
+        assert_eq!(quick_terminal.backend().buffer()[(24, 15)].symbol(), "┌");
 
         let mut advanced_terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         advanced_terminal
@@ -4693,13 +4787,26 @@ mod performance_tests {
                 },
                 false,
             );
-            app.mode = AppMode::SearchForm(SearchForm::advanced(
-                temp.path().to_path_buf(),
-                crate::search::SearchScope::CurrentDirectory,
-                crate::app::SearchReturn::Browser,
-            ));
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            for form in [
+                SearchForm {
+                    draft: crate::search::SearchDraft::quick(temp.path().to_path_buf()),
+                    advanced: false,
+                    section: crate::app::SearchSection::Match,
+                    field: 0,
+                    cursors: crate::app::SearchCursors::default(),
+                    error: None,
+                    return_to: crate::app::SearchReturn::Browser,
+                },
+                SearchForm::advanced(
+                    temp.path().to_path_buf(),
+                    crate::search::SearchScope::CurrentDirectory,
+                    crate::app::SearchReturn::Browser,
+                ),
+            ] {
+                app.mode = AppMode::SearchForm(form);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &app)).unwrap();
+            }
         }
     }
 
