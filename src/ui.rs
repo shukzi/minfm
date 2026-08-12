@@ -1281,7 +1281,27 @@ fn draw_search_form(frame: &mut Frame, form: &SearchForm) {
     } else {
         "Search"
     };
-    input_modal(frame, title, &form.draft.name, "Enter search · Esc cancel");
+    let area = centered(frame.area(), 72, 11);
+    draw_popup_halo(frame, area);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let body = match &form.error {
+        Some(error) => format!(
+            "{}\n\n{}\n\nEnter search · Esc cancel",
+            form.draft.name, error
+        ),
+        None => format!("{}\n\nEnter search · Esc cancel", form.draft.name),
+    };
+    frame.render_widget(
+        Paragraph::new(body)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn draw_update_progress(frame: &mut Frame) {
@@ -3196,6 +3216,33 @@ mod performance_tests {
         assert_eq!(icon.style.fg, Some(Color::Gray));
         assert_eq!(icon.style.bg, None);
         assert!(icon.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn search_form_renders_validation_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        app.mode = AppMode::SearchForm(SearchForm {
+            draft: crate::search::SearchDraft::quick(temp.path().to_path_buf()),
+            advanced: false,
+            section: crate::app::SearchSection::Query,
+            field: 0,
+            error: Some("enter a search or choose a filter".into()),
+            return_to: crate::app::SearchReturn::Browser,
+        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        assert!(rendered_text(&terminal).contains("enter a search or choose a filter"));
     }
 
     #[test]
