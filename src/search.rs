@@ -944,6 +944,40 @@ pub struct SearchHit {
     pub rank: MatchRank,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshSummary {
+    pub retained: usize,
+    pub removed: usize,
+    pub renamed: bool,
+}
+
+pub fn refresh_hits(hits: &mut Vec<SearchHit>, renamed: Option<(&Path, &Path)>) -> RefreshSummary {
+    let mut summary = RefreshSummary::default();
+    hits.retain_mut(|hit| {
+        let path = renamed
+            .filter(|(old, _)| hit.entry.path == *old)
+            .map_or(hit.entry.path.as_path(), |(_, new)| new);
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            summary.removed += 1;
+            return false;
+        };
+        let Ok(mut entry) = FileEntry::from_path_metadata(path.to_path_buf(), metadata) else {
+            summary.removed += 1;
+            return false;
+        };
+        if entry.kind != hit.entry.kind {
+            summary.removed += 1;
+            return false;
+        }
+        entry.selected = hit.entry.selected;
+        summary.renamed |= entry.path != hit.entry.path;
+        hit.entry = entry;
+        summary.retained += 1;
+        true
+    });
+    summary
+}
+
 impl PartialEq for SearchHit {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -1328,6 +1362,45 @@ fn fuzzy_penalty(query: &str, candidate: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_hits_updates_metadata_rename_marks_and_removes_stale_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let retained = temp.path().join("retained.txt");
+        let deleted = temp.path().join("deleted.txt");
+        let old = temp.path().join("old.txt");
+        let renamed = temp.path().join("renamed.txt");
+        let replaced = temp.path().join("replaced.txt");
+        for path in [&retained, &deleted, &old, &replaced] {
+            fs::write(path, b"x").unwrap();
+        }
+        let mut hits = [&retained, &deleted, &old, &replaced]
+            .into_iter()
+            .map(|path| hit_for_test(path.clone(), "txt"))
+            .collect::<Vec<_>>();
+        hits[0].entry.selected = true;
+        hits[2].entry.selected = true;
+        fs::write(&retained, b"longer contents").unwrap();
+        fs::remove_file(&deleted).unwrap();
+        fs::rename(&old, &renamed).unwrap();
+        fs::remove_file(&replaced).unwrap();
+        fs::create_dir(&replaced).unwrap();
+
+        let summary = refresh_hits(&mut hits, Some((&old, &renamed)));
+
+        assert_eq!(
+            summary,
+            RefreshSummary {
+                retained: 2,
+                removed: 2,
+                renamed: true
+            }
+        );
+        assert_eq!(hits[0].entry.size, b"longer contents".len() as u64);
+        assert!(hits[0].entry.selected);
+        assert_eq!(hits[1].entry.path, renamed);
+        assert!(hits[1].entry.selected);
+    }
     use chrono::NaiveDateTime;
     use std::{
         collections::BTreeSet,
