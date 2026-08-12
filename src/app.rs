@@ -2760,8 +2760,11 @@ impl App {
             return self.submit_search(form);
         }
         if !form.advanced {
+            let before = form.draft.name.clone();
             edit_cursor_input(&mut form.draft.name, &mut form.cursors.name, key);
-            form.error = None;
+            if form.draft.name != before {
+                form.error = None;
+            }
             return AppMode::SearchForm(form);
         }
 
@@ -7380,6 +7383,39 @@ mod tests {
         app.handle_key(key('x'));
         app.handle_key(key('G'));
         assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.name == "xG"));
+    }
+
+    #[test]
+    fn quick_search_error_clears_only_when_query_value_changes() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('/'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        for code in [KeyCode::Left, KeyCode::Home, KeyCode::Up] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        }
+        app.handle_key(key('x'));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_none() && form.draft.name == "x")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.search
+            .take()
+            .unwrap()
+            .cancel
+            .store(true, Ordering::Relaxed);
+
+        app.mode = AppMode::Browser;
+        app.handle_key(key('/'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_none() && form.draft.name.is_empty())
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
     }
 
     #[test]
