@@ -10,6 +10,7 @@ use std::{
 use chrono::{Local, NaiveDate, TimeZone};
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
+use unicode_casefold::UnicodeCaseFold;
 
 use crate::entry::{EntryKind, FileEntry};
 
@@ -167,13 +168,17 @@ impl Ord for SearchHit {
     fn cmp(&self, other: &Self) -> Ordering {
         self.rank
             .cmp(&other.rank)
-            .then_with(|| {
-                self.entry
-                    .name
-                    .to_lowercase()
-                    .cmp(&other.entry.name.to_lowercase())
-            })
+            .then_with(|| compare_basenames(&self.entry.path, &other.entry.path))
             .then_with(|| self.entry.path.cmp(&other.entry.path))
+    }
+}
+
+fn compare_basenames(left: &Path, right: &Path) -> Ordering {
+    let left = left.file_name().unwrap_or(left.as_os_str());
+    let right = right.file_name().unwrap_or(right.as_os_str());
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => case_fold(left).cmp(&case_fold(right)),
+        _ => left.cmp(right),
     }
 }
 
@@ -343,7 +348,7 @@ fn compile_name(mode: NameMode, pattern: &str) -> Result<NameMatcher, SearchVali
         return Ok(NameMatcher::Any);
     }
     match mode {
-        NameMode::Smart => Ok(NameMatcher::Smart(pattern.to_lowercase())),
+        NameMode::Smart => Ok(NameMatcher::Smart(case_fold(pattern))),
         NameMode::Glob => Glob::new(pattern)
             .map(|glob| NameMatcher::Glob {
                 matcher: glob.compile_matcher(),
@@ -383,7 +388,6 @@ impl CompiledSearch {
     }
 
     pub fn matches_name(&self, relative_path: &Path, basename: &OsStr) -> Option<MatchRank> {
-        let basename = basename.to_string_lossy();
         match &self.matcher {
             NameMatcher::Any => Some(MatchRank {
                 tier: 0,
@@ -393,17 +397,21 @@ impl CompiledSearch {
                 .is_match(if *path {
                     relative_path
                 } else {
-                    Path::new(basename.as_ref())
+                    Path::new(basename)
                 })
                 .then_some(MatchRank {
                     tier: 0,
                     penalty: 0,
                 }),
-            NameMatcher::Regex(regex) => regex.is_match(&basename).then_some(MatchRank {
-                tier: 0,
-                penalty: 0,
+            NameMatcher::Regex(regex) => basename.to_str().and_then(|basename| {
+                regex.is_match(basename).then_some(MatchRank {
+                    tier: 0,
+                    penalty: 0,
+                })
             }),
-            NameMatcher::Smart(query) => smart_rank(query, &basename.to_lowercase()),
+            NameMatcher::Smart(query) => basename
+                .to_str()
+                .and_then(|basename| smart_rank(query, &case_fold(basename))),
         }
     }
 
@@ -436,6 +444,10 @@ impl CompiledSearch {
         }
         true
     }
+}
+
+fn case_fold(text: &str) -> String {
+    text.case_fold().collect()
 }
 
 fn smart_rank(query: &str, candidate: &str) -> Option<MatchRank> {
@@ -500,7 +512,8 @@ mod tests {
     use super::*;
     use chrono::NaiveDateTime;
     use std::{
-        ffi::OsStr,
+        ffi::{OsStr, OsString},
+        os::unix::ffi::OsStringExt,
         path::{Path, PathBuf},
     };
 
@@ -680,6 +693,72 @@ mod tests {
     }
 
     #[test]
+    fn smart_matching_uses_full_unicode_case_folding() {
+        let search = compiled_name(NameMode::Smart, "Straße");
+        assert!(search
+            .matches_name(Path::new("STRASSE"), OsStr::new("STRASSE"))
+            .is_some());
+    }
+
+    #[test]
+    fn invalid_utf8_basenames_do_not_collide_through_replacement_characters() {
+        let invalid_a = OsString::from_vec(vec![b'a', 0x80]);
+        let invalid_b = OsString::from_vec(vec![b'a', 0x81]);
+        let replacement = compiled_name(NameMode::Smart, "a�");
+        assert!(replacement
+            .matches_name(Path::new(&invalid_a), &invalid_a)
+            .is_none());
+        assert!(replacement
+            .matches_name(Path::new(&invalid_b), &invalid_b)
+            .is_none());
+
+        let glob = compiled_name(NameMode::Glob, "a�");
+        assert!(glob
+            .matches_name(Path::new(&invalid_a), &invalid_a)
+            .is_none());
+        assert!(glob
+            .matches_name(Path::new(&invalid_b), &invalid_b)
+            .is_none());
+
+        let regex = compiled_name(NameMode::Regex, "^a�$");
+        assert!(regex
+            .matches_name(Path::new(&invalid_a), &invalid_a)
+            .is_none());
+        assert!(regex
+            .matches_name(Path::new(&invalid_b), &invalid_b)
+            .is_none());
+    }
+
+    #[test]
+    fn hit_ties_use_preserved_path_basenames_before_full_paths() {
+        let rank = MatchRank {
+            tier: 0,
+            penalty: 0,
+        };
+        let first_name = OsString::from_vec(vec![b'a', 0x80]);
+        let second_name = OsString::from_vec(vec![b'a', 0x81]);
+        let mut first = PathBuf::from("/z");
+        first.push(&first_name);
+        let mut second = PathBuf::from("/a");
+        second.push(&second_name);
+        let make_hit = |path: PathBuf, display_name: &str| SearchHit {
+            entry: FileEntry {
+                path,
+                name: display_name.into(),
+                kind: EntryKind::File,
+                size: 0,
+                mode: 0,
+                modified: None,
+                selected: false,
+            },
+            rank,
+        };
+        let first = make_hit(first, "same replacement display");
+        let second = make_hit(second, "same replacement display");
+        assert!(first < second);
+    }
+
+    #[test]
     fn type_mask_toggles_and_filters_each_entry_kind() {
         let kinds = [
             EntryKind::File,
@@ -724,20 +803,20 @@ mod tests {
             penalty: 0,
         };
         let mut hits = [
-            hit("beta", "/b", best),
-            hit("Alpha", "/z", best),
-            hit("alpha", "/a", best),
-            hit("aardvark", "/first", worse),
+            hit("beta", "/root/beta", best),
+            hit("Alpha", "/z/Alpha", best),
+            hit("alpha", "/a/alpha", best),
+            hit("aardvark", "/root/aardvark", worse),
         ];
         hits.sort();
         let paths: Vec<_> = hits.iter().map(|hit| hit.entry.path.as_path()).collect();
         assert_eq!(
             paths,
             [
-                Path::new("/a"),
-                Path::new("/z"),
-                Path::new("/b"),
-                Path::new("/first")
+                Path::new("/a/alpha"),
+                Path::new("/z/Alpha"),
+                Path::new("/root/beta"),
+                Path::new("/root/aardvark")
             ]
         );
     }
