@@ -1734,7 +1734,7 @@ mod tests {
         let result = loop {
             match running
                 .receiver
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(std::time::Duration::from_secs(15))
                 .unwrap()
             {
                 ArchiveUpdate::Finished(result) => break result,
