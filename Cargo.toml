@@ -1,6 +1,6 @@
 [package]
 name = "minfm"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.97.1"
 description = "minfm is a minimal terminal file manager for Linux, written in Rust. It provides intuitive keyboard navigation and integrated disk management (including LUKS functionality)."

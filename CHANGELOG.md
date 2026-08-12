@@ -1,5 +1,34 @@
 # minfm changelog
 
+## v0.6.0
+
+### Added
+
+- Create TAR, compressed TAR, and ZIP archives directly from selected files and
+  directories without additional system packages.
+- Inspect supported archive contents and extract them to a chosen directory.
+- Archive operations run in the background with progress and cancellation.
+- The configurable `archive` shortcut defaults to `z`; older configurations
+  receive the default automatically without being rewritten.
+
+### Fixed
+
+- Successful archive creation clears the source selection and focuses the new
+  archive.
+- Archive files use normal user file permissions, and archive inspection has a
+  dedicated responsive status and shortcut layout.
+- Cancellation remains responsive while processing very large files and cleans
+  incomplete output.
+
+### Security
+
+- Archive extraction rejects unsafe paths, escaping links, duplicate paths,
+  special device entries, overlapping ZIP data, and existing destination
+  items.
+- Creation and extraction use private temporary output and no-replace final
+  installation so failures, cancellation, and concurrent destination changes
+  cannot silently overwrite data.
+
 ## v0.5.3
 
 ### Added
