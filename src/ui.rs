@@ -4291,32 +4291,55 @@ mod performance_tests {
         assert!(rendered.contains("Enter/Esc return"));
     }
 
+    /// Manual baseline (2026-08-12, release build): 90 us at 10,000 retained
+    /// results, 80x24 terminal, median of nine visible-row renders.
     #[test]
     #[ignore]
-    fn benchmark_large_directory_render() {
-        let path = std::env::var_os("MINFM_PERF_LARGE_DIR")
-            .map(PathBuf::from)
-            .expect("MINFM_PERF_LARGE_DIR is required");
-        let app = App::new(
-            path.clone(),
+    fn benchmark_search_render_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
             ConfigLoad::Valid {
                 config: Config::default(),
-                path: path.join("config.toml"),
+                path: temp.path().join("config.toml"),
             },
-            true,
+            false,
         );
-        assert_eq!(app.entries.len(), 20_000);
-        let backend = TestBackend::new(160, 50);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let started = Instant::now();
-        for _ in 0..100 {
+        let mut draft = crate::search::SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "result".into();
+        let retained_results = crate::search::ResultLimit::TenThousand.get();
+        let results = (0..retained_results)
+            .map(|index| {
+                let path = temp.path().join(format!("result-{index:05}.txt"));
+                std::fs::write(&path, []).unwrap();
+                crate::search::hit_for_test(path, "result")
+            })
+            .collect();
+        app.search_results = Some(crate::app::SearchView {
+            request: draft.compile(true).unwrap(),
+            results,
+            selected: retained_results / 2,
+            selected_path: None,
+            skipped: 0,
+            truncated: true,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchResults;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut samples = Vec::with_capacity(9);
+        for _ in 0..9 {
+            let started = Instant::now();
             terminal.draw(|frame| draw(frame, &app)).unwrap();
+            samples.push(started.elapsed().as_micros());
         }
-        let elapsed = started.elapsed();
+        samples.sort_unstable();
+        let median = samples[4];
         eprintln!(
-            "PERF render_100_us={} render_mean_us={}",
-            elapsed.as_micros(),
-            elapsed.as_micros() / 100
+            "PERF search_render_visible_us={median} retained_results={retained_results} visible_rows=18"
+        );
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results.len(),
+            retained_results
         );
     }
 }

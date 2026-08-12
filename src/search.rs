@@ -1363,6 +1363,35 @@ fn fuzzy_penalty(query: &str, candidate: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    const BENCHMARK_RUNS: usize = 9;
+    const BENCHMARK_BATCH_SIZES: [usize; 4] = [1, 32, 64, 128];
+
+    #[derive(Clone, Copy)]
+    struct BenchmarkFixtureSpec {
+        total_files: usize,
+        rg_candidates: usize,
+        matching_files: usize,
+        retention_results: usize,
+    }
+
+    fn benchmark_fixture_spec() -> BenchmarkFixtureSpec {
+        BenchmarkFixtureSpec {
+            total_files: 1_024,
+            rg_candidates: 128,
+            matching_files: 32,
+            retention_results: 20_000,
+        }
+    }
+
+    #[test]
+    fn benchmark_matrix_covers_required_bounded_comparisons() {
+        assert_eq!(BENCHMARK_BATCH_SIZES, [1, 32, 64, 128]);
+        assert_eq!(BENCHMARK_RUNS, 9);
+        assert!(benchmark_fixture_spec().total_files > benchmark_fixture_spec().rg_candidates);
+        assert!(benchmark_fixture_spec().matching_files > 0);
+        assert!(benchmark_fixture_spec().retention_results > ResultLimit::TenThousand.get());
+    }
+
     #[test]
     fn refresh_hits_updates_metadata_rename_marks_and_removes_stale_kinds() {
         let temp = tempfile::tempdir().unwrap();
@@ -2670,6 +2699,325 @@ mod tests {
             }
             mask.toggle(selected);
             assert_eq!(mask, EntryKinds::ANY);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct BenchmarkSample {
+        wall_us: u128,
+        cpu_us: u128,
+        first_us: u128,
+    }
+
+    fn process_cpu_us() -> u128 {
+        let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            return 0;
+        };
+        let values = fields.split_whitespace().collect::<Vec<_>>();
+        // /proc/self/stat fields 14-17 are this process's utime/stime plus
+        // cutime/cstime accumulated from waited-for children, including rg.
+        let ticks = [11, 12, 13, 14]
+            .into_iter()
+            .filter_map(|index| values.get(index)?.parse::<u128>().ok())
+            .sum::<u128>();
+        static TICKS_PER_SECOND: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let hz = *TICKS_PER_SECOND.get_or_init(|| {
+            Command::new("getconf")
+                .arg("CLK_TCK")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(100)
+        });
+        ticks.saturating_mul(1_000_000) / hz
+    }
+
+    fn median(mut values: Vec<u128>) -> u128 {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn median_sample(samples: &[BenchmarkSample]) -> BenchmarkSample {
+        BenchmarkSample {
+            wall_us: median(samples.iter().map(|sample| sample.wall_us).collect()),
+            cpu_us: median(samples.iter().map(|sample| sample.cpu_us).collect()),
+            first_us: median(samples.iter().map(|sample| sample.first_us).collect()),
+        }
+    }
+
+    fn create_benchmark_fixture() -> tempfile::TempDir {
+        let spec = benchmark_fixture_spec();
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..spec.total_files {
+            let directory = temp.path().join(format!("group-{:02}", index % 16));
+            fs::create_dir_all(&directory).unwrap();
+            let candidate = index < spec.rg_candidates;
+            let name = if candidate {
+                format!("report-{index:04}.txt")
+            } else {
+                format!("other-{index:04}.txt")
+            };
+            let contents = if index < spec.matching_files {
+                "deterministic benchmark needle\n"
+            } else {
+                "deterministic benchmark haystack\n"
+            };
+            fs::write(directory.join(name), contents).unwrap();
+        }
+        temp
+    }
+
+    fn filename_sample(root: &Path) -> (BenchmarkSample, usize) {
+        let mut draft = SearchDraft::advanced(root.to_path_buf(), SearchScope::RecursiveHere);
+        draft.name = "report".into();
+        let cpu_started = process_cpu_us();
+        let started = std::time::Instant::now();
+        let running = spawn(draft.compile(true).unwrap());
+        let mut first = None;
+        let mut count = 0;
+        loop {
+            match running.receiver.recv().unwrap() {
+                SearchUpdate::Match(_) => {
+                    first.get_or_insert_with(|| started.elapsed().as_micros());
+                    count += 1;
+                }
+                SearchUpdate::Skipped(_) => {}
+                SearchUpdate::Finished(completion) => {
+                    assert_eq!(completion, SearchCompletion::default());
+                    break;
+                }
+                SearchUpdate::Failed(message) => panic!("search failed: {message}"),
+            }
+        }
+        (
+            BenchmarkSample {
+                wall_us: started.elapsed().as_micros(),
+                cpu_us: process_cpu_us().saturating_sub(cpu_started),
+                first_us: first.expect("fixture must produce a filename result"),
+            },
+            count,
+        )
+    }
+
+    fn content_candidates(
+        root: &Path,
+        cheap_filter_first: bool,
+        request: Option<&CompiledSearch>,
+    ) -> Vec<PathBuf> {
+        let mut candidates = ignore::WalkBuilder::new(root)
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(|entry| entry.into_path())
+            .filter(|path| {
+                if !cheap_filter_first {
+                    return true;
+                }
+                let request = request.expect("filtered candidates need a request");
+                let relative = path.strip_prefix(root).unwrap_or(path);
+                let basename = path.file_name().unwrap_or(path.as_os_str());
+                let Some(_) = request.matches_name(relative, basename) else {
+                    return false;
+                };
+                let Ok(metadata) = fs::symlink_metadata(path) else {
+                    return false;
+                };
+                request.matches_metadata(
+                    FileEntry::kind_from_metadata(&metadata),
+                    metadata.len(),
+                    metadata.modified().ok(),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates
+    }
+
+    fn content_sample(
+        request: &CompiledSearch,
+        candidates: &[PathBuf],
+        batch_size: usize,
+    ) -> (BenchmarkSample, usize, usize) {
+        let cpu_started = process_cpu_us();
+        let started = std::time::Instant::now();
+        let mut first = None;
+        let mut matches = 0;
+        let mut subprocesses = 0;
+        for batch in candidates.chunks(batch_size) {
+            let verified = run_rg_batch(request, batch, &AtomicBool::new(false)).unwrap();
+            subprocesses += 1;
+            if !verified.is_empty() {
+                first.get_or_insert_with(|| started.elapsed().as_micros());
+                matches += verified.len();
+            }
+        }
+        (
+            BenchmarkSample {
+                wall_us: started.elapsed().as_micros(),
+                cpu_us: process_cpu_us().saturating_sub(cpu_started),
+                first_us: first.expect("fixture must produce a content result"),
+            },
+            matches,
+            subprocesses,
+        )
+    }
+
+    /// Manual baseline (2026-08-12, release build, nine warm-cache runs):
+    /// first result 1,076 us; completion 2,148 us on the 1,024-file fixture.
+    /// Compare trends, not absolute timings, across machines and filesystems.
+    #[test]
+    #[ignore]
+    fn benchmark_search_filename() {
+        let fixture = create_benchmark_fixture();
+        let mut samples = Vec::with_capacity(BENCHMARK_RUNS);
+        for _ in 0..BENCHMARK_RUNS {
+            let (sample, matches) = filename_sample(fixture.path());
+            assert_eq!(matches, benchmark_fixture_spec().rg_candidates);
+            samples.push(sample);
+        }
+        let sample = median_sample(&samples);
+        eprintln!(
+            "PERF search_filename_first_result_us={} search_filename_complete_us={} search_filename_cpu_us={}",
+            sample.first_us, sample.wall_us, sample.cpu_us
+        );
+    }
+
+    /// Manual baseline (2026-08-12, release, nine runs): filtered batch 128
+    /// completed in 10,217 us with 128 candidates/one subprocess; unpruned
+    /// batch 128 took 81,987 us with 1,024 candidates/eight subprocesses.
+    /// Executes every required bounded batch size on the identical fixture.
+    #[test]
+    #[ignore]
+    fn benchmark_search_content_comparisons() {
+        assert!(
+            ripgrep_available(),
+            "ripgrep is required for this benchmark"
+        );
+        let fixture = create_benchmark_fixture();
+        let spec = benchmark_fixture_spec();
+        let mut draft =
+            SearchDraft::advanced(fixture.path().to_path_buf(), SearchScope::RecursiveHere);
+        draft.name = "report".into();
+        draft.content = "needle".into();
+        draft.types = EntryKinds::FILES;
+        draft.minimum_size = "1".into();
+        draft.maximum_size = "64".into();
+        draft.modified_after = "1970-01-01".into();
+        let request = draft.compile(true).unwrap();
+        let filtered = content_candidates(fixture.path(), true, Some(&request));
+        let unpruned = content_candidates(fixture.path(), false, None);
+        assert_eq!(filtered.len(), spec.rg_candidates);
+        assert_eq!(unpruned.len(), spec.total_files);
+
+        for (label, candidates) in [("filtered", &filtered), ("unpruned", &unpruned)] {
+            for batch_size in BENCHMARK_BATCH_SIZES {
+                let mut samples = Vec::with_capacity(BENCHMARK_RUNS);
+                let mut subprocesses = 0;
+                for _ in 0..BENCHMARK_RUNS {
+                    let (sample, matches, spawned) =
+                        content_sample(&request, candidates, batch_size);
+                    assert_eq!(matches, spec.matching_files);
+                    subprocesses = spawned;
+                    samples.push(sample);
+                }
+                let sample = median_sample(&samples);
+                let peak_proxy_bytes = candidates
+                    .chunks(batch_size)
+                    .map(|batch| {
+                        batch
+                            .iter()
+                            .map(|path| encoded_arg_bytes(path.as_os_str()))
+                            .sum()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                assert!(batch_size <= RG_BATCH_MAX_PATHS);
+                assert!(peak_proxy_bytes <= RG_BATCH_MAX_ARG_BYTES);
+                eprintln!(
+                    "PERF search_compare mode={label} batch_size={batch_size} wall_us={} cpu_us={} peak_proxy_bytes={peak_proxy_bytes} candidates={} subprocesses={subprocesses} first_result_us={} completion_us={}",
+                    sample.wall_us,
+                    sample.cpu_us,
+                    candidates.len(),
+                    sample.first_us,
+                    sample.wall_us
+                );
+                if label == "filtered" && batch_size == RG_BATCH_MAX_PATHS {
+                    eprintln!(
+                        "PERF search_filtered_candidates={} search_filtered_complete_us={}",
+                        candidates.len(),
+                        sample.wall_us
+                    );
+                    eprintln!(
+                        "PERF search_content_batches={} search_content_complete_us={}",
+                        subprocesses, sample.wall_us
+                    );
+                }
+            }
+        }
+    }
+
+    fn retention_sample(root: &Path, limit: usize) -> (BenchmarkSample, usize) {
+        let mut draft = SearchDraft::advanced(root.to_path_buf(), SearchScope::RecursiveHere);
+        draft.name = "result".into();
+        let mut request = draft.compile(true).unwrap();
+        request.result_limit_override = Some(limit);
+        let cpu = process_cpu_us();
+        let started = std::time::Instant::now();
+        let (hits, completion) = run_traversal(request);
+        assert_eq!(completion.truncated, hits.len() == limit);
+        (
+            BenchmarkSample {
+                wall_us: started.elapsed().as_micros(),
+                cpu_us: process_cpu_us().saturating_sub(cpu),
+                first_us: 0,
+            },
+            hits.len(),
+        )
+    }
+
+    /// Manual baseline (2026-08-12, release, nine runs): production-bounded
+    /// 1,000 results used a 24,000-byte retained-structure proxy and completed
+    /// in 4,269 us versus 480,000 bytes/82,741 us for real collect-all traversal.
+    /// Contrasts the production 1,000 cap with a test-only collect-all limit.
+    #[test]
+    #[ignore]
+    fn benchmark_search_streaming_retention_comparison() {
+        let fixture = create_benchmark_fixture();
+        let retention_root = fixture.path().join("retention");
+        fs::create_dir(&retention_root).unwrap();
+        for index in 0..benchmark_fixture_spec().retention_results {
+            fs::write(retention_root.join(format!("result-{index:05}")), []).unwrap();
+        }
+        let mut bounded_samples = Vec::new();
+        let mut collected_samples = Vec::new();
+        let mut bounded_retained = 0;
+        let mut collected_retained = 0;
+        for _ in 0..BENCHMARK_RUNS {
+            let (sample, retained) =
+                retention_sample(&retention_root, ResultLimit::OneThousand.get());
+            bounded_samples.push(sample);
+            bounded_retained = retained;
+            let (sample, retained) = retention_sample(
+                &retention_root,
+                benchmark_fixture_spec().retention_results + 1,
+            );
+            collected_samples.push(sample);
+            collected_retained = retained;
+        }
+        let bounded = median_sample(&bounded_samples);
+        let collected = median_sample(&collected_samples);
+        for (mode, sample, retained) in [
+            ("bounded", bounded, bounded_retained),
+            ("collect_all", collected, collected_retained),
+        ] {
+            let retained_proxy_bytes = retained * std::mem::size_of::<PathBuf>();
+            eprintln!(
+                "PERF search_retention mode={mode} wall_us={} cpu_us={} retained_results={retained} retained_proxy_bytes={retained_proxy_bytes} first_result_us=0 completion_us={}",
+                sample.wall_us, sample.cpu_us, sample.wall_us
+            );
         }
     }
 
