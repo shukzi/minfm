@@ -4291,7 +4291,7 @@ mod performance_tests {
         assert!(rendered.contains("Enter/Esc return"));
     }
 
-    /// Manual baseline (2026-08-12, release build): 90 us at 10,000 retained
+    /// Manual baseline (2026-08-12, release build): 91 us at 10,000 retained
     /// results, 80x24 terminal, median of nine visible-row renders.
     #[test]
     #[ignore]

@@ -2032,13 +2032,55 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn revalidated_search_entries(
+        &mut self,
+        snapshots: Vec<(PathBuf, EntryKind)>,
+    ) -> Vec<FileEntry> {
+        let mut missing = 0;
+        let mut changed = 0;
+        for (path, expected_kind) in &snapshots {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if FileEntry::kind_from_metadata(&metadata) == *expected_kind => {}
+                Ok(_) => changed += 1,
+                Err(_) => missing += 1,
+            }
+        }
+        self.refresh_search_results(None);
+        let valid = snapshots
+            .iter()
+            .filter_map(|(path, expected_kind)| {
+                self.search_results
+                    .as_ref()?
+                    .results
+                    .iter()
+                    .find_map(|hit| {
+                        (&hit.entry.path == path && hit.entry.kind == *expected_kind)
+                            .then(|| hit.entry.clone())
+                    })
+            })
+            .collect::<Vec<_>>();
+        if changed > 0 {
+            self.set_notice(if snapshots.len() == 1 {
+                "Search result changed type and is no longer available"
+            } else {
+                "One or more search results changed type and were skipped"
+            });
+        } else if missing > 0 {
+            self.set_notice(if snapshots.len() == 1 {
+                "Search result is no longer available"
+            } else {
+                "One or more search results are no longer available and were skipped"
+            });
+        }
+        valid
+    }
+
     fn revalidated_search_targets(&mut self) -> Vec<PathBuf> {
         let snapshots = self
             .search_results
             .as_ref()
             .map(|view| {
-                let targets = target_paths_from_hits(&view.results, view.selected);
-                targets
+                target_paths_from_hits(&view.results, view.selected)
                     .into_iter()
                     .filter_map(|path| {
                         view.results
@@ -2046,49 +2088,20 @@ impl App {
                             .find(|hit| hit.entry.path == path)
                             .map(|hit| (path, hit.entry.kind))
                     })
-                    .collect::<Vec<_>>()
+                    .collect()
             })
             .unwrap_or_default();
-        let mut valid = Vec::new();
-        let mut missing = false;
-        let mut changed = false;
-        for (path, expected_kind) in snapshots {
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if FileEntry::kind_from_metadata(&metadata) == expected_kind => {
-                    valid.push(path);
-                }
-                Ok(_) => changed = true,
-                Err(_) => missing = true,
-            }
-        }
-        if missing || changed {
-            self.refresh_search_results(None);
-            self.set_notice(if changed {
-                "One or more search results changed type and were skipped"
-            } else {
-                "Search result is no longer available"
-            });
-        }
-        valid
+        self.revalidated_search_entries(snapshots)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
     }
 
     fn revalidated_search_entry(&mut self) -> Option<FileEntry> {
         let snapshot = self.focused_search_entry()?.clone();
-        let metadata = match fs::symlink_metadata(&snapshot.path) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                self.refresh_search_results(None);
-                self.set_notice("Search result is no longer available");
-                return None;
-            }
-        };
-        let entry = FileEntry::from_path_metadata(snapshot.path.clone(), metadata).ok()?;
-        if entry.kind != snapshot.kind {
-            self.refresh_search_results(None);
-            self.set_notice("Search result changed type and is no longer available");
-            return None;
-        }
-        Some(entry)
+        self.revalidated_search_entries(vec![(snapshot.path, snapshot.kind)])
+            .into_iter()
+            .next()
     }
 
     fn activate_search_entry(&mut self, editor: bool) -> AppMode {
@@ -3050,7 +3063,17 @@ impl App {
             } else {
                 ClipboardMode::Cut
             };
-            self.set_clipboard_paths(mode, self.search_target_paths());
+            let expected = self.search_target_paths().len();
+            let paths = self.revalidated_search_targets();
+            let skipped = paths.len() != expected;
+            if !paths.is_empty() {
+                self.set_clipboard_paths(mode, paths);
+            }
+            if skipped {
+                self.set_notice(
+                    "One or more search results are no longer available and were skipped",
+                );
+            }
             AppMode::SearchResults
         } else if hotkeys.rename.matches(key) {
             let Some(entry) = self.revalidated_search_entry() else {
@@ -3088,8 +3111,11 @@ impl App {
         } else if hotkeys.open.matches(key) || hotkeys.edit.matches(key) {
             self.activate_search_entry(hotkeys.edit.matches(key))
         } else if hotkeys.info.matches(key) {
+            let Some(entry) = self.revalidated_search_entry() else {
+                return AppMode::SearchResults;
+            };
             self.modal_return = return_to;
-            AppMode::Info(self.focused_search_entry().cloned())
+            AppMode::Info(Some(entry))
         } else if hotkeys.paste.matches(key)
             || hotkeys.create_file.matches(key)
             || hotkeys.create_directory.matches(key)
@@ -6693,6 +6719,79 @@ mod tests {
         app.handle_key(key('n'));
         assert!(matches!(app.mode, AppMode::SearchResults));
         assert_eq!(app.status, "Unavailable in search results");
+    }
+
+    #[test]
+    fn search_result_copy_revalidates_mixed_marked_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let stale = temp.path().join("stale.txt");
+        std::fs::write(&valid, b"updated contents").unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), stale.clone()]);
+        let view = app.search_results.as_mut().unwrap();
+        view.results[0].entry.selected = true;
+        view.results[1].entry.selected = true;
+        view.selected = 1;
+        view.selected_path = Some(stale.clone());
+        std::fs::remove_file(&stale).unwrap();
+
+        app.handle_key(key('c'));
+
+        assert_eq!(app.clipboard.as_ref().unwrap().paths, vec![valid.clone()]);
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.results.len(), 1);
+        assert_eq!(view.results[0].entry.path, valid);
+        assert!(view.results[0].entry.selected);
+        assert_eq!(view.results[0].entry.size, b"updated contents".len() as u64);
+        assert_eq!(view.selected, 0);
+        assert!(app.visible_status().contains("no longer available"));
+    }
+
+    #[test]
+    fn search_result_cut_revalidates_mixed_marked_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let stale = temp.path().join("stale.txt");
+        std::fs::write(&valid, b"valid").unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), stale.clone()]);
+        for hit in &mut app.search_results.as_mut().unwrap().results {
+            hit.entry.selected = true;
+        }
+        std::fs::remove_file(stale).unwrap();
+
+        app.handle_key(key('x'));
+
+        let clipboard = app.clipboard.as_ref().unwrap();
+        assert!(matches!(clipboard.mode, ClipboardMode::Cut));
+        assert_eq!(clipboard.paths, vec![valid]);
+        assert_eq!(app.search_results.as_ref().unwrap().results.len(), 1);
+    }
+
+    #[test]
+    fn search_result_info_revalidates_current_metadata_and_removes_stale_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current.txt");
+        std::fs::write(&current, b"old").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&current));
+        std::fs::write(&current, b"new metadata").unwrap();
+
+        app.handle_key(key('I'));
+
+        assert!(matches!(
+            &app.mode,
+            AppMode::Info(Some(entry)) if entry.path == current && entry.size == b"new metadata".len() as u64
+        ));
+        app.mode = AppMode::SearchResults;
+        std::fs::remove_file(&current).unwrap();
+        app.handle_key(key('I'));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert!(app.visible_status().contains("no longer available"));
     }
 
     #[test]
