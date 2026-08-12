@@ -141,11 +141,11 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.6.0` in
+Pin both the installer and release asset to the same tag. Replace `v0.6.1` in
 both places with the version you want:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.6.0/install.sh | MINFM_VERSION=v0.6.0 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.6.1/install.sh | MINFM_VERSION=v0.6.1 sh
 minfm
 ```
 
@@ -248,6 +248,8 @@ cargo build --release --locked
   a private named pipe that is removed immediately afterward.
 - Persistent mount and encryption options are validated, staged privately, and
   atomically installed in `/etc/fstab` or `/etc/crypttab`.
+- Newly formatted ownership-capable data filesystems are assigned to the
+  formatting user, matching the default behavior of desktop disk tools.
 - Copy and restore operations avoid overwriting existing destinations and clean
   up incomplete output after failure or cancellation.
 - Archive extraction validates paths and links before installation, stages
