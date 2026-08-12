@@ -619,6 +619,7 @@ dependencies = [
  "thiserror",
  "toml",
  "unicode-casefold",
+ "unicode-segmentation",
  "unicode-width",
  "xattr",
  "zip",
