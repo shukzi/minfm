@@ -1407,7 +1407,7 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
             0,
         )
     } else {
-        search_section_text(form, usize::from(control_area.width))
+        search_control_text(form, usize::from(control_area.width))
     };
     let scroll = active_line.saturating_sub(usize::from(control_area.height).saturating_sub(1));
     frame.render_widget(
@@ -1557,42 +1557,252 @@ fn active_search_control_text(form: &SearchForm, width: usize) -> String {
     }
 }
 
-fn search_section_text(form: &SearchForm, width: usize) -> (String, usize) {
+fn search_control_text(form: &SearchForm, width: usize) -> (String, usize) {
     use crate::search::{ContentMode, NameMode, ResultLimit, SearchScope};
-    let mark = |field: usize| if form.field == field { ">" } else { " " };
+    use std::fmt::Write;
+
+    fn choice_marker(active: bool, is_selected: bool) -> (&'static str, &'static str) {
+        (if active { ">" } else { " " }, selected(is_selected))
+    }
+
+    let mut output = String::new();
     match form.section {
-        crate::app::SearchSection::Scope => (format!(
-            "Scope\n{} Scope: {} Current directory / {} Recursive here / {} Entire filesystem\nRoot: {}",
-            mark(0),
-            selected(form.draft.scope == SearchScope::CurrentDirectory),
-            selected(form.draft.scope == SearchScope::RecursiveHere),
-            selected(form.draft.scope == SearchScope::Filesystem),
-            form.draft.root.display()
-        ), 1),
-        crate::app::SearchSection::Match => (format!(
-            "Match\n{} Name mode: {}\n{} Content: {}\n{} Content mode: {}",
-            mark(0),
-            match form.draft.name_mode { NameMode::Smart => "Smart", NameMode::Glob => "Glob", NameMode::Regex => "Regex" },
-            mark(1), cursor_text(&form.draft.content, form.cursors.content, "<optional content>", width.saturating_sub(11)),
-            mark(2),
-            match form.draft.content_mode { ContentMode::Literal => "Literal", ContentMode::Regex => "Regex" },
-        ), form.field + 1),
-        crate::app::SearchSection::Filters => (format!(
-            "Filters\n{} {} Files\n{} {} Directories\n{} {} Symlinks\n{} {} Block devices\n{} {} Other\n{} Minimum size: {}\n{} Maximum size: {}\n{} Modified after: {}\n{} Modified before: {}\n{} Include ignored/hidden: {}",
-            mark(0), selected(form.draft.types.contains(EntryKind::File)), mark(1), selected(form.draft.types.contains(EntryKind::Directory)), mark(2), selected(form.draft.types.contains(EntryKind::Symlink)),
-            mark(3), selected(form.draft.types.contains(EntryKind::BlockDevice)), mark(4), selected(form.draft.types.contains(EntryKind::Other)),
-            mark(5), cursor_text(&form.draft.minimum_size, form.cursors.minimum_size, "—", width.saturating_sub(16)),
-            mark(6), cursor_text(&form.draft.maximum_size, form.cursors.maximum_size, "—", width.saturating_sub(16)),
-            mark(7), cursor_text(&form.draft.modified_after, form.cursors.modified_after, "—", width.saturating_sub(17)),
-            mark(8), cursor_text(&form.draft.modified_before, form.cursors.modified_before, "—", width.saturating_sub(18)),
-            mark(9),
-            if form.draft.include_ignored_hidden { "Yes" } else { "No" }
-        ), form.field + 1),
-        crate::app::SearchSection::Traversal => (format!(
-            "Traversal\n{} Result limit: {}",
-            mark(0),
-            match form.draft.result_limit { ResultLimit::OneThousand => "1,000", ResultLimit::FiveThousand => "5,000", ResultLimit::TenThousand => "10,000" }
-        ), 1),
+        crate::app::SearchSection::Scope => {
+            output.push_str("Scope\n");
+            let choices = [
+                (SearchScope::CurrentDirectory, "Current directory"),
+                (SearchScope::RecursiveHere, "Recursive here"),
+                (SearchScope::Filesystem, "Entire filesystem"),
+            ];
+            for (choice, label) in choices {
+                let is_selected = form.draft.scope == choice;
+                let (active, selected) = choice_marker(is_selected, is_selected);
+                let _ = writeln!(output, "{active} {selected} {label}");
+            }
+            let _ = write!(output, "Root: {}", form.draft.root.display());
+            let selected_index = match form.draft.scope {
+                SearchScope::CurrentDirectory => 0,
+                SearchScope::RecursiveHere => 1,
+                SearchScope::Filesystem => 2,
+            };
+            (output, selected_index + 1)
+        }
+        crate::app::SearchSection::Match => {
+            output.push_str("Match\nName mode\n");
+            for (choice, label) in [
+                (NameMode::Smart, "Smart"),
+                (NameMode::Glob, "Glob"),
+                (NameMode::Regex, "Regex"),
+            ] {
+                let is_selected = form.draft.name_mode == choice;
+                let (active, selected) = choice_marker(form.field == 0 && is_selected, is_selected);
+                let _ = writeln!(output, "{active} {selected} {label}");
+            }
+            let _ = writeln!(
+                output,
+                "{} Content: {}",
+                if form.field == 1 { ">" } else { " " },
+                cursor_text(
+                    &form.draft.content,
+                    form.cursors.content,
+                    "<optional content>",
+                    width.saturating_sub(11),
+                )
+            );
+            output.push_str("Content mode\n");
+            for (choice, label) in [
+                (ContentMode::Literal, "Literal"),
+                (ContentMode::Regex, "Regex"),
+            ] {
+                let is_selected = form.draft.content_mode == choice;
+                let (active, selected) = choice_marker(form.field == 2 && is_selected, is_selected);
+                let _ = writeln!(output, "{active} {selected} {label}");
+            }
+            output.pop();
+            let active_line = match form.field {
+                0 => {
+                    2 + match form.draft.name_mode {
+                        NameMode::Smart => 0,
+                        NameMode::Glob => 1,
+                        NameMode::Regex => 2,
+                    }
+                }
+                1 => 5,
+                _ => {
+                    7 + match form.draft.content_mode {
+                        ContentMode::Literal => 0,
+                        ContentMode::Regex => 1,
+                    }
+                }
+            };
+            (output, active_line)
+        }
+        crate::app::SearchSection::Filters => {
+            output.push_str("Filters\n");
+            for (field, kind, label) in [
+                (0, EntryKind::File, "Files"),
+                (1, EntryKind::Directory, "Directories"),
+                (2, EntryKind::Symlink, "Symlinks"),
+                (3, EntryKind::BlockDevice, "Block devices"),
+                (4, EntryKind::Other, "Other"),
+            ] {
+                let _ = writeln!(
+                    output,
+                    "{} {} {label}",
+                    if form.field == field { ">" } else { " " },
+                    selected(form.draft.types.contains(kind)),
+                );
+            }
+            for (field, label, value, cursor, reserved) in [
+                (
+                    5,
+                    "Minimum size",
+                    form.draft.minimum_size.as_str(),
+                    form.cursors.minimum_size,
+                    16,
+                ),
+                (
+                    6,
+                    "Maximum size",
+                    form.draft.maximum_size.as_str(),
+                    form.cursors.maximum_size,
+                    16,
+                ),
+                (
+                    7,
+                    "Modified after",
+                    form.draft.modified_after.as_str(),
+                    form.cursors.modified_after,
+                    18,
+                ),
+                (
+                    8,
+                    "Modified before",
+                    form.draft.modified_before.as_str(),
+                    form.cursors.modified_before,
+                    19,
+                ),
+            ] {
+                let _ = writeln!(
+                    output,
+                    "{} {label}: {}",
+                    if form.field == field { ">" } else { " " },
+                    cursor_text(value, cursor, "—", width.saturating_sub(reserved)),
+                );
+            }
+            let _ = write!(
+                output,
+                "{} Include ignored/hidden: {}",
+                if form.field == 9 { ">" } else { " " },
+                if form.draft.include_ignored_hidden {
+                    "Yes"
+                } else {
+                    "No"
+                },
+            );
+            (output, form.field + 1)
+        }
+        crate::app::SearchSection::Traversal => {
+            output.push_str("Traversal\n");
+            for (choice, label) in [
+                (ResultLimit::OneThousand, "1,000"),
+                (ResultLimit::FiveThousand, "5,000"),
+                (ResultLimit::TenThousand, "10,000"),
+            ] {
+                let is_selected = form.draft.result_limit == choice;
+                let (active, selected) = choice_marker(is_selected, is_selected);
+                let _ = writeln!(output, "{active} {selected} {label}");
+            }
+            output.pop();
+            let selected_index = match form.draft.result_limit {
+                ResultLimit::OneThousand => 0,
+                ResultLimit::FiveThousand => 1,
+                ResultLimit::TenThousand => 2,
+            };
+            (output, selected_index + 1)
+        }
+    }
+}
+
+#[allow(dead_code)] // Responsive composition consumes this in the next task.
+fn search_help_text(form: &SearchForm) -> &'static str {
+    use crate::search::{ContentMode, NameMode, ResultLimit, SearchScope};
+
+    match (form.section, form.field) {
+        (crate::app::SearchSection::Scope, _) => match form.draft.scope {
+            SearchScope::CurrentDirectory => {
+                "Searches the current directory only. Symbolic links are listed but never followed."
+            }
+            SearchScope::RecursiveHere => {
+                "Searches the current directory and all subfolders. Symbolic links are listed but never followed."
+            }
+            SearchScope::Filesystem => {
+                "Searches the entire filesystem from /. Symbolic links are listed but never followed."
+            }
+        },
+        (crate::app::SearchSection::Match, 0) => match form.draft.name_mode {
+            NameMode::Smart => {
+                "Smart matching ranks exact matches first, then prefix, substring, and fuzzy matches."
+            }
+            NameMode::Glob => {
+                "Glob matching accepts shell-style patterns such as *.rs and report-?.txt."
+            }
+            NameMode::Regex => {
+                "Regex matching treats the name query as a regular expression. Invalid expressions are reported before searching."
+            }
+        },
+        (crate::app::SearchSection::Match, 1) => {
+            "Content search uses ripgrep and applies only to regular files. Leave it empty to search names and filters only."
+        }
+        (crate::app::SearchSection::Match, _) => match form.draft.content_mode {
+            ContentMode::Literal => {
+                "Literal content mode searches for the entered text exactly, without regular-expression syntax."
+            }
+            ContentMode::Regex => {
+                "Regex content mode treats the content query as a regular expression interpreted by ripgrep."
+            }
+        },
+        (crate::app::SearchSection::Filters, 0) => {
+            "Files includes regular files when this entry-kind checkbox is enabled."
+        }
+        (crate::app::SearchSection::Filters, 1) => {
+            "Directories includes folders when this entry-kind checkbox is enabled."
+        }
+        (crate::app::SearchSection::Filters, 2) => {
+            "Symlinks includes symbolic-link entries when enabled; their targets are never followed."
+        }
+        (crate::app::SearchSection::Filters, 3) => {
+            "Block devices includes disk and partition device entries when enabled."
+        }
+        (crate::app::SearchSection::Filters, 4) => {
+            "Other includes entry kinds that are not files, directories, symlinks, or block devices."
+        }
+        (crate::app::SearchSection::Filters, 5) => {
+            "The minimum size is inclusive. Accepted examples include 500 B, 20 KB, 5 MB, 1.5 GB, and 2 GiB. Directories are excluded from size filtering."
+        }
+        (crate::app::SearchSection::Filters, 6) => {
+            "The maximum size is inclusive. Accepted examples include 500 B, 20 KB, 5 MB, 1.5 GB, and 2 GiB. Directories are excluded from size filtering."
+        }
+        (crate::app::SearchSection::Filters, 7) => {
+            "Modified after is an inclusive lower bound. Enter YYYY-MM-DD or a relative age such as 7d."
+        }
+        (crate::app::SearchSection::Filters, 8) => {
+            "Modified before is an inclusive upper bound. Enter YYYY-MM-DD or a relative age such as 7d."
+        }
+        (crate::app::SearchSection::Filters, _) => {
+            "Include ignored/hidden searches hidden entries and entries excluded by ignore rules; disabling it respects those rules."
+        }
+        (crate::app::SearchSection::Traversal, _) => match form.draft.result_limit {
+            ResultLimit::OneThousand => {
+                "Retains at most 1,000 results to keep memory bounded; additional matches are truncated."
+            }
+            ResultLimit::FiveThousand => {
+                "Retains at most 5,000 results to keep memory bounded; additional matches are truncated."
+            }
+            ResultLimit::TenThousand => {
+                "Retains at most 10,000 results to keep memory bounded; additional matches are truncated."
+            }
+        },
     }
 }
 
@@ -3726,6 +3936,272 @@ mod performance_tests {
             assert!(rendered.contains('│'));
             assert!(UnicodeWidthStr::width(rendered.as_str()) <= 24);
         }
+    }
+
+    #[test]
+    fn search_selector_scope_uses_independent_radio_rows_and_marks_selected_choice() {
+        let mut form = SearchForm::advanced(
+            PathBuf::from("/tmp"),
+            crate::search::SearchScope::RecursiveHere,
+            crate::app::SearchReturn::Browser,
+        );
+        form.section = crate::app::SearchSection::Scope;
+        form.field = 0;
+
+        let (rendered, active_line) = search_control_text(&form, 80);
+
+        assert!(rendered
+            .contains("  [ ] Current directory\n> [x] Recursive here\n  [ ] Entire filesystem"));
+        assert_eq!(active_line, 2);
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with('>'))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered.lines().filter(|line| line.contains("[x]")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_selector_name_and_content_modes_use_independent_radio_rows() {
+        let mut form = SearchForm::advanced(
+            PathBuf::from("/tmp"),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        form.section = crate::app::SearchSection::Match;
+
+        for (mode, expected, active_line) in [
+            (
+                crate::search::NameMode::Smart,
+                "> [x] Smart\n  [ ] Glob\n  [ ] Regex",
+                2,
+            ),
+            (
+                crate::search::NameMode::Glob,
+                "  [ ] Smart\n> [x] Glob\n  [ ] Regex",
+                3,
+            ),
+            (
+                crate::search::NameMode::Regex,
+                "  [ ] Smart\n  [ ] Glob\n> [x] Regex",
+                4,
+            ),
+        ] {
+            form.field = 0;
+            form.draft.name_mode = mode;
+            let (rendered, actual_line) = search_control_text(&form, 80);
+            assert!(rendered.contains(expected));
+            assert_eq!(actual_line, active_line);
+            assert_eq!(
+                rendered
+                    .lines()
+                    .filter(|line| line.starts_with('>'))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rendered.lines().filter(|line| line.contains("[x]")).count(),
+                2
+            );
+        }
+
+        for (mode, expected, active_line) in [
+            (
+                crate::search::ContentMode::Literal,
+                "> [x] Literal\n  [ ] Regex",
+                7,
+            ),
+            (
+                crate::search::ContentMode::Regex,
+                "  [ ] Literal\n> [x] Regex",
+                8,
+            ),
+        ] {
+            form.field = 2;
+            form.draft.content_mode = mode;
+            let (rendered, actual_line) = search_control_text(&form, 80);
+            assert!(rendered.contains(expected));
+            assert_eq!(actual_line, active_line);
+            assert_eq!(
+                rendered
+                    .lines()
+                    .filter(|line| line.starts_with('>'))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rendered.lines().filter(|line| line.contains("[x]")).count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn search_selector_result_limits_use_independent_radio_rows() {
+        let mut form = SearchForm::advanced(
+            PathBuf::from("/tmp"),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        form.section = crate::app::SearchSection::Traversal;
+        form.field = 0;
+
+        for (limit, expected, active_line) in [
+            (
+                crate::search::ResultLimit::OneThousand,
+                "> [x] 1,000\n  [ ] 5,000\n  [ ] 10,000",
+                1,
+            ),
+            (
+                crate::search::ResultLimit::FiveThousand,
+                "  [ ] 1,000\n> [x] 5,000\n  [ ] 10,000",
+                2,
+            ),
+            (
+                crate::search::ResultLimit::TenThousand,
+                "  [ ] 1,000\n  [ ] 5,000\n> [x] 10,000",
+                3,
+            ),
+        ] {
+            form.draft.result_limit = limit;
+            let (rendered, actual_line) = search_control_text(&form, 80);
+            assert!(rendered.contains(expected));
+            assert_eq!(actual_line, active_line);
+            assert_eq!(
+                rendered
+                    .lines()
+                    .filter(|line| line.starts_with('>'))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rendered.lines().filter(|line| line.contains("[x]")).count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn search_selector_entry_kinds_are_five_independent_checkbox_rows() {
+        let mut form = SearchForm::advanced(
+            PathBuf::from("/tmp"),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        form.section = crate::app::SearchSection::Filters;
+        form.field = 2;
+        form.draft.types.toggle(EntryKind::File);
+        form.draft.types.toggle(EntryKind::Symlink);
+        form.draft.types.toggle(EntryKind::Other);
+
+        let (rendered, active_line) = search_control_text(&form, 80);
+
+        assert!(rendered.contains(
+            "  [x] Files\n  [ ] Directories\n> [x] Symlinks\n  [ ] Block devices\n  [x] Other"
+        ));
+        assert_eq!(active_line, 3);
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with('>'))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_help_covers_every_search_control() {
+        let mut form = SearchForm::advanced(
+            PathBuf::from("/tmp"),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        for (section, field_count) in [
+            (crate::app::SearchSection::Scope, 1),
+            (crate::app::SearchSection::Match, 3),
+            (crate::app::SearchSection::Filters, 10),
+            (crate::app::SearchSection::Traversal, 1),
+        ] {
+            form.section = section;
+            for field in 0..field_count {
+                form.field = field;
+                assert!(
+                    !search_help_text(&form).trim().is_empty(),
+                    "missing help for {section:?} field {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_help_documents_search_semantics_and_accepted_forms() {
+        let mut form = SearchForm::advanced(
+            PathBuf::from("/tmp"),
+            crate::search::SearchScope::RecursiveHere,
+            crate::app::SearchReturn::Browser,
+        );
+        let scope_help = search_help_text(&form);
+        assert!(scope_help.contains("all subfolders"));
+        assert!(scope_help.contains("never followed"));
+
+        form.section = crate::app::SearchSection::Filters;
+        form.field = 5;
+        let minimum_size_help = search_help_text(&form);
+        assert!(minimum_size_help.contains("500 B"));
+        assert!(minimum_size_help.contains("1.5 GB"));
+        assert!(minimum_size_help.contains("2 GiB"));
+        assert!(minimum_size_help.contains("inclusive"));
+        assert!(minimum_size_help.contains("Directories"));
+
+        form.field = 7;
+        let modified_after_help = search_help_text(&form);
+        assert!(modified_after_help.contains("YYYY-MM-DD"));
+        assert!(modified_after_help.contains("7d"));
+        assert!(modified_after_help.contains("inclusive"));
+
+        form.section = crate::app::SearchSection::Match;
+        form.field = 1;
+        assert!(search_help_text(&form).contains("ripgrep"));
+    }
+
+    #[test]
+    fn search_help_changes_with_selected_scope_and_name_mode() {
+        let mut form = SearchForm::advanced(
+            PathBuf::from("/tmp"),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        let current = search_help_text(&form);
+        form.draft.scope = crate::search::SearchScope::RecursiveHere;
+        let recursive = search_help_text(&form);
+        form.draft.scope = crate::search::SearchScope::Filesystem;
+        let filesystem = search_help_text(&form);
+        assert_ne!(current, recursive);
+        assert_ne!(recursive, filesystem);
+        assert!(current.contains("current directory only"));
+        assert!(recursive.contains("all subfolders"));
+        assert!(filesystem.contains("entire filesystem"));
+
+        form.section = crate::app::SearchSection::Match;
+        form.field = 0;
+        form.draft.name_mode = crate::search::NameMode::Smart;
+        let smart = search_help_text(&form);
+        form.draft.name_mode = crate::search::NameMode::Glob;
+        let glob = search_help_text(&form);
+        form.draft.name_mode = crate::search::NameMode::Regex;
+        let regex = search_help_text(&form);
+        assert_ne!(smart, glob);
+        assert_ne!(glob, regex);
+        for tier in ["exact", "prefix", "substring", "fuzzy"] {
+            assert!(smart.contains(tier));
+        }
+        assert!(glob.contains("*.rs"));
+        assert!(regex.contains("regular expression"));
     }
 
     #[test]
