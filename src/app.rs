@@ -1429,11 +1429,7 @@ impl App {
                     let Some(view) = &mut self.search_results else {
                         continue;
                     };
-                    let insertion = view
-                        .results
-                        .binary_search(&hit)
-                        .unwrap_or_else(|index| index);
-                    view.results.insert(insertion, hit);
+                    insert_search_hit(&mut view.results, hit);
                     self.search_matches = view.results.len();
                     hits_changed = true;
                 }
@@ -6431,6 +6427,11 @@ impl App {
     }
 }
 
+fn insert_search_hit(results: &mut Vec<SearchHit>, hit: SearchHit) {
+    let insertion = results.binary_search(&hit).unwrap_or_else(|index| index);
+    results.insert(insertion, hit);
+}
+
 pub(crate) fn format_elapsed(duration: Duration) -> String {
     let total_tenths = duration.as_millis() / 100;
     let minutes = total_tenths / 600;
@@ -6622,7 +6623,9 @@ pub fn target_paths_from_hits(entries: &[SearchHit], cursor: usize) -> Vec<PathB
 mod tests {
     use super::*;
     use std::{
+        ffi::OsString,
         fs::File,
+        os::unix::ffi::OsStringExt,
         os::unix::fs::PermissionsExt,
         sync::{atomic::AtomicBool, Arc},
     };
@@ -8431,6 +8434,7 @@ mod tests {
         assert_eq!(results.len(), 10_000);
         assert!(results.windows(2).all(|pair| pair[0] <= pair[1]));
         assert_eq!(search::case_fold_calls_for_test(), 0);
+        assert_eq!(search::sort_key_allocations_for_test(), 0);
     }
 
     #[test]
@@ -8440,6 +8444,7 @@ mod tests {
         for _ in 0..9 {
             let (_, elapsed) = poll_synthetic_hits(10_000);
             assert_eq!(search::case_fold_calls_for_test(), 0);
+            assert_eq!(search::sort_key_allocations_for_test(), 0);
             samples.push(elapsed.as_micros());
         }
         samples.sort_unstable();
@@ -8538,6 +8543,83 @@ mod tests {
         assert!(app.poll_search());
         let view = app.search_results.as_ref().unwrap();
         assert_eq!(view.results[0].entry.path, better);
+        assert_eq!(view.results[view.selected].entry.path, selected);
+        assert_eq!(view.selected_path.as_deref(), Some(selected.as_path()));
+    }
+
+    #[test]
+    fn mixed_name_hits_use_production_insertion_order_and_keep_selected_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = |bytes: &[u8], group: &str| {
+            temp.path()
+                .join(group)
+                .join(OsString::from_vec(bytes.to_vec()))
+        };
+        let selected = path(b"Z", "selected");
+        let paths = [
+            selected.clone(),
+            path(b"a", "valid"),
+            path(&[0x60, 0x80], "invalid-0"),
+            path(b"Alpha", "collision-0"),
+            path(b"alpha", "collision-1"),
+            path("Straße".as_bytes(), "unicode-0"),
+            path(b"STRASSE", "unicode-1"),
+            path(&[0x61, 0xff], "invalid-1"),
+        ];
+        let hits = paths
+            .iter()
+            .map(|path| search::synthetic_hit_for_test(path.clone(), "hit".into()))
+            .collect::<Vec<_>>();
+        let mut expected = hits.clone();
+        expected.sort();
+
+        let mut inserted = Vec::new();
+        for index in [2, 6, 0, 7, 3, 1, 5, 4] {
+            insert_search_hit(&mut inserted, hits[index].clone());
+        }
+        assert_eq!(
+            inserted
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>()
+        );
+
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "hit".into();
+        let mut app = test_app(temp.path());
+        app.search_results = Some(SearchView {
+            request: draft.compile(true).unwrap(),
+            results: vec![hits[0].clone()],
+            selected: 0,
+            selected_path: Some(selected.clone()),
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchProgress;
+        app.search = Some(search::running_search_for_test(
+            [2, 6, 7, 3, 1, 5, 4]
+                .into_iter()
+                .map(|index| SearchUpdate::Match(hits[index].clone()))
+                .chain(std::iter::once(SearchUpdate::Finished(Default::default())))
+                .collect(),
+        ));
+        assert!(app.poll_search());
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(
+            view.results
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(view.results[view.selected].entry.path, selected);
         assert_eq!(view.selected_path.as_deref(), Some(selected.as_path()));
     }
