@@ -51,6 +51,7 @@ struct SearchMetrics {
     rg_subprocesses: usize,
     matches: usize,
     first_match_us: Option<u128>,
+    rg_leader_pid: Option<u32>,
 }
 
 #[cfg(test)]
@@ -269,6 +270,10 @@ fn run_rg_batch_with_command(
     let mut child = process
         .spawn()
         .map_err(|error| RgError::Failed(error.to_string()))?;
+    #[cfg(test)]
+    if let Some(metrics) = &request.metrics_hook {
+        metrics.lock().unwrap().rg_leader_pid = Some(child.id());
+    }
 
     #[cfg(test)]
     let mut supervision_polls = 0_usize;
@@ -577,10 +582,11 @@ pub fn spawn(request: CompiledSearch) -> RunningSearch {
 
 #[cfg(test)]
 fn spawn_with_options(
-    request: CompiledSearch,
+    mut request: CompiledSearch,
     options: RunOptions,
     metrics: Option<Arc<std::sync::Mutex<SearchMetrics>>>,
 ) -> RunningSearch {
+    request.metrics_hook = metrics.clone();
     let (match_sender, match_receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
     let (control_sender, control_receiver) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1269,6 +1275,8 @@ pub struct CompiledSearch {
     send_attempt_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     rg_program: Option<PathBuf>,
+    #[cfg(test)]
+    metrics_hook: Option<Arc<std::sync::Mutex<SearchMetrics>>>,
 }
 
 impl SearchDraft {
@@ -1360,6 +1368,8 @@ impl SearchDraft {
             send_attempt_counter: None,
             #[cfg(test)]
             rg_program: None,
+            #[cfg(test)]
+            metrics_hook: None,
         })
     }
 }
@@ -1633,12 +1643,17 @@ mod tests {
     #[test]
     fn streaming_sample_first_result_and_completion_share_origin() {
         let fixture = create_benchmark_fixture();
+        let fake = FakeRg::capturing_arguments();
         let mut draft =
             SearchDraft::advanced(fixture.path().to_path_buf(), SearchScope::RecursiveHere);
         draft.content = "needle".into();
-        let sample = streaming_content_sample(draft.compile(true).unwrap(), RG_BATCH_MAX_PATHS);
+        let mut request = draft.compile(true).unwrap();
+        request.rg_program = Some(fake.command.program.clone());
+        let sample = streaming_content_sample(request, RG_BATCH_MAX_PATHS);
         assert!(sample.timing.first_us <= sample.timing.wall_us);
         assert!(sample.timing.first_us > 0);
+        assert!(fake.capture.exists());
+        assert!(fake.arguments().iter().any(|argument| argument == "needle"));
     }
 
     #[test]
@@ -3133,33 +3148,15 @@ mod tests {
         elapsed.as_micros()
     }
 
-    #[cfg(target_os = "linux")]
-    fn direct_child_pids() -> Vec<String> {
-        fs::read_dir("/proc/self/task")
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
-            .flat_map(|children| {
-                children
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
     fn real_rg_cancellation_sample(request: CompiledSearch) -> Option<u128> {
         let metrics = Arc::new(std::sync::Mutex::new(SearchMetrics::default()));
         let running =
             spawn_with_options(request, RunOptions::default(), Some(Arc::clone(&metrics)));
         let observation_deadline = std::time::Instant::now() + Duration::from_millis(100);
-        let observed_children = loop {
-            #[cfg(target_os = "linux")]
-            {
-                let children = direct_child_pids();
-                if !children.is_empty() {
-                    break children;
+        let observed_pid = loop {
+            if let Some(pid) = metrics.lock().unwrap().rg_leader_pid {
+                if Path::new("/proc").join(pid.to_string()).exists() {
+                    break pid;
                 }
             }
             match running.receiver.try_recv() {
@@ -3170,6 +3167,7 @@ mod tests {
             }
             if std::time::Instant::now() >= observation_deadline {
                 running.cancel.store(true, AtomicOrdering::Relaxed);
+                drain_cancelled_search(&running.receiver);
                 return None;
             }
             thread::yield_now();
@@ -3190,13 +3188,24 @@ mod tests {
         assert!(completion.cancelled);
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_secs(2));
-        for pid in observed_children {
-            assert!(
-                !Path::new("/proc").join(pid).exists(),
-                "real rg child remains"
-            );
-        }
+        assert!(
+            !Path::new("/proc").join(observed_pid.to_string()).exists(),
+            "real rg leader remains"
+        );
         Some(elapsed.as_micros())
+    }
+
+    fn drain_cancelled_search(receiver: &SearchReceiver) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "cancelled retry did not terminate");
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(SearchUpdate::Finished(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Ok(SearchUpdate::Match(_) | SearchUpdate::Skipped(_) | SearchUpdate::Failed(_))
+                | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 
     /// Manual baseline (2026-08-12, release build, nine warm-cache runs):
