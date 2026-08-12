@@ -1,5 +1,22 @@
 # minfm changelog
 
+## Unreleased
+
+### Added
+
+- Advanced search across the current directory, recursively from the current
+  directory, or the filesystem, with smart/glob/regex names and composable
+  type, size, modified-time, ignore/hidden, and optional `rg` content filters.
+- Actionable streaming results support marking, opening, copying, cutting,
+  renaming, trashing, archiving, editing, and viewing information through the
+  existing safe file-operation paths.
+
+### Performance
+
+- Search streams into bounded result and update queues, applies cheap name and
+  metadata filters before optional content work, and invokes `rg` in bounded
+  path/argument batches for responsive completion and cancellation.
+
 ## v0.6.1
 
 ### Fixed

@@ -12,6 +12,8 @@ mod network;
 mod operation;
 mod partition;
 mod safety;
+#[allow(dead_code)] // Foundational API consumed by the following search slices.
+mod search;
 mod trash;
 mod ui;
 mod updater;
@@ -85,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || app.device_refreshing
             || app.network_refreshing
             || app.partition_refreshing
+            || app.search_running()
         {
             Duration::from_millis(16)
         } else {

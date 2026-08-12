@@ -16,7 +16,7 @@ functionality.
 
 - **Navigation:** File and directory navigation with arrow-key and Vim-style controls
 - **Views:** Tree view by default with a toggleable table and details view
-- **Search:** Search the current directory or across the filesystem
+- **Search:** Quick and advanced filename, metadata, and optional content search
 - **Files:** Create, rename, cut, copy, paste, and open files with a preferred text editor or default application
 - **Archives:** Create, inspect, and safely extract TAR, TAR.GZ/TGZ, and ZIP archives
 - **Selection:** Multi-entry selection
@@ -105,10 +105,10 @@ primary text font. Reinstalling or updating minfm preserves every icon override.
 
 The basic file manager needs only a Linux terminal and the installed binary.
 The single install command above handles the rest: it installs minfm, checks the
-tools used by its optional device, Samba, partition, and filesystem features,
-and shows what is missing. It then asks whether it may install the corresponding
-packages with your distribution's package manager. Nothing is installed without
-your confirmation.
+tools used by its optional content-search, device, Samba, partition, and
+filesystem features, and shows what is missing. It then asks whether it may
+install the corresponding packages with your distribution's package manager.
+Nothing is installed without your confirmation.
 
 The installer supports Fedora, Debian/Ubuntu, and Arch Linux. These package
 names are the same on all three:
@@ -116,7 +116,7 @@ names are the same on all three:
 `fontconfig`, `xdg-utils`, `util-linux`, `udisks2`, `cryptsetup`,
 `smartmontools`, `hdparm`, `parted`, `sudo`, `coreutils`, `e2fsprogs`,
 `ntfs-3g`, `dosfstools`, `xfsprogs`, `btrfs-progs`, `f2fs-tools`,
-`exfatprogs`, and `udftools`.
+`exfatprogs`, `udftools`, and `ripgrep`.
 
 Only the Samba package names differ:
 
@@ -124,8 +124,9 @@ Only the Samba package names differ:
 - Debian and Ubuntu: `gvfs-backends`, `libsecret-tools`
 
 You may decline any package prompt and continue using the basic file manager.
-If an optional tool in `M` is unavailable, minfm explains what packages are
-required when you open it.
+Without `ripgrep`, filename and metadata search remain available but content
+search is disabled. If an optional tool in `M` is unavailable, minfm explains
+what packages are required when you open it.
 
 ## Uninstall
 
@@ -215,6 +216,39 @@ entries, and existing destination items rather than silently overwriting data.
 ZIP support covers stored and standard Deflate compression. TAR archives retain
 safe Unix permissions, timestamps, and links; ZIP archives retain permissions
 and safe symbolic links where the format provides them.
+
+## Search
+
+Press `/` for a quick search in the current directory. Type a name and press
+Enter, or press `F` while the query is still empty to expand the same form to
+advanced search. Pressing `F` from the browser opens advanced search for the
+entire filesystem. The advanced form can instead search only the current
+directory or recurse from the current directory.
+
+Name matching supports smart, glob, and regular-expression modes. Smart mode
+is case-insensitive and ranks exact, prefix, substring, and fuzzy matches.
+Name, content, type, size, and modified-time constraints use AND semantics.
+Multiple file types may be selected. Minimum/maximum size and modified-after/
+modified-before bounds are inclusive; size filters exclude directories because
+directory entry sizes do not represent their contents.
+
+Search respects hidden-file and ignore rules by default. The advanced traversal
+option can include ignored and hidden entries. Searches never follow symbolic
+links. Content search is optional and invokes `rg` (ripgrep) in bounded batches;
+there is no slower built-in content-search fallback. If `rg` is unavailable,
+only submissions with a content query are disabled—filename and metadata search
+continue to work.
+
+Results arrive while traversal is running. Press Esc to cancel and return to
+the previous browser or result view. Choose a 1,000, 5,000, or 10,000 result
+cap in the advanced form; reaching it marks the result set as truncated. From
+results you can open directories or files, mark multiple entries, copy, cut,
+rename, trash, archive, edit text files, and view information. Paste targets
+the current browser directory, so return to a directory before pasting copied
+or cut results. Creating files/directories, opening the trash or tools, changing
+sort/view settings, and refreshing are intentionally unavailable in results.
+Operations revalidate result paths and safely remove entries that disappeared
+or changed type since the search.
 
 ## Build from source
 

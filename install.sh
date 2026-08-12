@@ -101,6 +101,38 @@ has_tty() {
     [ -r /dev/tty ] && (: </dev/tty) 2>/dev/null
 }
 
+if ! command -v rg >/dev/null 2>&1; then
+    echo "ripgrep is missing; content search is unavailable."
+    if has_tty; then
+        printf "Install ripgrep now? [y/N] " > /dev/tty
+        read answer < /dev/tty || answer=""
+        case "$answer" in
+            y|Y|yes|YES)
+                ripgrep_installed=false
+                if command -v dnf >/dev/null 2>&1; then
+                    sudo dnf install -y ripgrep && ripgrep_installed=true
+                elif command -v apt-get >/dev/null 2>&1; then
+                    if sudo apt-get update; then
+                        sudo apt-get install -y ripgrep && ripgrep_installed=true
+                    fi
+                elif command -v pacman >/dev/null 2>&1; then
+                    sudo pacman -S --needed ripgrep && ripgrep_installed=true
+                else
+                    echo "No supported package manager found; install ripgrep manually."
+                fi
+                if [ "$ripgrep_installed" = false ]; then
+                    echo "Content search remains unavailable. Filename and metadata search remain available."
+                fi
+                ;;
+            *)
+                echo "Skipped ripgrep. Filename and metadata search remain available."
+                ;;
+        esac
+    else
+        echo "Install the ripgrep package to enable content search. Filename and metadata search remain available."
+    fi
+fi
+
 if ! command -v xdg-open >/dev/null 2>&1; then
     echo "xdg-open is missing; opening files with the default application is unavailable."
     if has_tty; then

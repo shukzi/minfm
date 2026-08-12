@@ -3,9 +3,8 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::Ordering,
         mpsc::{self, Receiver, SyncSender, TryRecvError},
-        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -32,6 +31,10 @@ use crate::{
         self, DeviceIdentity, Filesystem, PartitionAction, PartitionEntry, PartitionInventory,
         PartitionTable,
     },
+    search::{
+        self, CompiledSearch, SearchDraft, SearchHit, SearchScope, SearchUpdate,
+        UPDATES_PER_UI_TICK,
+    },
     trash::{TrashEntry, TrashManager},
     updater,
 };
@@ -52,10 +55,6 @@ pub struct Clipboard {
 pub enum Prompt {
     GoTo {
         input: String,
-    },
-    Search {
-        input: String,
-        scope: SearchScope,
     },
     Rename {
         source: PathBuf,
@@ -196,19 +195,224 @@ pub enum Prompt {
     },
 }
 
+#[allow(dead_code)] // Task 5 consumes the full section navigation state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchScope {
-    CurrentDirectory,
-    Filesystem,
+pub enum SearchSection {
+    Scope,
+    Match,
+    Filters,
+    Traversal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReturn {
+    Browser,
+    Results,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnDestination {
+    Browser,
+    SearchResults,
+}
+
+#[derive(Debug)]
+struct PendingLaunchError {
+    error: LaunchError,
+    return_to: ReturnDestination,
+}
+
+impl ReturnDestination {
+    fn mode(self) -> AppMode {
+        match self {
+            Self::Browser => AppMode::Browser,
+            Self::SearchResults => AppMode::SearchResults,
+        }
+    }
+}
+
+impl SearchReturn {
+    fn mode(self) -> AppMode {
+        match self {
+            Self::Browser => AppMode::Browser,
+            Self::Results => AppMode::SearchResults,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
+pub struct SearchForm {
+    pub draft: SearchDraft,
+    pub advanced: bool,
+    #[allow(dead_code)] // Task 5 owns full field navigation.
+    pub section: SearchSection,
+    #[allow(dead_code)] // Task 5 owns full field navigation.
+    pub field: usize,
+    pub cursors: SearchCursors,
+    pub error: Option<String>,
+    pub return_to: SearchReturn,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchCursors {
+    pub name: usize,
+    pub content: usize,
+    pub minimum_size: usize,
+    pub maximum_size: usize,
+    pub modified_after: usize,
+    pub modified_before: usize,
+}
+
+impl SearchForm {
+    fn quick(root: PathBuf, return_to: SearchReturn) -> Self {
+        Self {
+            draft: SearchDraft::quick(root),
+            advanced: false,
+            section: SearchSection::Match,
+            field: 0,
+            cursors: SearchCursors::default(),
+            error: None,
+            return_to,
+        }
+    }
+
+    pub(crate) fn advanced(root: PathBuf, scope: SearchScope, return_to: SearchReturn) -> Self {
+        Self {
+            draft: SearchDraft::advanced(root, scope),
+            advanced: true,
+            section: SearchSection::Scope,
+            field: 0,
+            cursors: SearchCursors::default(),
+            error: None,
+            return_to,
+        }
+    }
+
+    fn edit_active_text(&mut self, key: KeyEvent) -> Option<bool> {
+        let (input, cursor) = match (self.section, self.field) {
+            (SearchSection::Match, 1) => (&mut self.draft.content, &mut self.cursors.content),
+            (SearchSection::Filters, 5) => {
+                (&mut self.draft.minimum_size, &mut self.cursors.minimum_size)
+            }
+            (SearchSection::Filters, 6) => {
+                (&mut self.draft.maximum_size, &mut self.cursors.maximum_size)
+            }
+            (SearchSection::Filters, 7) => (
+                &mut self.draft.modified_after,
+                &mut self.cursors.modified_after,
+            ),
+            (SearchSection::Filters, 8) => (
+                &mut self.draft.modified_before,
+                &mut self.cursors.modified_before,
+            ),
+            _ => return None,
+        };
+        let before = input.clone();
+        edit_cursor_input(input, cursor, key);
+        Some(*input != before)
+    }
+
+    fn handle_choice_key(&mut self, key: KeyEvent) -> bool {
+        use search::{ContentMode, NameMode, ResultLimit};
+        let forward = key.code == KeyCode::Right;
+        if !matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+        ) {
+            return false;
+        }
+        if key.code == KeyCode::Char(' ') {
+            if let (SearchSection::Filters, field @ 0..=4) = (self.section, self.field) {
+                let kind = [
+                    crate::entry::EntryKind::File,
+                    crate::entry::EntryKind::Directory,
+                    crate::entry::EntryKind::Symlink,
+                    crate::entry::EntryKind::BlockDevice,
+                    crate::entry::EntryKind::Other,
+                ][field];
+                self.draft.types.toggle(kind);
+                return true;
+            }
+            return false;
+        }
+        match (self.section, self.field) {
+            (SearchSection::Scope, 0) => {
+                self.draft.scope = match (self.draft.scope, forward) {
+                    (SearchScope::CurrentDirectory, true) => SearchScope::RecursiveHere,
+                    (SearchScope::RecursiveHere, true) => SearchScope::Filesystem,
+                    (SearchScope::Filesystem, true) => SearchScope::CurrentDirectory,
+                    (SearchScope::CurrentDirectory, false) => SearchScope::Filesystem,
+                    (SearchScope::RecursiveHere, false) => SearchScope::CurrentDirectory,
+                    (SearchScope::Filesystem, false) => SearchScope::RecursiveHere,
+                };
+            }
+            (SearchSection::Match, 0) => {
+                self.draft.name_mode = match (self.draft.name_mode, forward) {
+                    (NameMode::Smart, true) => NameMode::Glob,
+                    (NameMode::Glob, true) => NameMode::Regex,
+                    (NameMode::Regex, true) => NameMode::Smart,
+                    (NameMode::Smart, false) => NameMode::Regex,
+                    (NameMode::Glob, false) => NameMode::Smart,
+                    (NameMode::Regex, false) => NameMode::Glob,
+                };
+            }
+            (SearchSection::Match, 2) => {
+                self.draft.content_mode = match self.draft.content_mode {
+                    ContentMode::Literal => ContentMode::Regex,
+                    ContentMode::Regex => ContentMode::Literal,
+                };
+            }
+            (SearchSection::Filters, 9) => {
+                self.draft.include_ignored_hidden = !self.draft.include_ignored_hidden;
+            }
+            (SearchSection::Traversal, 0) => {
+                self.draft.result_limit = match (self.draft.result_limit, forward) {
+                    (ResultLimit::OneThousand, true) => ResultLimit::FiveThousand,
+                    (ResultLimit::FiveThousand, true) => ResultLimit::TenThousand,
+                    (ResultLimit::TenThousand, true) => ResultLimit::OneThousand,
+                    (ResultLimit::OneThousand, false) => ResultLimit::TenThousand,
+                    (ResultLimit::FiveThousand, false) => ResultLimit::OneThousand,
+                    (ResultLimit::TenThousand, false) => ResultLimit::FiveThousand,
+                };
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl SearchSection {
+    fn moved(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Scope, true) => Self::Match,
+            (Self::Match, true) => Self::Filters,
+            (Self::Filters, true) => Self::Traversal,
+            (Self::Traversal, true) => Self::Scope,
+            (Self::Scope, false) => Self::Traversal,
+            (Self::Match, false) => Self::Scope,
+            (Self::Filters, false) => Self::Match,
+            (Self::Traversal, false) => Self::Filters,
+        }
+    }
+
+    fn field_count(self) -> usize {
+        match self {
+            Self::Scope | Self::Traversal => 1,
+            Self::Match => 3,
+            Self::Filters => 10,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct SearchView {
-    pub query: String,
-    pub results: Vec<PathBuf>,
+    pub request: CompiledSearch,
+    pub results: Vec<SearchHit>,
     pub selected: usize,
+    pub selected_path: Option<PathBuf>,
     pub skipped: usize,
-    pub limited: bool,
+    pub truncated: bool,
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -216,21 +420,6 @@ pub struct ArchiveView {
     pub archive: PathBuf,
     pub entries: Vec<ArchiveEntry>,
     pub selected: usize,
-}
-
-#[derive(Debug)]
-enum SearchUpdate {
-    Match(PathBuf),
-    PermissionDenied,
-    Finished { cancelled: bool, limited: bool },
-}
-
-struct RunningSearch {
-    receiver: Receiver<SearchUpdate>,
-    cancel: Arc<AtomicBool>,
-    query: String,
-    results: Vec<PathBuf>,
-    skipped: usize,
 }
 
 struct RunningUpdateCheck {
@@ -539,12 +728,13 @@ pub enum PartitionOverlay {
 
 pub enum AppMode {
     Browser,
+    SearchForm(SearchForm),
     Archive(ArchiveView),
     Apps(AppsView),
     Prompt(Prompt),
     Progress,
     SearchProgress,
-    SearchResults(SearchView),
+    SearchResults,
     UpdateProgress,
     Trash(TrashView),
     Devices(DeviceView),
@@ -552,7 +742,7 @@ pub enum AppMode {
     NetworkProgress,
     Partitions(PartitionView),
     Help,
-    Info,
+    Info(Option<FileEntry>),
     ConfigError { path: PathBuf, error: String },
 }
 
@@ -614,6 +804,7 @@ pub struct PendingTerminalEditor {
     program: String,
     path: PathBuf,
     browser: Option<BrowserSnapshot>,
+    return_to: ReturnDestination,
 }
 
 impl PendingTerminalEditor {
@@ -645,10 +836,14 @@ pub struct App {
     operation: Option<RunningOperation>,
     archive_operation: Option<RunningArchive>,
     operation_trash_manager: Option<TrashManager>,
+    operation_return: ReturnDestination,
+    operation_search_paths: Vec<PathBuf>,
+    archive_return: ReturnDestination,
+    modal_return: ReturnDestination,
     luks_operation: Option<RunningLuks>,
-    launch_sender: SyncSender<LaunchError>,
-    launch_receiver: Receiver<LaunchError>,
-    pending_launch_errors: VecDeque<LaunchError>,
+    launch_sender: SyncSender<PendingLaunchError>,
+    launch_receiver: Receiver<PendingLaunchError>,
+    pending_launch_errors: VecDeque<PendingLaunchError>,
     pending_terminal_editor: Option<PendingTerminalEditor>,
     last_device_refresh: Instant,
     device_refresh: Option<RunningDeviceRefresh>,
@@ -674,9 +869,10 @@ pub struct App {
     pub browser_loaded_entries: usize,
     pub browser_load_elapsed: Option<Duration>,
     browser_user_navigated: bool,
-    pending_directory_search: Option<String>,
-    pub search_filter: Option<String>,
-    search: Option<RunningSearch>,
+    search: Option<search::RunningSearch>,
+    pub search_results: Option<SearchView>,
+    previous_search_results: Option<SearchView>,
+    search_return: SearchReturn,
     pub search_matches: usize,
     pub search_skipped: usize,
     pub search_cancelling: bool,
@@ -715,6 +911,10 @@ impl App {
             operation: None,
             archive_operation: None,
             operation_trash_manager: None,
+            operation_return: ReturnDestination::Browser,
+            operation_search_paths: Vec::new(),
+            archive_return: ReturnDestination::Browser,
+            modal_return: ReturnDestination::Browser,
             luks_operation: None,
             launch_sender,
             launch_receiver,
@@ -744,9 +944,10 @@ impl App {
             browser_loaded_entries: 0,
             browser_load_elapsed: None,
             browser_user_navigated: false,
-            pending_directory_search: None,
-            search_filter: None,
             search: None,
+            search_results: None,
+            previous_search_results: None,
+            search_return: SearchReturn::Browser,
             search_matches: 0,
             search_skipped: 0,
             search_cancelling: false,
@@ -809,12 +1010,13 @@ impl App {
         let mode = std::mem::replace(&mut self.mode, AppMode::Browser);
         self.mode = match mode {
             AppMode::Browser => self.handle_browser_key(key),
+            AppMode::SearchForm(form) => self.handle_search_form_key(form, key),
             AppMode::Archive(view) => self.handle_archive_key(view, key),
             AppMode::Apps(view) => self.handle_apps_key(view, key),
             AppMode::Prompt(prompt) => self.handle_prompt_key(prompt, key),
             AppMode::Progress => self.handle_progress_key(key),
             AppMode::SearchProgress => self.handle_search_progress_key(key),
-            AppMode::SearchResults(view) => self.handle_search_results_key(view, key),
+            AppMode::SearchResults => self.handle_search_results_key(key),
             AppMode::UpdateProgress => AppMode::UpdateProgress,
             AppMode::Trash(view) => self.handle_trash_key(view, key),
             AppMode::Devices(view) => self.handle_device_key(view, key),
@@ -822,7 +1024,15 @@ impl App {
             AppMode::NetworkProgress => AppMode::NetworkProgress,
             AppMode::Partitions(view) => self.handle_partition_key(view, key),
             AppMode::Help => self.handle_readonly_popup(key, AppMode::Help),
-            AppMode::Info => self.handle_readonly_popup(key, AppMode::Info),
+            AppMode::Info(entry) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+                    || self.config.hotkeys.quit.matches(key)
+                {
+                    self.modal_return.mode()
+                } else {
+                    AppMode::Info(entry)
+                }
+            }
             AppMode::ConfigError { path, error } => self.handle_config_error(path, error, key),
         };
     }
@@ -850,7 +1060,6 @@ impl App {
         let active_generation = running.generation;
         let mut finished = disconnected;
         let mut received_finished = false;
-        let mut reload_without_filter = false;
         for update in updates {
             match update {
                 LoadUpdate::Batch {
@@ -881,7 +1090,6 @@ impl App {
                             if result.root == self.current_dir
                                 && result.view == self.browser_view =>
                         {
-                            let entry_count = result.entries.len();
                             let live_preferred = self
                                 .browser_user_navigated
                                 .then(|| self.selected_entry().map(|entry| entry.path.clone()))
@@ -907,15 +1115,6 @@ impl App {
                             if let Some(warning) = result.warning {
                                 self.status = warning;
                             }
-                            if let Some(query) = self.pending_directory_search.take() {
-                                if entry_count == 0 {
-                                    self.search_filter = None;
-                                    self.status = format!("No match for {query}");
-                                    reload_without_filter = true;
-                                } else {
-                                    self.set_notice(format!("Search: {entry_count} match(es)"));
-                                }
-                            }
                         }
                         Ok(_) => {}
                         Err(error) if error != "directory load cancelled" => {
@@ -937,10 +1136,7 @@ impl App {
                 self.status = "directory load worker stopped unexpectedly".into();
             }
             self.browser_load = None;
-            if reload_without_filter {
-                self.pending_browser_load = None;
-                self.refresh();
-            } else if let Some(request) = self.pending_browser_load.take() {
+            if let Some(request) = self.pending_browser_load.take() {
                 self.browser_loaded_entries = 0;
                 self.browser_loading = true;
                 self.browser_load = Some(browser_loader::spawn(request));
@@ -991,6 +1187,10 @@ impl App {
         self.operation = None;
         let return_to_trash = self.operation_trash_manager.take();
         self.refresh();
+        if !self.operation_search_paths.is_empty() {
+            self.refresh_search_results(None);
+            self.operation_search_paths.clear();
+        }
         if summary.failed.is_empty() && summary.warnings.is_empty() && !summary.cancelled {
             self.set_notice(format!(
                 "{} completed: {} item(s)",
@@ -999,7 +1199,7 @@ impl App {
             self.mode = if let Some(manager) = return_to_trash {
                 self.open_trash_manager(manager)
             } else {
-                AppMode::Browser
+                self.operation_return.mode()
             };
         } else {
             self.mode = AppMode::Prompt(Prompt::Summary {
@@ -1061,7 +1261,10 @@ impl App {
                 }
                 self.refresh_browser(Some(archive));
                 self.set_notice(format!("Archive created: {entries} item(s)"));
-                self.mode = AppMode::Browser;
+                if self.archive_return == ReturnDestination::SearchResults {
+                    self.refresh_search_results(None);
+                }
+                self.mode = self.archive_return.mode();
             }
             Ok(ArchiveOutcome::Listed { archive, entries }) => {
                 self.mode = AppMode::Archive(ArchiveView {
@@ -1082,13 +1285,17 @@ impl App {
                     archive.display(),
                     destination.display()
                 ));
-                self.mode = AppMode::Browser;
+                if self.archive_return == ReturnDestination::SearchResults {
+                    self.refresh_search_results(None);
+                }
+                self.mode = self.archive_return.mode();
             }
             Err(error) if error == "Archive operation cancelled" => {
                 self.set_notice("Archive operation cancelled");
-                self.mode = AppMode::Browser;
+                self.mode = self.archive_return.mode();
             }
             Err(error) => {
+                self.modal_return = self.archive_return;
                 self.mode = AppMode::Prompt(Prompt::Message {
                     title: "Archive operation failed".into(),
                     body: error,
@@ -1197,49 +1404,113 @@ impl App {
             return false;
         };
         let mut finished = None;
+        let mut disconnected = false;
         let mut changed = false;
-        for _ in 0..1_024 {
-            let Ok(update) = search.receiver.try_recv() else {
-                break;
+        let mut hits_changed = false;
+        let selected_path = self.search_results.as_ref().and_then(|view| {
+            view.selected_path.clone().or_else(|| {
+                view.results
+                    .get(view.selected)
+                    .map(|hit| hit.entry.path.clone())
+            })
+        });
+        for _ in 0..UPDATES_PER_UI_TICK {
+            let update = match search.receiver.try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             };
             changed = true;
             match update {
-                SearchUpdate::Match(path) => {
-                    search.results.push(path);
-                    self.search_matches = search.results.len();
+                SearchUpdate::Match(hit) => {
+                    let Some(view) = &mut self.search_results else {
+                        continue;
+                    };
+                    insert_search_hit(&mut view.results, hit);
+                    self.search_matches = view.results.len();
+                    hits_changed = true;
                 }
-                SearchUpdate::PermissionDenied => {
-                    search.skipped += 1;
-                    self.search_skipped = search.skipped;
+                SearchUpdate::Skipped(count) => {
+                    let Some(view) = &mut self.search_results else {
+                        continue;
+                    };
+                    view.skipped += count;
+                    self.search_skipped = view.skipped;
                 }
-                SearchUpdate::Finished { cancelled, limited } => {
-                    finished = Some((cancelled, limited))
+                SearchUpdate::Finished(completion) => finished = Some(completion),
+                SearchUpdate::Failed(error) => {
+                    self.status = error;
+                    if let Some(view) = &mut self.search_results {
+                        view.incomplete = true;
+                    }
+                    finished = Some(Default::default());
                 }
             }
         }
-        let Some((cancelled, limited)) = finished else {
+        if let Some(view) = &mut self.search_results {
+            if hits_changed {
+                view.selected = selected_path
+                    .as_ref()
+                    .and_then(|path| view.results.iter().position(|hit| &hit.entry.path == path))
+                    .unwrap_or_else(|| view.selected.min(view.results.len().saturating_sub(1)));
+                view.selected_path = view
+                    .results
+                    .get(view.selected)
+                    .map(|hit| hit.entry.path.clone());
+            }
+        }
+        if disconnected && finished.is_none() {
+            self.search.take();
+            if self.search_cancelling {
+                self.restore_previous_search_results();
+                self.mode = self.search_return.mode();
+                self.search_cancelling = false;
+                self.set_notice("Search cancelled");
+            } else {
+                if let Some(view) = &mut self.search_results {
+                    view.incomplete = true;
+                }
+                self.mode = AppMode::SearchResults;
+                self.search_cancelling = false;
+                self.status = "Search worker stopped unexpectedly".into();
+            }
+            return true;
+        }
+        let Some(completion) = finished else {
             return changed;
         };
-        let Some(search) = self.search.take() else {
-            return changed;
-        };
+        self.search.take();
         self.search_cancelling = false;
-        if cancelled {
-            self.mode = AppMode::Browser;
-            self.set_notice("Filesystem search cancelled");
+        if completion.cancelled {
+            self.restore_previous_search_results();
+            self.mode = self.search_return.mode();
+            self.set_notice("Search cancelled");
         } else {
-            self.mode = AppMode::SearchResults(SearchView {
-                query: search.query,
-                results: search.results,
-                selected: 0,
-                skipped: search.skipped,
-                limited,
-            });
+            self.previous_search_results = None;
+            if let Some(view) = &mut self.search_results {
+                view.truncated |= completion.truncated;
+                view.incomplete |= completion.incomplete;
+            }
+            self.mode = AppMode::SearchResults;
             if self.search_matches == 0 {
-                self.set_notice("No filesystem matches found");
+                self.set_notice("No search matches found");
             }
         }
         true
+    }
+
+    fn restore_previous_search_results(&mut self) {
+        if let Some(previous) = self.previous_search_results.take() {
+            self.search_results = Some(previous);
+        }
+        self.search_matches = self
+            .search_results
+            .as_ref()
+            .map_or(0, |view| view.results.len());
+        self.search_skipped = self.search_results.as_ref().map_or(0, |view| view.skipped);
     }
 
     pub fn poll_update(&mut self) -> bool {
@@ -1731,7 +2002,8 @@ impl App {
     }
 
     pub fn needs_animation(&self) -> bool {
-        self.browser_loading
+        self.search.is_some()
+            || self.browser_loading
             || self.partition_refreshing
             || matches!(self.mode, AppMode::UpdateProgress)
             || matches!(self.mode, AppMode::NetworkProgress)
@@ -1740,8 +2012,109 @@ impl App {
                 && self.progress.total_bytes == 0)
     }
 
+    pub fn search_running(&self) -> bool {
+        self.search.is_some()
+    }
+
     pub fn selected_entry(&self) -> Option<&FileEntry> {
-        self.entries.get(self.cursor)
+        focused_entry_from(&self.entries, self.cursor)
+    }
+
+    fn focused_search_entry(&self) -> Option<&FileEntry> {
+        self.search_results
+            .as_ref()
+            .and_then(|view| focused_entry_from_hits(&view.results, view.selected))
+    }
+
+    fn search_target_paths(&self) -> Vec<PathBuf> {
+        self.search_results
+            .as_ref()
+            .map(|view| target_paths_from_hits(&view.results, view.selected))
+            .unwrap_or_default()
+    }
+
+    fn revalidated_search_entries(
+        &mut self,
+        snapshots: Vec<(PathBuf, EntryKind)>,
+    ) -> Vec<FileEntry> {
+        let mut missing = 0;
+        let mut changed = 0;
+        for (path, expected_kind) in &snapshots {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if FileEntry::kind_from_metadata(&metadata) == *expected_kind => {}
+                Ok(_) => changed += 1,
+                Err(_) => missing += 1,
+            }
+        }
+        self.refresh_search_results(None);
+        let valid = snapshots
+            .iter()
+            .filter_map(|(path, expected_kind)| {
+                self.search_results
+                    .as_ref()?
+                    .results
+                    .iter()
+                    .find_map(|hit| {
+                        (&hit.entry.path == path && hit.entry.kind == *expected_kind)
+                            .then(|| hit.entry.clone())
+                    })
+            })
+            .collect::<Vec<_>>();
+        if changed > 0 {
+            self.set_notice(if snapshots.len() == 1 {
+                "Search result changed type and is no longer available"
+            } else {
+                "One or more search results changed type and were skipped"
+            });
+        } else if missing > 0 {
+            self.set_notice(if snapshots.len() == 1 {
+                "Search result is no longer available"
+            } else {
+                "One or more search results are no longer available and were skipped"
+            });
+        }
+        valid
+    }
+
+    fn revalidated_search_targets(&mut self) -> Vec<PathBuf> {
+        let snapshots = self
+            .search_results
+            .as_ref()
+            .map(|view| {
+                target_paths_from_hits(&view.results, view.selected)
+                    .into_iter()
+                    .filter_map(|path| {
+                        view.results
+                            .iter()
+                            .find(|hit| hit.entry.path == path)
+                            .map(|hit| (path, hit.entry.kind))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.revalidated_search_entries(snapshots)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+    }
+
+    fn revalidated_search_entry(&mut self) -> Option<FileEntry> {
+        let snapshot = self.focused_search_entry()?.clone();
+        self.revalidated_search_entries(vec![(snapshot.path, snapshot.kind)])
+            .into_iter()
+            .next()
+    }
+
+    fn activate_search_entry(&mut self, editor: bool) -> AppMode {
+        let Some(entry) = self.revalidated_search_entry() else {
+            return AppMode::SearchResults;
+        };
+        if !editor && entry.kind == EntryKind::Directory {
+            self.open_search_result(&entry.path);
+            AppMode::Browser
+        } else {
+            self.open_external_entry(&entry, editor, ReturnDestination::SearchResults)
+        }
     }
 
     pub fn poll_file_launch(&mut self) -> bool {
@@ -1749,20 +2122,21 @@ impl App {
             self.pending_launch_errors.push_back(error);
         }
         let config_error = match &self.mode {
-            AppMode::Browser => Some(None),
+            AppMode::Browser | AppMode::SearchResults => Some(None),
             AppMode::ConfigError { path, error } => Some(Some((path.clone(), error.clone()))),
             _ => None,
         };
         let Some(config_error) = config_error else {
             return false;
         };
-        let Some(error) = self.pending_launch_errors.pop_front() else {
+        let Some(pending) = self.pending_launch_errors.pop_front() else {
             return false;
         };
         self.mode = AppMode::Prompt(Prompt::OpenError {
-            body: error.to_string(),
+            body: pending.error.to_string(),
             config_error,
         });
+        self.modal_return = pending.return_to;
         true
     }
 
@@ -1777,6 +2151,11 @@ impl App {
     ) {
         match result {
             Ok(()) => {
+                if action.return_to == ReturnDestination::SearchResults {
+                    self.refresh_search_results(None);
+                    self.mode = AppMode::SearchResults;
+                    return;
+                }
                 let Some(snapshot) = &action.browser else {
                     return;
                 };
@@ -1794,6 +2173,7 @@ impl App {
                     body: error.to_string(),
                     config_error,
                 });
+                self.modal_return = action.return_to;
             }
         }
     }
@@ -1810,16 +2190,15 @@ impl App {
     }
 
     fn handle_browser_key(&mut self, key: KeyEvent) -> AppMode {
+        self.modal_return = ReturnDestination::Browser;
+        self.operation_return = ReturnDestination::Browser;
+        self.archive_return = ReturnDestination::Browser;
         let hotkeys = self.config.hotkeys.clone();
         if hotkeys.force_quit.matches(key) {
             self.running = false;
             return AppMode::Browser;
         }
-        if key.code == KeyCode::Esc && self.search_filter.is_some() {
-            self.search_filter = None;
-            self.refresh();
-            self.set_notice("Search cleared");
-        } else if hotkeys.quit.matches(key) {
+        if hotkeys.quit.matches(key) {
             self.running = false;
         } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
             self.move_cursor(1);
@@ -1858,15 +2237,16 @@ impl App {
                 input: String::new(),
             });
         } else if hotkeys.search.matches(key) {
-            return AppMode::Prompt(Prompt::Search {
-                input: String::new(),
-                scope: SearchScope::CurrentDirectory,
-            });
+            return AppMode::SearchForm(SearchForm::quick(
+                self.current_dir.clone(),
+                SearchReturn::Browser,
+            ));
         } else if hotkeys.search_filesystem.matches(key) {
-            return AppMode::Prompt(Prompt::Search {
-                input: String::new(),
-                scope: SearchScope::Filesystem,
-            });
+            return AppMode::SearchForm(SearchForm::advanced(
+                PathBuf::from("/"),
+                SearchScope::Filesystem,
+                SearchReturn::Browser,
+            ));
         } else if hotkeys.rename.matches(key) {
             if let Some(entry) = self.selected_entry() {
                 let input = entry.name.clone();
@@ -1907,7 +2287,8 @@ impl App {
         } else if hotkeys.tools.matches(key) {
             return AppMode::Apps(AppsView { selected: 0 });
         } else if hotkeys.info.matches(key) {
-            return AppMode::Info;
+            self.modal_return = ReturnDestination::Browser;
+            return AppMode::Info(self.selected_entry().cloned());
         } else if hotkeys.help.matches(key) {
             return AppMode::Help;
         } else if hotkeys.open.matches(key) || hotkeys.edit.matches(key) {
@@ -1947,7 +2328,7 @@ impl App {
     fn handle_archive_key(&mut self, mut view: ArchiveView, key: KeyEvent) -> AppMode {
         let hotkeys = self.config.hotkeys.clone();
         if key.code == KeyCode::Esc || hotkeys.quit.matches(key) {
-            AppMode::Browser
+            self.archive_return.mode()
         } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
             if !view.entries.is_empty() {
                 view.selected = (view.selected + 1).min(view.entries.len() - 1);
@@ -1973,28 +2354,6 @@ impl App {
                     return AppMode::Browser;
                 }
             }
-            Prompt::Search { input, scope } => {
-                if edit_input(input, key) {
-                    return AppMode::Browser;
-                }
-                if key.code == KeyCode::Enter {
-                    let query = input.trim().to_string();
-                    if query.is_empty() {
-                        self.status = "Search query cannot be empty".into();
-                        return AppMode::Browser;
-                    }
-                    return match scope {
-                        SearchScope::CurrentDirectory => {
-                            self.search_here(&query);
-                            AppMode::Browser
-                        }
-                        SearchScope::Filesystem => {
-                            self.start_filesystem_search(&query);
-                            AppMode::SearchProgress
-                        }
-                    };
-                }
-            }
             Prompt::CreateDirectory { input } => {
                 if edit_input(input, key) {
                     return AppMode::Browser;
@@ -2015,7 +2374,7 @@ impl App {
             }
             Prompt::ArchiveFormat { sources, selected } => {
                 if key.code == KeyCode::Esc {
-                    return AppMode::Browser;
+                    return self.archive_return.mode();
                 }
                 if key.code == KeyCode::Down || hotkeys.down.matches(key) {
                     *selected = (*selected + 1).min(ArchiveFormat::ALL.len() - 1);
@@ -2039,7 +2398,7 @@ impl App {
                 cursor,
             } => {
                 if edit_cursor_input(input, cursor, key) {
-                    return AppMode::Browser;
+                    return self.archive_return.mode();
                 }
                 if key.code == KeyCode::Enter {
                     let name = format.append_extension(input.trim());
@@ -2058,7 +2417,7 @@ impl App {
             }
             Prompt::ArchiveActions { archive, selected } => {
                 if key.code == KeyCode::Esc {
-                    return AppMode::Browser;
+                    return self.archive_return.mode();
                 }
                 if key.code == KeyCode::Down || hotkeys.down.matches(key) {
                     *selected = (*selected + 1).min(1);
@@ -2073,7 +2432,7 @@ impl App {
                     }
                     if self.config.behavior.read_only {
                         self.status = "Read-only mode: archive extraction is disabled".into();
-                        return AppMode::Browser;
+                        return self.archive_return.mode();
                     }
                     let input = self.current_dir.display().to_string();
                     return AppMode::Prompt(Prompt::ArchiveDestination {
@@ -2089,7 +2448,7 @@ impl App {
                 cursor,
             } => {
                 if edit_cursor_input(input, cursor, key) {
-                    return AppMode::Browser;
+                    return self.archive_return.mode();
                 }
                 if key.code == KeyCode::Enter {
                     let destination = PathBuf::from(expand_home(input.trim()));
@@ -2118,26 +2477,28 @@ impl App {
                 cursor,
             } => {
                 if edit_cursor_input(input, cursor, key) {
-                    return AppMode::Browser;
+                    return self.modal_return.mode();
                 }
                 if key.code == KeyCode::Enter {
                     let source = source.clone();
                     let input = input.clone();
                     self.rename(&source, &input);
-                    return AppMode::Browser;
+                    return self.modal_return.mode();
                 }
             }
             Prompt::ConfirmTrash { paths } => match key.code {
                 KeyCode::Enter => {
+                    self.operation_return = self.modal_return;
                     self.start_trash(paths.clone());
                     return AppMode::Progress;
                 }
                 _ if hotkeys.confirm_yes.matches(key) => {
+                    self.operation_return = self.modal_return;
                     self.start_trash(paths.clone());
                     return AppMode::Progress;
                 }
-                KeyCode::Esc => return AppMode::Browser,
-                _ if hotkeys.confirm_no.matches(key) => return AppMode::Browser,
+                KeyCode::Esc => return self.modal_return.mode(),
+                _ if hotkeys.confirm_no.matches(key) => return self.modal_return.mode(),
                 _ => {}
             },
             Prompt::ConfirmOverwrite { sources, cut } => match key.code {
@@ -2477,7 +2838,7 @@ impl App {
             },
             Prompt::Message { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                    return AppMode::Browser;
+                    return self.modal_return.mode();
                 }
             }
             Prompt::SmartReport { body, scroll, view } => match key.code {
@@ -2509,7 +2870,7 @@ impl App {
                     return if let Some((path, error)) = config_error.take() {
                         AppMode::ConfigError { path, error }
                     } else {
-                        AppMode::Browser
+                        self.modal_return.mode()
                     };
                 }
             }
@@ -2520,7 +2881,7 @@ impl App {
                     return if let Some(manager) = return_to_trash.clone() {
                         self.open_trash_manager(manager)
                     } else {
-                        AppMode::Browser
+                        self.operation_return.mode()
                     };
                 }
             }
@@ -2542,6 +2903,128 @@ impl App {
         AppMode::Progress
     }
 
+    fn handle_search_form_key(&mut self, mut form: SearchForm, key: KeyEvent) -> AppMode {
+        if key.code == KeyCode::Esc {
+            return form.return_to.mode();
+        }
+        if !form.advanced
+            && form.draft.name.is_empty()
+            && self.config.hotkeys.search_filesystem.matches(key)
+        {
+            form.advanced = true;
+            form.section = SearchSection::Scope;
+            form.field = 0;
+            return AppMode::SearchForm(form);
+        }
+        if key.code == KeyCode::Enter {
+            return self.submit_search(form);
+        }
+        if !form.advanced {
+            let before = form.draft.name.clone();
+            edit_cursor_input(&mut form.draft.name, &mut form.cursors.name, key);
+            if form.draft.name != before {
+                form.error = None;
+            }
+            return AppMode::SearchForm(form);
+        }
+
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            form.section = form.section.moved(key.code == KeyCode::Down);
+            form.field = 0;
+            return AppMode::SearchForm(form);
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let count = form.section.field_count();
+            form.field = if key.code == KeyCode::BackTab {
+                (form.field + count - 1) % count
+            } else {
+                (form.field + 1) % count
+            };
+            return AppMode::SearchForm(form);
+        }
+        if form.section == SearchSection::Filters
+            && form.field <= 4
+            && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            form.field = if key.code == KeyCode::Left {
+                (form.field + 4) % 5
+            } else {
+                (form.field + 1) % 5
+            };
+            return AppMode::SearchForm(form);
+        }
+        if let Some(changed) = form.edit_active_text(key) {
+            if changed {
+                form.error = None;
+            }
+            return AppMode::SearchForm(form);
+        }
+        let space = key.code == KeyCode::Char(' ');
+        let entry_kind_toggle = form.section == SearchSection::Filters && form.field <= 4 && space;
+        if !space
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+        {
+            let before = form.draft.name.clone();
+            edit_cursor_input(&mut form.draft.name, &mut form.cursors.name, key);
+            if form.draft.name != before {
+                form.error = None;
+            }
+            return AppMode::SearchForm(form);
+        }
+        if (entry_kind_toggle || matches!(key.code, KeyCode::Left | KeyCode::Right))
+            && form.handle_choice_key(key)
+        {
+            form.error = None;
+        }
+        AppMode::SearchForm(form)
+    }
+
+    fn submit_search(&mut self, mut form: SearchForm) -> AppMode {
+        if self.search.is_some() {
+            return AppMode::SearchProgress;
+        }
+        let request = match form.draft.compile(search::ripgrep_available()) {
+            Ok(request) => request,
+            Err(error) => {
+                form.error = Some(error.to_string());
+                return AppMode::SearchForm(form);
+            }
+        };
+        self.search_return = form.return_to;
+        if self.search_results.is_some() {
+            self.previous_search_results = self.search_results.take();
+        } else {
+            self.previous_search_results = None;
+        }
+        self.search_matches = 0;
+        self.search_skipped = 0;
+        self.search_cancelling = false;
+        self.search_results = Some(SearchView {
+            request,
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        let request = self
+            .search_results
+            .as_ref()
+            .expect("search view")
+            .request
+            .clone();
+        self.search = Some(search::spawn(request));
+        AppMode::SearchProgress
+    }
+
     fn handle_search_progress_key(&mut self, key: KeyEvent) -> AppMode {
         if key.code == KeyCode::Esc {
             if let Some(search) = &self.search {
@@ -2552,41 +3035,126 @@ impl App {
         AppMode::SearchProgress
     }
 
-    fn handle_search_results_key(&mut self, view: SearchView, key: KeyEvent) -> AppMode {
-        let mut view = view;
+    fn handle_search_results_key(&mut self, key: KeyEvent) -> AppMode {
         let hotkeys = self.config.hotkeys.clone();
+        let return_to = ReturnDestination::SearchResults;
         if key.code == KeyCode::Esc {
             AppMode::Browser
         } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
-            if !view.results.is_empty() {
-                view.selected = (view.selected + 1).min(view.results.len() - 1);
+            if let Some(view) = &mut self.search_results {
+                if !view.results.is_empty() {
+                    view.selected = (view.selected + 1).min(view.results.len() - 1);
+                    view.selected_path = Some(view.results[view.selected].entry.path.clone());
+                }
             }
-            AppMode::SearchResults(view)
+            AppMode::SearchResults
         } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
-            view.selected = view.selected.saturating_sub(1);
-            AppMode::SearchResults(view)
+            if let Some(view) = &mut self.search_results {
+                view.selected = view.selected.saturating_sub(1);
+                view.selected_path = view
+                    .results
+                    .get(view.selected)
+                    .map(|hit| hit.entry.path.clone());
+            }
+            AppMode::SearchResults
         } else if key.code == KeyCode::Enter
             || key.code == KeyCode::Right
             || hotkeys.expand.matches(key)
         {
-            if let Some(path) = view.results.get(view.selected).cloned() {
-                self.open_search_result(&path);
-                AppMode::Browser
-            } else {
-                AppMode::SearchResults(view)
+            self.activate_search_entry(false)
+        } else if hotkeys.select.matches(key) {
+            if let Some(view) = &mut self.search_results {
+                if let Some(hit) = view.results.get_mut(view.selected) {
+                    hit.entry.selected = !hit.entry.selected;
+                }
             }
+            AppMode::SearchResults
+        } else if hotkeys.copy.matches(key) || hotkeys.cut.matches(key) {
+            let mode = if hotkeys.copy.matches(key) {
+                ClipboardMode::Copy
+            } else {
+                ClipboardMode::Cut
+            };
+            let expected = self.search_target_paths().len();
+            let paths = self.revalidated_search_targets();
+            let skipped = paths.len() != expected;
+            if !paths.is_empty() {
+                self.set_clipboard_paths(mode, paths);
+            }
+            if skipped {
+                self.set_notice(
+                    "One or more search results are no longer available and were skipped",
+                );
+            }
+            AppMode::SearchResults
+        } else if hotkeys.rename.matches(key) {
+            let Some(entry) = self.revalidated_search_entry() else {
+                return AppMode::SearchResults;
+            };
+            let input = entry.name.clone();
+            self.modal_return = return_to;
+            AppMode::Prompt(Prompt::Rename {
+                source: entry.path,
+                cursor: input.chars().count(),
+                input,
+            })
+        } else if hotkeys.trash.matches(key) {
+            let paths = self.revalidated_search_targets();
+            if paths.is_empty() {
+                return AppMode::SearchResults;
+            }
+            let Some(paths) = self.mutation_targets_from(paths) else {
+                return AppMode::SearchResults;
+            };
+            self.modal_return = return_to;
+            AppMode::Prompt(Prompt::ConfirmTrash { paths })
+        } else if hotkeys.quick_trash.matches(key) {
+            let paths = self.revalidated_search_targets();
+            if paths.is_empty() {
+                return AppMode::SearchResults;
+            }
+            let Some(paths) = self.mutation_targets_from(paths) else {
+                return AppMode::SearchResults;
+            };
+            self.operation_return = return_to;
+            self.start_trash(paths);
+            AppMode::Progress
+        } else if hotkeys.archive.matches(key) {
+            self.archive_return = return_to;
+            self.modal_return = return_to;
+            let paths = self.revalidated_search_targets();
+            if paths.is_empty() {
+                AppMode::SearchResults
+            } else {
+                self.prepare_archive_paths(paths)
+            }
+        } else if hotkeys.open.matches(key) || hotkeys.edit.matches(key) {
+            self.activate_search_entry(hotkeys.edit.matches(key))
+        } else if hotkeys.info.matches(key) {
+            let Some(entry) = self.revalidated_search_entry() else {
+                return AppMode::SearchResults;
+            };
+            self.modal_return = return_to;
+            AppMode::Info(Some(entry))
+        } else if hotkeys.paste.matches(key)
+            || hotkeys.create_file.matches(key)
+            || hotkeys.create_directory.matches(key)
+        {
+            self.set_notice("Unavailable in search results");
+            AppMode::SearchResults
         } else if hotkeys.search.matches(key) {
-            AppMode::Prompt(Prompt::Search {
-                input: String::new(),
-                scope: SearchScope::CurrentDirectory,
-            })
+            AppMode::SearchForm(SearchForm::quick(
+                self.current_dir.clone(),
+                SearchReturn::Results,
+            ))
         } else if hotkeys.search_filesystem.matches(key) {
-            AppMode::Prompt(Prompt::Search {
-                input: String::new(),
-                scope: SearchScope::Filesystem,
-            })
+            AppMode::SearchForm(SearchForm::advanced(
+                PathBuf::from("/"),
+                SearchScope::Filesystem,
+                SearchReturn::Results,
+            ))
         } else {
-            AppMode::SearchResults(view)
+            AppMode::SearchResults
         }
     }
 
@@ -4919,10 +5487,16 @@ impl App {
                         program,
                         path: path.clone(),
                         browser: None,
+                        return_to: ReturnDestination::Browser,
                     });
                     return AppMode::ConfigError { path, error };
                 }
-                match launcher::launch(program, path.clone(), self.launch_sender.clone()) {
+                match launcher::launch(program, path.clone(), self.launch_sender.clone(), |error| {
+                    PendingLaunchError {
+                        error,
+                        return_to: ReturnDestination::Browser,
+                    }
+                }) {
                     Ok(()) => AppMode::ConfigError { path, error },
                     Err(launch_error) => AppMode::Prompt(Prompt::OpenError {
                         body: launch_error.to_string(),
@@ -4945,6 +5519,31 @@ impl App {
             self.remember_selection();
         }
         self.refresh_browser(preferred);
+    }
+
+    fn refresh_search_results(&mut self, renamed: Option<(&Path, &Path)>) {
+        let Some(view) = &mut self.search_results else {
+            return;
+        };
+        let selected_path = view
+            .results
+            .get(view.selected)
+            .map(|hit| hit.entry.path.clone());
+        search::refresh_hits(&mut view.results, renamed);
+        let preferred = renamed
+            .and_then(|(old, new)| {
+                (selected_path.as_deref() == Some(old)).then(|| new.to_path_buf())
+            })
+            .or(selected_path);
+        view.selected = preferred
+            .as_ref()
+            .and_then(|path| view.results.iter().position(|hit| &hit.entry.path == path))
+            .unwrap_or_else(|| view.selected.min(view.results.len().saturating_sub(1)));
+        view.selected_path = view
+            .results
+            .get(view.selected)
+            .map(|hit| hit.entry.path.clone());
+        self.search_matches = view.results.len();
     }
 
     fn refresh_browser(&mut self, preferred: Option<PathBuf>) {
@@ -4972,7 +5571,7 @@ impl App {
             view: self.browser_view,
             ui: self.config.ui.clone(),
             expanded: self.expanded_directories.clone(),
-            query: self.search_filter.clone(),
+            query: None,
             marked,
             preferred,
             fallback_cursor: self.cursor,
@@ -5007,14 +5606,8 @@ impl App {
             self.config.ui.directories_first,
         ) {
             Ok(entries) => {
-                let query = self.search_filter.as_deref();
                 let entries = entries
                     .into_iter()
-                    .filter(|entry| {
-                        query.is_none_or(|query| {
-                            entry::contains_case_insensitive(&entry.name, query)
-                        })
-                    })
                     .map(|mut entry| {
                         entry.selected = marked.contains(&entry.path);
                         entry
@@ -5047,18 +5640,12 @@ impl App {
             .collect::<HashSet<_>>();
         match self.read_expanded_tree() {
             Ok((entries, depths, nested_error)) => {
-                let query = self.search_filter.as_deref();
                 let (entries, depths): (Vec<_>, Vec<_>) = entries
                     .into_iter()
                     .zip(depths)
-                    .filter(|(entry, _)| {
-                        query.is_none_or(|query| {
-                            entry::contains_case_insensitive(&entry.name, query)
-                        })
-                    })
                     .map(|(mut entry, depth)| {
                         entry.selected = marked.contains(&entry.path);
-                        (entry, if query.is_some() { 0 } else { depth })
+                        (entry, depth)
                     })
                     .unzip();
                 self.cursor = preferred
@@ -5279,44 +5866,6 @@ impl App {
         }
     }
 
-    fn search_here(&mut self, query: &str) {
-        self.search_filter = Some(query.to_lowercase());
-        if cfg!(test) {
-            self.refresh();
-            if self.entries.is_empty() {
-                self.search_filter = None;
-                self.refresh();
-                self.status = format!("No match for {query}");
-            } else {
-                self.set_notice(format!("Search: {} match(es)", self.entries.len()));
-            }
-        } else {
-            self.pending_directory_search = Some(query.into());
-            self.refresh();
-        }
-    }
-
-    fn start_filesystem_search(&mut self, query: &str) {
-        const SEARCH_QUEUE_CAPACITY: usize = 512;
-        let (sender, receiver) = mpsc::sync_channel(SEARCH_QUEUE_CAPACITY);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        let query_lower = query.to_lowercase();
-        thread::spawn(move || {
-            search_filesystem(Path::new("/"), &query_lower, &sender, &worker_cancel);
-        });
-        self.search_matches = 0;
-        self.search_skipped = 0;
-        self.search_cancelling = false;
-        self.search = Some(RunningSearch {
-            receiver,
-            cancel,
-            query: query.into(),
-            results: Vec::new(),
-            skipped: 0,
-        });
-    }
-
     fn start_update_check(&mut self) {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -5344,7 +5893,6 @@ impl App {
     }
 
     fn open_search_result(&mut self, path: &Path) {
-        self.search_filter = None;
         if path.is_dir() {
             self.go_to(path.to_path_buf());
             return;
@@ -5378,27 +5926,18 @@ impl App {
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
-        let selected: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.selected)
-            .map(|entry| entry.path.clone())
-            .collect();
-        if selected.is_empty() {
-            self.selected_entry()
-                .map(|entry| vec![entry.path.clone()])
-                .unwrap_or_default()
-        } else {
-            selected
-        }
+        target_paths_from(&self.entries, self.cursor)
     }
 
     fn mutation_targets(&mut self) -> Option<Vec<PathBuf>> {
+        self.mutation_targets_from(self.selected_paths())
+    }
+
+    fn mutation_targets_from(&mut self, paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
         if self.config.behavior.read_only {
             self.status = "Read-only mode: file operations are disabled".into();
             return None;
         }
-        let paths = self.selected_paths();
         if paths.is_empty() {
             self.status = "Nothing selected".into();
             None
@@ -5408,15 +5947,18 @@ impl App {
     }
 
     fn prepare_archive(&mut self) -> AppMode {
-        let paths = self.selected_paths();
+        self.prepare_archive_paths(self.selected_paths())
+    }
+
+    fn prepare_archive_paths(&mut self, paths: Vec<PathBuf>) -> AppMode {
         if paths.len() == 1 && paths[0].is_file() && ArchiveFormat::detect(&paths[0]).is_some() {
             return AppMode::Prompt(Prompt::ArchiveActions {
                 archive: paths[0].clone(),
                 selected: 0,
             });
         }
-        let Some(sources) = self.mutation_targets() else {
-            return AppMode::Browser;
+        let Some(sources) = self.mutation_targets_from(paths) else {
+            return self.modal_return.mode();
         };
         AppMode::Prompt(Prompt::ArchiveFormat {
             sources,
@@ -5433,7 +5975,11 @@ impl App {
     }
 
     fn set_clipboard(&mut self, mode: ClipboardMode) {
-        let Some(paths) = self.mutation_targets() else {
+        self.set_clipboard_paths(mode, self.selected_paths());
+    }
+
+    fn set_clipboard_paths(&mut self, mode: ClipboardMode, paths: Vec<PathBuf>) {
+        let Some(paths) = self.mutation_targets_from(paths) else {
             return;
         };
         let count = paths.len();
@@ -5475,6 +6021,20 @@ impl App {
         self.progress = ProgressState::default();
         self.progress.cancellable = true;
         self.operation_trash_manager = None;
+        self.operation_search_paths = if cut {
+            self.search_results
+                .as_ref()
+                .map(|view| {
+                    sources
+                        .iter()
+                        .filter(|source| view.results.iter().any(|hit| &hit.entry.path == *source))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.operation = Some(operation::spawn(OperationRequest::Copy {
             sources,
             destination: self.current_dir.clone(),
@@ -5497,6 +6057,17 @@ impl App {
         self.progress = ProgressState::default();
         self.progress.cancellable = true;
         self.operation_trash_manager = None;
+        self.operation_search_paths = self
+            .search_results
+            .as_ref()
+            .map(|view| {
+                paths
+                    .iter()
+                    .filter(|path| view.results.iter().any(|hit| &hit.entry.path == *path))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         self.operation = Some(operation::spawn(OperationRequest::Trash {
             paths,
             current_dir: self.current_dir.clone(),
@@ -5627,7 +6198,15 @@ impl App {
                 false
             }
         };
-        self.refresh_browser(renamed.then_some(destination));
+        if self.modal_return == ReturnDestination::SearchResults {
+            if renamed {
+                self.refresh_search_results(Some((source, &destination)));
+            } else {
+                self.refresh_search_results(None);
+            }
+        } else {
+            self.refresh_browser(renamed.then_some(destination));
+        }
     }
 
     fn open_trash(&mut self) -> AppMode {
@@ -5812,15 +6391,24 @@ impl App {
     }
 
     fn open_external(&mut self, editor: bool) -> AppMode {
-        if self.config.behavior.read_only {
-            self.status = "Read-only mode: external opening is disabled".into();
-            return AppMode::Browser;
-        }
-        let Some(entry) = self.selected_entry() else {
+        let Some(entry) = self.selected_entry().cloned() else {
             return AppMode::Browser;
         };
+        self.open_external_entry(&entry, editor, ReturnDestination::Browser)
+    }
+
+    fn open_external_entry(
+        &mut self,
+        entry: &FileEntry,
+        editor: bool,
+        return_to: ReturnDestination,
+    ) -> AppMode {
+        if self.config.behavior.read_only {
+            self.status = "Read-only mode: external opening is disabled".into();
+            return return_to.mode();
+        };
         if editor && !entry.is_text_file() {
-            return AppMode::Browser;
+            return return_to.mode();
         }
         let path = entry.path.clone();
         let program = if editor {
@@ -5829,30 +6417,38 @@ impl App {
             self.config.open.opener.clone()
         };
         if editor && launcher::is_terminal_editor(&program) {
-            let selected_paths = self
-                .entries
-                .iter()
-                .filter(|entry| entry.selected)
-                .map(|entry| entry.path.clone())
+            let selected_paths = target_paths_from(&self.entries, self.cursor)
+                .into_iter()
                 .collect();
             self.pending_terminal_editor = Some(PendingTerminalEditor {
                 program,
                 path: path.clone(),
-                browser: Some(BrowserSnapshot {
+                browser: (return_to == ReturnDestination::Browser).then(|| BrowserSnapshot {
                     cursor_path: path,
                     selected_paths,
                 }),
+                return_to,
             });
-            return AppMode::Browser;
+            return return_to.mode();
         }
-        if let Err(error) = launcher::launch(program, path, self.launch_sender.clone()) {
+        if let Err(error) =
+            launcher::launch(program, path, self.launch_sender.clone(), move |error| {
+                PendingLaunchError { error, return_to }
+            })
+        {
+            self.modal_return = return_to;
             return AppMode::Prompt(Prompt::OpenError {
                 body: error.to_string(),
                 config_error: None,
             });
         }
-        AppMode::Browser
+        return_to.mode()
     }
+}
+
+fn insert_search_hit(results: &mut Vec<SearchHit>, hit: SearchHit) {
+    let insertion = results.binary_search(&hit).unwrap_or_else(|index| index);
+    results.insert(insertion, hit);
 }
 
 pub(crate) fn format_elapsed(duration: Duration) -> String {
@@ -5998,103 +6594,70 @@ fn validate_archive_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn search_filesystem(
-    root: &Path,
-    query: &str,
-    sender: &SyncSender<SearchUpdate>,
-    cancel: &AtomicBool,
-) {
-    const MAX_RESULTS: usize = 10_000;
-    let mut pending = vec![root.to_path_buf()];
-    let mut result_count = 0;
-    let mut cancelled = false;
-    let mut limited = false;
-
-    while let Some(directory) = pending.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            cancelled = true;
-            break;
-        }
-        if is_virtual_search_path(&directory) {
-            continue;
-        }
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(_) => {
-                let _ = sender.send(SearchUpdate::PermissionDenied);
-                continue;
-            }
-        };
-        for item in entries {
-            if cancel.load(Ordering::Relaxed) {
-                cancelled = true;
-                break;
-            }
-            let item = match item {
-                Ok(item) => item,
-                Err(_) => {
-                    let _ = sender.send(SearchUpdate::PermissionDenied);
-                    continue;
-                }
-            };
-            let file_type = match item.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => {
-                    let _ = sender.send(SearchUpdate::PermissionDenied);
-                    continue;
-                }
-            };
-            let file_name = item.file_name();
-            let matches = entry::contains_case_insensitive(&file_name.to_string_lossy(), query);
-            let is_directory = file_type.is_dir() && !file_type.is_symlink();
-            if is_directory {
-                let path = item.path();
-                pending.push(path.clone());
-                if !matches {
-                    continue;
-                }
-                if result_count >= MAX_RESULTS {
-                    limited = true;
-                    break;
-                }
-                result_count += 1;
-                let _ = sender.send(SearchUpdate::Match(path));
-            } else if matches {
-                if result_count >= MAX_RESULTS {
-                    limited = true;
-                    break;
-                }
-                result_count += 1;
-                let _ = sender.send(SearchUpdate::Match(item.path()));
-            }
-        }
-        if cancelled || limited {
-            break;
-        }
-    }
-    let _ = sender.send(SearchUpdate::Finished { cancelled, limited });
-}
-
-fn is_virtual_search_path(path: &Path) -> bool {
-    if path == Path::new("/run") || path.starts_with("/run/media") {
-        return false;
-    }
-    ["/proc", "/sys", "/dev", "/run"]
-        .iter()
-        .map(Path::new)
-        .any(|excluded| path == excluded || path.starts_with(excluded))
-}
-
 fn command_available(command: &str) -> bool {
     env::var_os("PATH")
         .map(|paths| env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
         .unwrap_or(false)
 }
 
+pub fn focused_entry_from(entries: &[FileEntry], cursor: usize) -> Option<&FileEntry> {
+    entries.get(cursor)
+}
+
+pub fn target_paths_from(entries: &[FileEntry], cursor: usize) -> Vec<PathBuf> {
+    let marked = entries
+        .iter()
+        .filter(|entry| entry.selected)
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if marked.is_empty() {
+        focused_entry_from(entries, cursor)
+            .map(|entry| vec![entry.path.clone()])
+            .unwrap_or_default()
+    } else {
+        marked
+    }
+}
+
+pub fn focused_entry_from_hits(entries: &[SearchHit], cursor: usize) -> Option<&FileEntry> {
+    entries.get(cursor).map(|hit| &hit.entry)
+}
+
+pub fn target_paths_from_hits(entries: &[SearchHit], cursor: usize) -> Vec<PathBuf> {
+    let marked = entries
+        .iter()
+        .filter(|hit| hit.entry.selected)
+        .map(|hit| hit.entry.path.clone())
+        .collect::<Vec<_>>();
+    if marked.is_empty() {
+        focused_entry_from_hits(entries, cursor)
+            .map(|entry| vec![entry.path.clone()])
+            .unwrap_or_default()
+    } else {
+        marked
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::File, os::unix::fs::PermissionsExt};
+    use std::{
+        ffi::OsString,
+        fs::File,
+        os::unix::ffi::OsStringExt,
+        os::unix::fs::PermissionsExt,
+        sync::{atomic::AtomicBool, Arc},
+    };
+
+    fn wait_for_search(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.search.is_some() && Instant::now() < deadline {
+            if !app.poll_search() {
+                thread::yield_now();
+            }
+        }
+        assert!(app.search.is_none(), "search worker timed out");
+    }
 
     fn test_app(root: &Path) -> App {
         let config = Config::default();
@@ -6106,6 +6669,515 @@ mod tests {
             },
             false,
         )
+    }
+
+    fn key(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn browser_and_search_result_selection_share_mark_then_cursor_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ["one.txt", "two.txt", "three.txt"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"").unwrap();
+        }
+        let mut entries = paths
+            .iter()
+            .map(|path| search::hit_for_test(path.clone(), "txt").entry)
+            .collect::<Vec<_>>();
+        entries[0].selected = true;
+        entries[1].selected = true;
+        let mut hits = entries
+            .iter()
+            .cloned()
+            .map(|entry| search::hit_for_test(entry.path, "txt"))
+            .collect::<Vec<_>>();
+        hits[0].entry.selected = true;
+        hits[1].entry.selected = true;
+
+        assert_eq!(target_paths_from(&entries, 2), paths[..2]);
+        assert_eq!(target_paths_from_hits(&hits, 2), paths[..2]);
+        entries.iter_mut().for_each(|entry| entry.selected = false);
+        hits.iter_mut().for_each(|hit| hit.entry.selected = false);
+        assert_eq!(target_paths_from(&entries, 2), vec![paths[2].clone()]);
+        assert_eq!(target_paths_from_hits(&hits, 2), vec![paths[2].clone()]);
+        assert!(std::ptr::eq(
+            focused_entry_from(&entries, 2).unwrap(),
+            &entries[2]
+        ));
+    }
+
+    fn install_search_results(app: &mut App, paths: &[PathBuf]) {
+        let mut draft = SearchDraft::quick(app.current_dir.clone());
+        draft.name = "txt".into();
+        app.search_results = Some(SearchView {
+            request: draft.compile(true).unwrap(),
+            results: paths
+                .iter()
+                .map(|path| search::hit_for_test(path.clone(), "txt"))
+                .collect(),
+            selected: 0,
+            selected_path: paths.first().cloned(),
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchResults;
+    }
+
+    #[test]
+    fn search_results_select_copy_and_unavailable_creation_use_result_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        std::fs::write(&first, b"").unwrap();
+        std::fs::write(&second, b"").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[first.clone(), second.clone()]);
+
+        app.handle_key(key(' '));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(key(' '));
+        app.handle_key(key('c'));
+        assert_eq!(app.clipboard.as_ref().unwrap().paths, vec![first, second]);
+        assert!(matches!(app.mode, AppMode::SearchResults));
+
+        app.handle_key(key('n'));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert_eq!(app.status, "Unavailable in search results");
+    }
+
+    #[test]
+    fn search_result_copy_revalidates_mixed_marked_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let stale = temp.path().join("stale.txt");
+        std::fs::write(&valid, b"updated contents").unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), stale.clone()]);
+        let view = app.search_results.as_mut().unwrap();
+        view.results[0].entry.selected = true;
+        view.results[1].entry.selected = true;
+        view.selected = 1;
+        view.selected_path = Some(stale.clone());
+        std::fs::remove_file(&stale).unwrap();
+
+        app.handle_key(key('c'));
+
+        assert_eq!(app.clipboard.as_ref().unwrap().paths, vec![valid.clone()]);
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.results.len(), 1);
+        assert_eq!(view.results[0].entry.path, valid);
+        assert!(view.results[0].entry.selected);
+        assert_eq!(view.results[0].entry.size, b"updated contents".len() as u64);
+        assert_eq!(view.selected, 0);
+        assert!(app.visible_status().contains("no longer available"));
+    }
+
+    #[test]
+    fn search_result_cut_revalidates_mixed_marked_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let stale = temp.path().join("stale.txt");
+        std::fs::write(&valid, b"valid").unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), stale.clone()]);
+        for hit in &mut app.search_results.as_mut().unwrap().results {
+            hit.entry.selected = true;
+        }
+        std::fs::remove_file(stale).unwrap();
+
+        app.handle_key(key('x'));
+
+        let clipboard = app.clipboard.as_ref().unwrap();
+        assert!(matches!(clipboard.mode, ClipboardMode::Cut));
+        assert_eq!(clipboard.paths, vec![valid]);
+        assert_eq!(app.search_results.as_ref().unwrap().results.len(), 1);
+    }
+
+    #[test]
+    fn search_result_info_revalidates_current_metadata_and_removes_stale_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current.txt");
+        std::fs::write(&current, b"old").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&current));
+        std::fs::write(&current, b"new metadata").unwrap();
+
+        app.handle_key(key('I'));
+
+        assert!(matches!(
+            &app.mode,
+            AppMode::Info(Some(entry)) if entry.path == current && entry.size == b"new metadata".len() as u64
+        ));
+        app.mode = AppMode::SearchResults;
+        std::fs::remove_file(&current).unwrap();
+        app.handle_key(key('I'));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert!(app.visible_status().contains("no longer available"));
+    }
+
+    #[test]
+    fn search_result_rename_returns_to_results_and_refreshes_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old.txt");
+        let new = temp.path().join("new.txt");
+        std::fs::write(&old, b"old").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&old));
+
+        app.handle_key(key('r'));
+        assert!(matches!(app.mode, AppMode::Prompt(Prompt::Rename { .. })));
+        if let AppMode::Prompt(Prompt::Rename { input, cursor, .. }) = &mut app.mode {
+            *input = "new.txt".into();
+            *cursor = input.len();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results[0].entry.path,
+            new
+        );
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn stale_search_result_is_removed_before_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gone.txt");
+        std::fs::write(&path, b"").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&path));
+        std::fs::remove_file(path).unwrap();
+
+        app.handle_key(key('r'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(app.status, "Search result is no longer available");
+    }
+
+    #[test]
+    fn stale_result_activation_revalidates_before_using_snapshot_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let deleted_file = temp.path().join("deleted.txt");
+        let replaced_directory = temp.path().join("was-directory.txt");
+        std::fs::write(&deleted_file, b"").unwrap();
+        std::fs::create_dir(&replaced_directory).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(
+            &mut app,
+            &[deleted_file.clone(), replaced_directory.clone()],
+        );
+        std::fs::remove_file(&deleted_file).unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert_eq!(app.search_results.as_ref().unwrap().results.len(), 1);
+
+        std::fs::remove_dir(&replaced_directory).unwrap();
+        std::fs::write(&replaced_directory, b"now a file").unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert!(app.status.contains("changed type"));
+    }
+
+    #[test]
+    fn stale_archive_result_is_not_reinterpreted_as_a_creation_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("old.txt.zip");
+        std::fs::write(&archive, b"not needed").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&archive));
+        std::fs::remove_file(&archive).unwrap();
+
+        app.handle_key(key('z'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(app.status, "Search result is no longer available");
+    }
+
+    #[test]
+    fn archive_result_revalidation_skips_changed_type_but_keeps_valid_marked_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let changed = temp.path().join("changed.txt");
+        std::fs::write(&valid, b"valid").unwrap();
+        std::fs::write(&changed, b"old").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), changed.clone()]);
+        for hit in &mut app.search_results.as_mut().unwrap().results {
+            hit.entry.selected = true;
+        }
+        std::fs::remove_file(&changed).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+
+        app.handle_key(key('z'));
+
+        assert!(
+            matches!(app.mode, AppMode::Prompt(Prompt::ArchiveFormat { ref sources, .. }) if sources == &vec![valid])
+        );
+        assert_eq!(app.search_results.as_ref().unwrap().results.len(), 1);
+        assert!(app.status.contains("changed type"));
+    }
+
+    #[test]
+    fn archive_result_revalidation_does_not_follow_or_reclassify_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("linked.txt");
+        std::fs::write(&target, b"target").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&link));
+
+        app.handle_key(key('z'));
+
+        assert!(
+            matches!(app.mode, AppMode::Prompt(Prompt::ArchiveFormat { ref sources, .. }) if sources == &vec![link])
+        );
+    }
+
+    #[test]
+    fn missing_search_result_is_removed_before_trash_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.txt");
+        std::fs::write(&missing, b"stale").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&missing));
+        std::fs::remove_file(&missing).unwrap();
+
+        app.handle_key(key('d'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(app.status, "Search result is no longer available");
+    }
+
+    #[test]
+    fn file_replaced_by_directory_is_removed_before_trash_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let replaced = temp.path().join("replaced.txt");
+        std::fs::write(&replaced, b"file snapshot").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&replaced));
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::create_dir(&replaced).unwrap();
+
+        app.handle_key(key('d'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(replaced.is_dir());
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(
+            app.status,
+            "Search result changed type and is no longer available"
+        );
+    }
+
+    #[test]
+    fn directory_replaced_by_file_is_removed_before_quick_trash() {
+        let temp = tempfile::tempdir().unwrap();
+        let replaced = temp.path().join("replaced.txt");
+        std::fs::create_dir(&replaced).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&replaced));
+        std::fs::remove_dir(&replaced).unwrap();
+        std::fs::write(&replaced, b"replacement file").unwrap();
+
+        app.handle_key(key('D'));
+
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(replaced.is_file());
+        assert!(app.operation.is_none());
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert_eq!(
+            app.status,
+            "Search result changed type and is no longer available"
+        );
+    }
+
+    #[test]
+    fn trash_confirmation_keeps_only_valid_marked_search_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.txt");
+        let missing = temp.path().join("missing.txt");
+        let changed = temp.path().join("changed.txt");
+        std::fs::write(&valid, b"valid").unwrap();
+        std::fs::write(&missing, b"missing").unwrap();
+        std::fs::write(&changed, b"file snapshot").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &[valid.clone(), missing.clone(), changed.clone()]);
+        for hit in &mut app.search_results.as_mut().unwrap().results {
+            hit.entry.selected = true;
+        }
+        std::fs::remove_file(&missing).unwrap();
+        std::fs::remove_file(&changed).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+
+        app.handle_key(key('d'));
+
+        assert!(
+            matches!(&app.mode, AppMode::Prompt(Prompt::ConfirmTrash { paths }) if paths == &vec![valid.clone()])
+        );
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.results.len(), 1);
+        assert_eq!(view.results[0].entry.path, valid);
+        assert!(view.results[0].entry.selected);
+        assert!(changed.is_dir());
+        assert!(app.status.contains("changed type"));
+    }
+
+    #[test]
+    fn refresh_keeps_mark_and_moves_cursor_to_nearest_remaining_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ["one.txt", "two.txt", "three.txt"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"").unwrap();
+        }
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, &paths);
+        {
+            let view = app.search_results.as_mut().unwrap();
+            view.selected = 1;
+            view.results[2].entry.selected = true;
+        }
+        std::fs::remove_file(&paths[1]).unwrap();
+
+        app.refresh_search_results(None);
+
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.selected, 1);
+        assert_eq!(view.results[1].entry.path, paths[2]);
+        assert!(view.results[1].entry.selected);
+    }
+
+    #[test]
+    fn cut_result_pasted_from_browser_refreshes_retained_results_after_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination");
+        std::fs::write(&source, b"move me").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&source));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.go_to(destination.clone());
+
+        app.handle_key(key('p'));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.operation.is_some() && Instant::now() < deadline {
+            if !app.poll_operation() {
+                thread::yield_now();
+            }
+        }
+
+        assert!(destination.join("source.txt").is_file());
+        assert!(app.search_results.as_ref().unwrap().results.is_empty());
+        assert!(matches!(app.mode, AppMode::Browser));
+    }
+
+    #[test]
+    fn read_only_result_mutations_stay_in_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, b"").unwrap();
+        let mut app = test_app(temp.path());
+        app.config.behavior.read_only = true;
+        install_search_results(&mut app, std::slice::from_ref(&source));
+
+        for key_code in ['x', 'c', 'd', 'D', 'z'] {
+            app.handle_key(key(key_code));
+            assert!(matches!(app.mode, AppMode::SearchResults));
+        }
+        assert!(source.exists());
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
+    fn search_result_terminal_editor_and_launch_error_return_to_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("notes.txt");
+        std::fs::write(&path, b"notes").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&path));
+        app.config.open.editor = "vim".into();
+
+        app.handle_key(key('e'));
+        let action = app.take_terminal_editor().unwrap();
+        assert_eq!(action.return_to, ReturnDestination::SearchResults);
+        app.finish_terminal_editor(&action, Ok(()));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+
+        app.launch_sender
+            .try_send(PendingLaunchError {
+                error: LaunchError {
+                    program: "opener".into(),
+                    path,
+                    detail: "failed".into(),
+                },
+                return_to: ReturnDestination::SearchResults,
+            })
+            .unwrap();
+        assert!(app.poll_file_launch());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+    }
+
+    #[test]
+    fn overlapping_launcher_errors_keep_their_individual_return_destinations() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        for (detail, return_to) in [
+            ("browser error", ReturnDestination::Browser),
+            ("results error", ReturnDestination::SearchResults),
+        ] {
+            app.launch_sender
+                .try_send(PendingLaunchError {
+                    error: LaunchError {
+                        program: "opener".into(),
+                        path: temp.path().join("file.txt"),
+                        detail: detail.into(),
+                    },
+                    return_to,
+                })
+                .unwrap();
+        }
+        app.mode = AppMode::SearchResults;
+
+        assert!(app.poll_file_launch());
+        assert!(
+            matches!(app.mode, AppMode::Prompt(Prompt::OpenError { ref body, .. }) if body.contains("browser error"))
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::Browser));
+        assert!(app.poll_file_launch());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+    }
+
+    #[test]
+    fn search_result_info_closes_back_to_results_with_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("notes.txt");
+        std::fs::write(&path, b"notes").unwrap();
+        let mut app = test_app(temp.path());
+        install_search_results(&mut app, std::slice::from_ref(&path));
+
+        app.handle_key(key('I'));
+        assert!(matches!(app.mode, AppMode::Info(Some(ref entry)) if entry.path == path));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
     }
 
     fn test_network_environment(root: &Path) -> NetworkEnvironment {
@@ -6357,10 +7429,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(temp.path());
         app.launch_sender
-            .try_send(LaunchError {
-                program: "missing-opener".into(),
-                path: temp.path().join("example.txt"),
-                detail: "application not found".into(),
+            .try_send(PendingLaunchError {
+                error: LaunchError {
+                    program: "missing-opener".into(),
+                    path: temp.path().join("example.txt"),
+                    detail: "application not found".into(),
+                },
+                return_to: ReturnDestination::Browser,
             })
             .unwrap();
 
@@ -6516,10 +7591,13 @@ mod tests {
             false,
         );
         app.launch_sender
-            .try_send(LaunchError {
-                program: "missing-editor".into(),
-                path: path.clone(),
-                detail: "application not found".into(),
+            .try_send(PendingLaunchError {
+                error: LaunchError {
+                    program: "missing-editor".into(),
+                    path: path.clone(),
+                    detail: "application not found".into(),
+                },
+                return_to: ReturnDestination::Browser,
             })
             .unwrap();
 
@@ -7037,51 +8115,760 @@ mod tests {
     }
 
     #[test]
-    fn current_directory_search_filters_and_clears() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("Report.txt"), b"report").unwrap();
-        std::fs::write(temp.path().join("notes.txt"), b"notes").unwrap();
-        let mut app = test_app(temp.path());
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        for character in "report".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-        }
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(app.entries.len(), 1);
-        assert_eq!(app.entries[0].name, "Report.txt");
-        assert_eq!(app.search_filter.as_deref(), Some("report"));
-
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.search_filter.is_none());
-        assert_eq!(app.entries.len(), 2);
+    fn slash_opens_quick_search_and_empty_f_expands_it() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('/'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if !form.advanced));
+        app.handle_key(key('F'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.advanced && form.draft.scope == SearchScope::CurrentDirectory));
     }
 
     #[test]
-    fn tree_search_restores_hierarchy_and_nested_selector() {
-        let temp = tempfile::tempdir().unwrap();
-        let child = temp.path().join("child");
-        let file = child.join("notes.txt");
-        std::fs::create_dir(&child).unwrap();
-        std::fs::write(&file, b"notes").unwrap();
-        let mut app = test_app(temp.path());
+    fn advanced_search_up_down_selects_sections_and_tab_stays_within_section() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Match && form.field == 0));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Match && form.field == 1));
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Match && form.field == 0));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.section == SearchSection::Scope));
+    }
 
+    #[test]
+    fn advanced_search_cycles_choices_and_toggles_entry_kinds() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.scope == SearchScope::CurrentDirectory));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        for character in "notes".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.name_mode == crate::search::NameMode::Glob));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if !form.draft.types.contains(crate::entry::EntryKind::Directory)));
+        for _ in 0..9 {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.include_ignored_hidden));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.result_limit == crate::search::ResultLimit::TenThousand));
+    }
+
+    #[test]
+    fn advanced_search_type_arrows_wrap_without_toggling() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.error = Some("keep this validation error".into());
+        }
+
+        let initial_types = match &app.mode {
+            AppMode::SearchForm(form) => form.draft.types,
+            _ => panic!("advanced search form was not open"),
+        };
+        for expected_field in [1, 2, 3, 4, 0] {
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            assert!(matches!(&app.mode, AppMode::SearchForm(form)
+                if form.field == expected_field
+                    && form.draft.types == initial_types
+                    && form.error.as_deref() == Some("keep this validation error")));
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(&app.mode, AppMode::SearchForm(form)
+            if form.field == 4
+                && form.draft.types == initial_types
+                && form.error.as_deref() == Some("keep this validation error")));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(&app.mode, AppMode::SearchForm(form)
+            if form.field == 4 && form.draft.types == crate::search::EntryKinds::OTHER));
+    }
+
+    #[test]
+    fn advanced_search_enter_validates_from_every_section_and_keeps_error_inline() {
+        for section_moves in 0..4 {
+            let mut app = test_app(tempfile::tempdir().unwrap().path());
+            app.handle_key(key('F'));
+            for _ in 0..section_moves {
+                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            if let AppMode::SearchForm(form) = &mut app.mode {
+                form.draft.minimum_size = "not-a-size".into();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+                if form.error.as_deref().is_some_and(|error| error.contains("invalid minimum size"))));
+            if let AppMode::SearchForm(form) = &mut app.mode {
+                form.draft.minimum_size.clear();
+                form.draft.name = "needle".into();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchProgress));
+            app.search
+                .take()
+                .unwrap()
+                .cancel
+                .store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn invalid_content_regex_keeps_form_and_does_not_start_or_replace_search() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_path = temp.path().join("old-result");
+        std::fs::write(&old_path, []).unwrap();
+        let mut app = test_app(temp.path());
+        let mut old_draft = SearchDraft::quick(temp.path().to_path_buf());
+        old_draft.name = "old".into();
+        app.search_results = Some(SearchView {
+            request: old_draft.compile(true).unwrap(),
+            results: vec![search::hit_for_test(old_path.clone(), "old")],
+            selected: 0,
+            selected_path: Some(old_path.clone()),
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchResults;
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.content = "(".into();
+            form.draft.content_mode = crate::search::ContentMode::Regex;
         }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.entries.len(), 1);
-        assert_eq!(app.selected_entry().unwrap().path, file);
-        assert_eq!(app.tree_depth(app.cursor), 0);
+        assert!(app.search.is_none());
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results[0].entry.path,
+            old_path
+        );
+        assert!(matches!(&app.mode, AppMode::SearchForm(form)
+            if form.draft.content == "(" && form.error.as_deref().is_some_and(|e| e.contains("invalid content regex"))));
+    }
 
+    #[test]
+    fn advanced_search_preserves_validation_error_while_navigating() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.minimum_size = "bad".into();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for code in [KeyCode::Down, KeyCode::Tab, KeyCode::Up] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        }
+    }
+
+    #[test]
+    fn advanced_search_text_fields_keep_independent_unicode_cursors() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.name = "a界b".into();
+            form.cursors.name = 2;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "xy".chars() {
+            app.handle_key(key(ch));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(key('界'));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(key('Z'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.name == "a界Zb" && form.draft.content == "x界y"
+                && form.cursors.name == 3 && form.cursors.content == 2));
+    }
+
+    #[test]
+    fn advanced_search_space_is_noop_for_non_type_choices() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        app.handle_key(key(' '));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.draft.scope == SearchScope::Filesystem && form.draft.name.is_empty()));
+    }
+
+    #[test]
+    fn configured_filesystem_binding_expands_only_an_empty_quick_query() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.config =
+            toml::from_str::<crate::config::Config>("[hotkeys]\nsearch_filesystem = 'G'").unwrap();
+        app.handle_key(key('/'));
+        app.handle_key(key('G'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.advanced));
+        app.mode = AppMode::Browser;
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(key('G'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.name == "xG"));
+    }
+
+    #[test]
+    fn quick_search_error_clears_only_when_query_value_changes() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('/'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        for code in [KeyCode::Left, KeyCode::Home, KeyCode::Up] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        }
+        app.handle_key(key('x'));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_none() && form.draft.name == "x")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.search
+            .take()
+            .unwrap()
+            .cancel
+            .store(true, Ordering::Relaxed);
+
+        app.mode = AppMode::Browser;
+        app.handle_key(key('/'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_none() && form.draft.name.is_empty())
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+    }
+
+    #[test]
+    fn advanced_search_scope_cycles_from_exact_initial_scope() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.scope == SearchScope::Filesystem)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.scope == SearchScope::CurrentDirectory)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(
+            matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.scope == SearchScope::Filesystem)
+        );
+    }
+
+    #[test]
+    fn advanced_search_error_survives_caret_moves_and_noop_controls() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.minimum_size = "bad".into();
+            form.draft.content = "a界b".into();
+            form.cursors.content = 2;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_some()));
+    }
+
+    #[test]
+    fn advanced_search_error_clears_only_after_value_mutation() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.minimum_size = "bad".into();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.error.is_none()));
+    }
+
+    #[test]
+    fn typed_f_is_query_input_and_global_f_uses_filesystem_scope() {
+        let mut app = test_app(tempfile::tempdir().unwrap().path());
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(key('F'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form) if form.draft.name == "xF"));
+        app.mode = AppMode::Browser;
+        app.handle_key(key('F'));
+        assert!(matches!(app.mode, AppMode::SearchForm(ref form)
+            if form.advanced && form.draft.scope == SearchScope::Filesystem));
+    }
+
+    #[test]
+    fn search_typing_does_not_start_worker_and_enter_starts_once() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("needle.txt"), b"needle").unwrap();
+        let mut app = test_app(temp.path());
+
+        app.handle_key(key('/'));
+        for character in "needle".chars() {
+            app.handle_key(key(character));
+            assert!(app.search.is_none());
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search.is_some());
+        let cancel = Arc::clone(&app.search.as_ref().unwrap().cancel);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(Arc::ptr_eq(&cancel, &app.search.as_ref().unwrap().cancel));
+        wait_for_search(&mut app);
+    }
+
+    #[test]
+    fn search_results_preserve_browser_state_and_old_results_on_form_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let target = child.join("needle.txt");
+        std::fs::write(&target, b"needle").unwrap();
+        let mut app = test_app(temp.path());
+        app.expanded_directories.insert(child.clone());
+        app.refresh();
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == target)
+            .unwrap();
+        app.entries[app.cursor].selected = true;
+        let cursor_path = app.selected_entry().unwrap().path.clone();
+        let marked = app
+            .entries
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        app.handle_key(key('/'));
+        for character in "needle".chars() {
+            app.handle_key(key(character));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_search(&mut app);
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        let result_count = app.search_results.as_ref().unwrap().results.len();
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.is_tree_directory_expanded(&child));
-        assert_eq!(app.selected_entry().unwrap().path, file);
-        assert_eq!(app.tree_depth(app.cursor), 1);
+
+        assert_eq!(app.current_dir, temp.path());
+        assert_eq!(app.selected_entry().unwrap().path, cursor_path);
+        assert!(app.expanded_directories.contains(&child));
+        assert_eq!(
+            app.entries
+                .iter()
+                .filter(|entry| entry.selected)
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            marked
+        );
+
+        app.mode = AppMode::SearchResults;
+        app.handle_key(key('/'));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results.len(),
+            result_count
+        );
+        assert_eq!(app.selected_entry().unwrap().path, cursor_path);
+    }
+
+    #[test]
+    fn poll_search_is_bounded_to_updates_per_tick() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..UPDATES_PER_UI_TICK + 20 {
+            std::fs::write(temp.path().join(format!("needle-{index}.txt")), b"").unwrap();
+        }
+        let mut app = test_app(temp.path());
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "needle".into();
+        let request = draft.compile(true).unwrap();
+        app.search_results = Some(SearchView {
+            request,
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchProgress;
+        let updates = (0..UPDATES_PER_UI_TICK + 20)
+            .map(|index| {
+                SearchUpdate::Match(search::hit_for_test(
+                    temp.path().join(format!("needle-{index}.txt")),
+                    "needle",
+                ))
+            })
+            .chain(std::iter::once(SearchUpdate::Finished(Default::default())))
+            .collect();
+        app.search = Some(search::running_search_for_test(updates));
+
+        assert!(app.poll_search());
+        assert_eq!(app.search_matches, UPDATES_PER_UI_TICK);
+        assert!(app.search.is_some());
+        assert!(matches!(app.mode, AppMode::SearchProgress));
+    }
+
+    fn poll_synthetic_hits(count: usize) -> (App, Duration) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "item".into();
+        app.search_results = Some(SearchView {
+            request: draft.compile(true).unwrap(),
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        let updates = (0..count)
+            .rev()
+            .map(|index| {
+                let name = format!("item-{index:05}-Straße");
+                SearchUpdate::Match(search::synthetic_hit_for_test(
+                    PathBuf::from("/benchmark").join(&name),
+                    name,
+                ))
+            })
+            .chain(std::iter::once(SearchUpdate::Finished(Default::default())))
+            .collect();
+        app.search = Some(search::running_search_for_test(updates));
+        app.mode = AppMode::SearchProgress;
+        search::reset_case_fold_calls_for_test();
+        let started = Instant::now();
+        while app.search.is_some() {
+            app.poll_search();
+        }
+        (app, started.elapsed())
+    }
+
+    #[test]
+    fn poll_search_sorts_ten_thousand_streamed_hits_without_comparator_folding() {
+        let (app, _) = poll_synthetic_hits(10_000);
+        let results = &app.search_results.as_ref().unwrap().results;
+        assert_eq!(results.len(), 10_000);
+        assert!(results.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(search::case_fold_calls_for_test(), 0);
+        assert_eq!(search::sort_key_allocations_for_test(), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_poll_search_stream_sort_ten_thousand() {
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let (_, elapsed) = poll_synthetic_hits(10_000);
+            assert_eq!(search::case_fold_calls_for_test(), 0);
+            assert_eq!(search::sort_key_allocations_for_test(), 0);
+            samples.push(elapsed.as_micros());
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "PERF app_search_sort hits=10000 median_us={} comparator_case_folds=0",
+            samples[samples.len() / 2]
+        );
+    }
+
+    #[test]
+    fn poll_search_adds_aggregate_skipped_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "needle".into();
+        app.search_results = Some(SearchView {
+            request: draft.compile(true).unwrap(),
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 2,
+            truncated: false,
+            incomplete: false,
+        });
+        app.search = Some(search::running_search_for_test(vec![
+            SearchUpdate::Skipped(7),
+            SearchUpdate::Finished(Default::default()),
+        ]));
+
+        assert!(app.poll_search());
+        assert_eq!(app.search_skipped, 9);
+        assert_eq!(app.search_results.as_ref().unwrap().skipped, 9);
+    }
+
+    #[test]
+    fn cancelled_search_returns_to_results_without_clearing_them() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("needle.txt"), b"needle").unwrap();
+        let mut app = test_app(temp.path());
+        app.handle_key(key('/'));
+        for character in "needle".chars() {
+            app.handle_key(key(character));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_search(&mut app);
+        let old_count = app.search_results.as_ref().unwrap().results.len();
+        app.mode = AppMode::SearchResults;
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.previous_search_results.is_some());
+        app.search = Some(search::running_search_for_test(vec![
+            SearchUpdate::Finished(search::SearchCompletion {
+                cancelled: true,
+                truncated: false,
+                incomplete: false,
+            }),
+        ]));
+
+        assert!(app.poll_search());
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results.len(),
+            old_count
+        );
+    }
+
+    #[test]
+    fn streamed_hits_sort_and_keep_selected_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("needle-z.txt");
+        let better = temp.path().join("needle.txt");
+        std::fs::write(&selected, b"").unwrap();
+        std::fs::write(&better, b"").unwrap();
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let selected_hit = search::hit_for_test(selected.clone(), "needle");
+        let better_hit = search::hit_for_test(better.clone(), "needle");
+        let mut app = test_app(temp.path());
+        app.search_results = Some(SearchView {
+            request,
+            results: vec![selected_hit],
+            selected: 0,
+            selected_path: Some(selected.clone()),
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchProgress;
+        app.search = Some(search::running_search_for_test(vec![
+            SearchUpdate::Match(better_hit),
+            SearchUpdate::Finished(Default::default()),
+        ]));
+
+        assert!(app.poll_search());
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.results[0].entry.path, better);
+        assert_eq!(view.results[view.selected].entry.path, selected);
+        assert_eq!(view.selected_path.as_deref(), Some(selected.as_path()));
+    }
+
+    #[test]
+    fn mixed_name_hits_use_production_insertion_order_and_keep_selected_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = |bytes: &[u8], group: &str| {
+            temp.path()
+                .join(group)
+                .join(OsString::from_vec(bytes.to_vec()))
+        };
+        let selected = path(b"Z", "selected");
+        let paths = [
+            selected.clone(),
+            path(b"a", "valid"),
+            path(&[0x60, 0x80], "invalid-0"),
+            path(b"Alpha", "collision-0"),
+            path(b"alpha", "collision-1"),
+            path("Straße".as_bytes(), "unicode-0"),
+            path(b"STRASSE", "unicode-1"),
+            path(&[0x61, 0xff], "invalid-1"),
+        ];
+        let hits = paths
+            .iter()
+            .map(|path| search::synthetic_hit_for_test(path.clone(), "hit".into()))
+            .collect::<Vec<_>>();
+        let mut expected = hits.clone();
+        expected.sort();
+
+        let mut inserted = Vec::new();
+        for index in [2, 6, 0, 7, 3, 1, 5, 4] {
+            insert_search_hit(&mut inserted, hits[index].clone());
+        }
+        assert_eq!(
+            inserted
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>()
+        );
+
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "hit".into();
+        let mut app = test_app(temp.path());
+        app.search_results = Some(SearchView {
+            request: draft.compile(true).unwrap(),
+            results: vec![hits[0].clone()],
+            selected: 0,
+            selected_path: Some(selected.clone()),
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchProgress;
+        app.search = Some(search::running_search_for_test(
+            [2, 6, 7, 3, 1, 5, 4]
+                .into_iter()
+                .map(|index| SearchUpdate::Match(hits[index].clone()))
+                .chain(std::iter::once(SearchUpdate::Finished(Default::default())))
+                .collect(),
+        ));
+        assert!(app.poll_search());
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(
+            view.results
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|hit| &hit.entry.path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(view.results[view.selected].entry.path, selected);
+        assert_eq!(view.selected_path.as_deref(), Some(selected.as_path()));
+    }
+
+    #[test]
+    fn disconnected_search_preserves_hits_and_marks_results_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("needle.txt");
+        std::fs::write(&path, b"").unwrap();
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "needle".into();
+        let request = draft.compile(true).unwrap();
+        let hit = search::hit_for_test(path.clone(), "needle");
+        let mut app = test_app(temp.path());
+        app.search_results = Some(SearchView {
+            request,
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchProgress;
+        app.search = Some(search::running_search_for_test(vec![SearchUpdate::Match(
+            hit,
+        )]));
+
+        assert!(app.poll_search());
+        assert!(matches!(app.mode, AppMode::SearchResults));
+        assert!(app.search.is_none());
+        let view = app.search_results.as_ref().unwrap();
+        assert_eq!(view.results[0].entry.path, path);
+        assert!(view.incomplete);
+        assert_eq!(app.status, "Search worker stopped unexpectedly");
+    }
+
+    #[test]
+    fn disconnected_cancelling_search_restores_prior_browser_results() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("needle.txt"), b"").unwrap();
+        let mut app = test_app(temp.path());
+        app.handle_key(key('/'));
+        for character in "needle".chars() {
+            app.handle_key(key(character));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_search(&mut app);
+        let old_paths = app
+            .search_results
+            .as_ref()
+            .unwrap()
+            .results
+            .iter()
+            .map(|hit| hit.entry.path.clone())
+            .collect::<Vec<_>>();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.search_cancelling = true;
+        app.search = Some(search::running_search_for_test(Vec::new()));
+
+        assert!(app.poll_search());
+        assert!(matches!(app.mode, AppMode::Browser));
+        assert!(app.search.is_none());
+        assert_eq!(
+            app.search_results
+                .as_ref()
+                .unwrap()
+                .results
+                .iter()
+                .map(|hit| hit.entry.path.clone())
+                .collect::<Vec<_>>(),
+            old_paths
+        );
+    }
+
+    #[test]
+    fn browser_search_cancellation_restores_existing_results() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("needle.txt"), b"").unwrap();
+        let mut app = test_app(temp.path());
+        app.handle_key(key('/'));
+        for character in "needle".chars() {
+            app.handle_key(key(character));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_search(&mut app);
+        let old_count = app.search_results.as_ref().unwrap().results.len();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(key('/'));
+        app.handle_key(key('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.search = Some(search::running_search_for_test(vec![
+            SearchUpdate::Finished(search::SearchCompletion {
+                cancelled: true,
+                ..Default::default()
+            }),
+        ]));
+
+        assert!(app.poll_search());
+        assert!(matches!(app.mode, AppMode::Browser));
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results.len(),
+            old_count
+        );
     }
 
     #[test]
@@ -7095,7 +8882,6 @@ mod tests {
         let mut app = test_app(temp.path());
 
         app.request_browser_load(None);
-        app.search_filter = Some("target".into());
         app.request_browser_load(Some(target.clone()));
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -7105,7 +8891,7 @@ mod tests {
         }
 
         assert!(!app.browser_loading);
-        assert_eq!(app.entries.len(), 1);
+        assert!(app.entries.iter().any(|entry| entry.path == target));
         assert_eq!(app.selected_entry().unwrap().path, target);
         assert!(app.pending_browser_load.is_none());
     }
@@ -7155,50 +8941,6 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_search_returns_nested_full_paths() {
-        let temp = tempfile::tempdir().unwrap();
-        let nested = temp.path().join("nested");
-        std::fs::create_dir(&nested).unwrap();
-        let target = nested.join("Report.txt");
-        std::fs::write(&target, b"report").unwrap();
-        let (sender, receiver) = mpsc::sync_channel(512);
-        let cancel = AtomicBool::new(false);
-
-        search_filesystem(temp.path(), "report", &sender, &cancel);
-        drop(sender);
-        let updates = receiver.into_iter().collect::<Vec<_>>();
-
-        assert!(updates
-            .iter()
-            .any(|update| matches!(update, SearchUpdate::Match(path) if path == &target)));
-        assert!(matches!(
-            updates.last(),
-            Some(SearchUpdate::Finished {
-                cancelled: false,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn filesystem_search_honors_cancellation_before_traversal() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("needle.txt"), b"needle").unwrap();
-        let (sender, receiver) = mpsc::sync_channel(8);
-        let cancel = AtomicBool::new(true);
-
-        search_filesystem(temp.path(), "needle", &sender, &cancel);
-
-        assert!(matches!(
-            receiver.recv().unwrap(),
-            SearchUpdate::Finished {
-                cancelled: true,
-                limited: false
-            }
-        ));
-    }
-
-    #[test]
     #[ignore]
     fn benchmark_background_device_discovery() {
         let mut synchronous_samples = Vec::new();
@@ -7227,30 +8969,6 @@ mod tests {
             enqueue_samples[4].as_micros(),
             background_samples[4].as_micros(),
         );
-    }
-
-    #[test]
-    #[ignore]
-    fn benchmark_filesystem_search() {
-        let root = std::env::var_os("MINFM_PERF_SEARCH_DIR")
-            .map(PathBuf::from)
-            .expect("MINFM_PERF_SEARCH_DIR is required");
-        let mut samples = Vec::new();
-        for _ in 0..9 {
-            let (sender, receiver) = mpsc::sync_channel(512);
-            let cancel = AtomicBool::new(false);
-            let started = Instant::now();
-            search_filesystem(&root, "needle", &sender, &cancel);
-            drop(sender);
-            let matches = receiver
-                .into_iter()
-                .filter(|update| matches!(update, SearchUpdate::Match(_)))
-                .count();
-            assert_eq!(matches, 250);
-            samples.push(started.elapsed());
-        }
-        samples.sort();
-        eprintln!("PERF search_median_us={}", samples[4].as_micros());
     }
 
     #[test]

@@ -40,7 +40,9 @@ hidden = "."
 sort = "s"
 reverse_sort = "S"
 go_to = "g"
+# Quick search here; press search_filesystem on an empty quick form for advanced search.
 search = "/"
+# Open advanced filesystem search (also expands an empty quick-search form).
 search_filesystem = "F"
 rename = "r"
 refresh = "r"

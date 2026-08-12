@@ -32,21 +32,21 @@ pub struct FileEntry {
 
 impl FileEntry {
     pub(crate) fn from_dir_entry(item: fs::DirEntry) -> std::io::Result<Self> {
-        let metadata = item.metadata()?;
         let path = item.path();
-        let file_type = metadata.file_type();
-        let kind = if file_type.is_symlink() {
-            EntryKind::Symlink
-        } else if file_type.is_dir() {
-            EntryKind::Directory
-        } else if file_type.is_file() {
-            EntryKind::File
-        } else if file_type.is_block_device() {
-            EntryKind::BlockDevice
-        } else {
-            EntryKind::Other
-        };
-        let name = item.file_name().to_string_lossy().into_owned();
+        let metadata = fs::symlink_metadata(&path)?;
+        Self::from_path_metadata(path, metadata)
+    }
+
+    pub(crate) fn from_path_metadata(
+        path: PathBuf,
+        metadata: fs::Metadata,
+    ) -> std::io::Result<Self> {
+        let kind = Self::kind_from_metadata(&metadata);
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
         Ok(Self {
             path,
             name,
@@ -56,6 +56,21 @@ impl FileEntry {
             modified: metadata.modified().ok(),
             selected: false,
         })
+    }
+
+    pub(crate) fn kind_from_metadata(metadata: &fs::Metadata) -> EntryKind {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            EntryKind::Symlink
+        } else if file_type.is_dir() {
+            EntryKind::Directory
+        } else if file_type.is_file() {
+            EntryKind::File
+        } else if file_type.is_block_device() {
+            EntryKind::BlockDevice
+        } else {
+            EntryKind::Other
+        }
     }
 
     pub fn is_hidden(&self) -> bool {
@@ -336,6 +351,22 @@ mod tests {
         let link = entries.iter().find(|entry| entry.name == "link").unwrap();
 
         assert_eq!(link.kind, EntryKind::Symlink);
+    }
+
+    #[test]
+    fn from_path_metadata_preserves_a_directory_symlink_as_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let entry =
+            FileEntry::from_path_metadata(link.clone(), fs::symlink_metadata(&link).unwrap())
+                .unwrap();
+
+        assert_eq!(entry.kind, EntryKind::Symlink);
+        assert_eq!(entry.path, link);
     }
 
     #[test]

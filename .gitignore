@@ -1,5 +1,7 @@
 /target/
+.worktrees/
+.superpowers/
+docs/superpowers/
 *.swp
 *.swo
 *~
-
