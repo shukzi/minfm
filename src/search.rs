@@ -2230,7 +2230,10 @@ mod tests {
             &command,
         );
 
-        assert!(matches!(result, Err(RgError::Cancelled)));
+        assert!(
+            matches!(result, Err(RgError::Cancelled)),
+            "unexpected cancellation race result: {result:?}"
+        );
     }
 
     #[test]
@@ -2277,7 +2280,7 @@ mod tests {
             return;
         }
         let fake = FakeRg::from_script(
-            "#!/bin/sh\nsetsid sh -c 'trap \"\" PIPE; while printf x; do :; done; exit 0' &\necho $! > '$CAPTURE'\nexit 1\n",
+            "#!/bin/sh\nsetsid sh -c 'echo $$ > \"$CAPTURE\"; trap \"\" PIPE; while printf x; do :; done; exit 0' &\nexit 1\n",
         );
         let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
         draft.content = "needle".into();
