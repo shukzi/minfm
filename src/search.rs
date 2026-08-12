@@ -2,8 +2,14 @@ use std::{
     cmp::Ordering,
     error::Error,
     ffi::OsStr,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc::{self, Receiver, SyncSender},
+        Arc,
+    },
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -13,6 +19,138 @@ use regex::Regex;
 use unicode_casefold::UnicodeCaseFold;
 
 use crate::entry::{EntryKind, FileEntry};
+
+const UPDATE_QUEUE_CAPACITY: usize = 256;
+pub(crate) const UPDATES_PER_UI_TICK: usize = 512;
+
+#[derive(Debug)]
+pub enum SearchUpdate {
+    Match(SearchHit),
+    Skipped,
+    Finished(SearchCompletion),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchCompletion {
+    pub cancelled: bool,
+    pub truncated: bool,
+    pub incomplete: bool,
+}
+
+pub struct RunningSearch {
+    pub receiver: Receiver<SearchUpdate>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+pub fn spawn(request: CompiledSearch) -> RunningSearch {
+    let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    thread::spawn(move || run(request, sender, worker_cancel));
+    RunningSearch { receiver, cancel }
+}
+
+fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<AtomicBool>) {
+    let mut builder = ignore::WalkBuilder::new(request.root());
+    builder.follow_links(false);
+    if request.scope() == SearchScope::CurrentDirectory {
+        builder.max_depth(Some(1));
+    }
+    if request.include_ignored_hidden() {
+        builder
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .parents(false);
+    }
+    if request.scope() == SearchScope::Filesystem {
+        builder.filter_entry(|entry| filesystem_entry_allowed(entry.path()));
+    }
+
+    let mut skipped = 0_usize;
+    let mut matches = 0_usize;
+    let mut truncated = false;
+    for item in builder.build().skip(1) {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let path = item.path();
+        if request.scope() == SearchScope::CurrentDirectory
+            && item
+                .file_type()
+                .is_some_and(|file_type| file_type.is_symlink())
+        {
+            continue;
+        }
+        let relative = path.strip_prefix(request.root()).unwrap_or(path);
+        let basename = path.file_name().unwrap_or(path.as_os_str());
+        let Some(rank) = request.matches_name(relative, basename) else {
+            continue;
+        };
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let entry = match FileEntry::from_path_metadata(path.to_path_buf(), metadata) {
+            Ok(entry) => entry,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if !request.matches_metadata(entry.kind, entry.size, entry.modified) {
+            continue;
+        }
+        if sender
+            .send(SearchUpdate::Match(SearchHit { entry, rank }))
+            .is_err()
+        {
+            return;
+        }
+        matches += 1;
+        if matches == request.selected_result_limit() {
+            truncated = true;
+            break;
+        }
+    }
+    if skipped > 0 && sender.send(SearchUpdate::Skipped).is_err() {
+        return;
+    }
+    let _ = sender.send(SearchUpdate::Finished(SearchCompletion {
+        cancelled: cancel.load(AtomicOrdering::Relaxed),
+        truncated,
+        incomplete: skipped > 0,
+    }));
+}
+
+fn filesystem_entry_allowed(path: &Path) -> bool {
+    if path == Path::new("/proc")
+        || path.starts_with("/proc/")
+        || path == Path::new("/sys")
+        || path.starts_with("/sys/")
+        || path == Path::new("/dev")
+        || path.starts_with("/dev/")
+    {
+        return false;
+    }
+    path == Path::new("/run")
+        || path == Path::new("/run/media")
+        || path.starts_with("/run/media/")
+        || !path.starts_with("/run/")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchScope {
@@ -202,6 +340,8 @@ pub struct CompiledSearch {
     time: TimeBounds,
     include_ignored_hidden: bool,
     result_limit: ResultLimit,
+    #[cfg(test)]
+    result_limit_override: Option<usize>,
 }
 
 impl SearchDraft {
@@ -285,6 +425,8 @@ impl SearchDraft {
             time: TimeBounds { after, before },
             include_ignored_hidden: self.include_ignored_hidden,
             result_limit: self.result_limit,
+            #[cfg(test)]
+            result_limit_override: None,
         })
     }
 }
@@ -385,6 +527,14 @@ impl CompiledSearch {
     }
     pub fn result_limit(&self) -> ResultLimit {
         self.result_limit
+    }
+
+    fn selected_result_limit(&self) -> usize {
+        #[cfg(test)]
+        if let Some(limit) = self.result_limit_override {
+            return limit;
+        }
+        self.result_limit.get()
     }
 
     pub fn matches_name(&self, relative_path: &Path, basename: &OsStr) -> Option<MatchRank> {
@@ -512,10 +662,70 @@ mod tests {
     use super::*;
     use chrono::NaiveDateTime;
     use std::{
+        collections::BTreeSet,
         ffi::{OsStr, OsString},
+        fs,
         os::unix::ffi::OsStringExt,
+        os::unix::fs::symlink,
         path::{Path, PathBuf},
     };
+
+    struct TraversalFixture {
+        temp: tempfile::TempDir,
+    }
+
+    impl TraversalFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir(temp.path().join("nested")).unwrap();
+            fs::write(temp.path().join("top.txt"), "top").unwrap();
+            fs::write(temp.path().join("nested/deep.txt"), "deep").unwrap();
+            fs::write(temp.path().join(".hidden.txt"), "hidden").unwrap();
+            fs::write(temp.path().join("ignored.txt"), "ignored").unwrap();
+            fs::write(temp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+            symlink(temp.path(), temp.path().join("loop")).unwrap();
+            Self { temp }
+        }
+
+        fn root(&self) -> &Path {
+            self.temp.path()
+        }
+    }
+
+    fn traversal_request(
+        root: &Path,
+        scope: SearchScope,
+        include_ignored_hidden: bool,
+    ) -> CompiledSearch {
+        let mut draft = SearchDraft::advanced(root.to_path_buf(), scope);
+        draft.name_mode = NameMode::Regex;
+        draft.name = r"^(top\.txt|deep\.txt|\.hidden\.txt|ignored\.txt|loop)$".into();
+        draft.include_ignored_hidden = include_ignored_hidden;
+        draft.compile(true).unwrap()
+    }
+
+    fn run_traversal(request: CompiledSearch) -> (Vec<SearchHit>, SearchCompletion) {
+        let running = spawn(request);
+        let mut hits = Vec::new();
+        loop {
+            match running.receiver.recv().unwrap() {
+                SearchUpdate::Match(hit) => hits.push(hit),
+                SearchUpdate::Skipped => {}
+                SearchUpdate::Finished(completion) => return (hits, completion),
+                SearchUpdate::Failed(message) => panic!("search failed: {message}"),
+            }
+        }
+    }
+
+    fn paths(root: &Path, hits: &[SearchHit]) -> BTreeSet<PathBuf> {
+        hits.iter()
+            .map(|hit| hit.entry.path.strip_prefix(root).unwrap().to_path_buf())
+            .collect()
+    }
+
+    fn count_named(hits: &[SearchHit], name: &str) -> usize {
+        hits.iter().filter(|hit| hit.entry.name == name).count()
+    }
 
     fn compiled_name(mode: NameMode, name: &str) -> CompiledSearch {
         let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
@@ -756,6 +966,146 @@ mod tests {
         let first = make_hit(first, "same replacement display");
         let second = make_hit(second, "same replacement display");
         assert!(first < second);
+    }
+
+    #[test]
+    fn traversal_current_directory_does_not_descend() {
+        let fixture = TraversalFixture::new();
+        let (hits, completion) = run_traversal(traversal_request(
+            fixture.root(),
+            SearchScope::CurrentDirectory,
+            false,
+        ));
+
+        assert_eq!(
+            paths(fixture.root(), &hits),
+            BTreeSet::from(["top.txt".into()])
+        );
+        assert_eq!(completion, SearchCompletion::default());
+    }
+
+    #[test]
+    fn traversal_recursive_honors_ignores_and_does_not_follow_symlinks() {
+        let fixture = TraversalFixture::new();
+        let (hits, completion) = run_traversal(traversal_request(
+            fixture.root(),
+            SearchScope::RecursiveHere,
+            false,
+        ));
+
+        assert_eq!(
+            paths(fixture.root(), &hits),
+            BTreeSet::from(["top.txt".into(), "nested/deep.txt".into(), "loop".into()])
+        );
+        assert_eq!(count_named(&hits, "deep.txt"), 1);
+        assert_eq!(completion, SearchCompletion::default());
+    }
+
+    #[test]
+    fn traversal_include_ignored_hidden_disables_all_ignore_filters() {
+        let fixture = TraversalFixture::new();
+        let (hits, completion) = run_traversal(traversal_request(
+            fixture.root(),
+            SearchScope::RecursiveHere,
+            true,
+        ));
+        let paths = paths(fixture.root(), &hits);
+
+        assert!(paths.contains(Path::new(".hidden.txt")));
+        assert!(paths.contains(Path::new("ignored.txt")));
+        assert_eq!(count_named(&hits, "deep.txt"), 1);
+        assert_eq!(completion, SearchCompletion::default());
+    }
+
+    #[test]
+    fn traversal_filesystem_prunes_virtual_trees_but_keeps_run_media() {
+        assert!(!filesystem_entry_allowed(Path::new("/proc")));
+        assert!(!filesystem_entry_allowed(Path::new("/proc/123/status")));
+        assert!(!filesystem_entry_allowed(Path::new("/sys/class")));
+        assert!(!filesystem_entry_allowed(Path::new("/dev/pts")));
+        assert!(filesystem_entry_allowed(Path::new("/run")));
+        assert!(!filesystem_entry_allowed(Path::new("/run/lock")));
+        assert!(filesystem_entry_allowed(Path::new("/run/media")));
+        assert!(filesystem_entry_allowed(Path::new("/run/media/user/disk")));
+        assert!(filesystem_entry_allowed(Path::new("/home/user")));
+    }
+
+    #[test]
+    fn bounded_results_stop_at_the_selected_limit_and_report_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            fs::write(temp.path().join(format!("item-{index}.txt")), "item").unwrap();
+        }
+        let mut draft =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::RecursiveHere);
+        draft.name = "item".into();
+        let mut request = draft.compile(true).unwrap();
+        request.result_limit_override = Some(3);
+
+        let (hits, completion) = run_traversal(request);
+
+        assert_eq!(hits.len(), 3);
+        assert_eq!(
+            completion,
+            SearchCompletion {
+                truncated: true,
+                ..SearchCompletion::default()
+            }
+        );
+    }
+
+    #[test]
+    fn cancellation_pre_set_before_traversal_emits_no_matches() {
+        let fixture = TraversalFixture::new();
+        let request = traversal_request(fixture.root(), SearchScope::RecursiveHere, true);
+        let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        run(request, sender, cancel);
+        let updates: Vec<_> = receiver.into_iter().collect();
+
+        assert!(updates
+            .iter()
+            .all(|update| !matches!(update, SearchUpdate::Match(_))));
+        assert!(matches!(
+            updates.last(),
+            Some(SearchUpdate::Finished(SearchCompletion {
+                cancelled: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn cancellation_after_first_update_completes_promptly() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..1_000 {
+            fs::write(temp.path().join(format!("item-{index}.txt")), "item").unwrap();
+        }
+        let mut request =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::RecursiveHere);
+        request.name = "item".into();
+        let running = spawn(request.compile(true).unwrap());
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            running.receiver.recv().unwrap(),
+            SearchUpdate::Match(_)
+        ));
+        running.cancel.store(true, AtomicOrdering::Relaxed);
+
+        let completion = loop {
+            match running
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                SearchUpdate::Finished(completion) => break completion,
+                SearchUpdate::Failed(message) => panic!("search failed: {message}"),
+                SearchUpdate::Match(_) | SearchUpdate::Skipped => {}
+            }
+        };
+        assert!(completion.cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
