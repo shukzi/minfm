@@ -450,6 +450,16 @@ impl HotkeyConfig {
                 ("expand", &self.expand),
                 ("search", &self.search),
                 ("search_filesystem", &self.search_filesystem),
+                ("select", &self.select),
+                ("copy", &self.copy),
+                ("cut", &self.cut),
+                ("archive", &self.archive),
+                ("trash", &self.trash),
+                ("quick_trash", &self.quick_trash),
+                ("rename", &self.rename),
+                ("info", &self.info),
+                ("open", &self.open),
+                ("edit", &self.edit),
             ],
         )?;
         self.validate_context(
