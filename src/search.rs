@@ -1454,22 +1454,22 @@ fn parse_size(raw: &str) -> Option<Option<u64>> {
         return Some(None);
     }
 
-    let mut tokens = input.split_whitespace();
-    let number = tokens.next()?;
-    let multiplier = match tokens.next() {
-        None => 1_u64,
-        Some("B") => 1,
-        Some("KB") => 1_000,
-        Some("MB") => 1_000_000,
-        Some("GB") => 1_000_000_000,
-        Some("KiB") => 1_024,
-        Some("MiB") => 1_048_576,
-        Some("GiB") => 1_073_741_824,
-        Some(_) => return None,
-    };
-    if tokens.next().is_some() {
-        return None;
-    }
+    let (number, multiplier) = [
+        ("KiB", 1_024_u64),
+        ("MiB", 1_048_576),
+        ("GiB", 1_073_741_824),
+        ("KB", 1_000),
+        ("MB", 1_000_000),
+        ("GB", 1_000_000_000),
+        ("B", 1),
+    ]
+    .into_iter()
+    .find_map(|(unit, multiplier)| {
+        input
+            .strip_suffix(unit)
+            .map(|number| (number.trim_end(), multiplier))
+    })
+    .unwrap_or((input, 1));
 
     let mut components = number.split('.');
     let whole = components.next()?;
@@ -2620,6 +2620,12 @@ mod tests {
             ("5 MB", 5_000_000),
             ("1.5 GB", 1_500_000_000),
             ("2 GiB", 2_147_483_648),
+            ("1KiB", 1_024),
+            ("2MiB", 2_097_152),
+            ("3GiB", 3_221_225_472),
+            ("1.5KiB", 1_536),
+            ("0.1KB", 100),
+            ("18446744073709551615B", u64::MAX),
         ] {
             assert_eq!(parse_size(raw), Some(Some(expected)), "{raw}");
         }
@@ -2627,7 +2633,15 @@ mod tests {
 
     #[test]
     fn size_parser_rejects_fractional_bytes_bad_units_and_overflow() {
-        for raw in ["0.5 B", "1 XB", "-1 KB", "NaN GB", "18446744073709551616 B"] {
+        for raw in [
+            "0.5 B",
+            "0.1KiB",
+            "1 XB",
+            "-1 KB",
+            "NaN GB",
+            "18446744073709551616 B",
+            "18014398509481984KiB",
+        ] {
             assert_eq!(parse_size(raw), None, "{raw}");
         }
     }

@@ -1614,17 +1614,21 @@ fn active_search_control_text(form: &SearchForm, width: usize) -> String {
                 &form.draft.modified_before,
                 form.cursors.modified_before,
                 "—",
-                width.saturating_sub(18),
+                width.saturating_sub(19),
             )
         ),
-        (crate::app::SearchSection::Filters, _) => format!(
-            "> Include ignored/hidden: {}",
-            if form.draft.include_ignored_hidden {
+        (crate::app::SearchSection::Filters, _) => {
+            let value = if form.draft.include_ignored_hidden {
                 "Yes"
             } else {
                 "No"
+            };
+            if width < 28 {
+                format!("> Include: {value}")
+            } else {
+                format!("> Include ignored/hidden: {value}")
             }
-        ),
+        }
         (crate::app::SearchSection::Traversal, _) => format!(
             "> Result limit: {}",
             match form.draft.result_limit {
@@ -4630,6 +4634,71 @@ mod performance_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn search_advanced_one_row_keeps_active_toggle_label_and_value_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let mut form = SearchForm::advanced(
+            temp.path().to_path_buf(),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        form.section = crate::app::SearchSection::Filters;
+        form.field = 9;
+        app.mode = AppMode::SearchForm(form);
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("> Include") && row.contains("No")),
+            "active toggle must retain its marker, label, and value: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn search_advanced_one_row_keeps_active_text_label_value_and_caret_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        let mut form = SearchForm::advanced(
+            temp.path().to_path_buf(),
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        form.section = crate::app::SearchSection::Filters;
+        form.field = 8;
+        form.draft.modified_before = "2026-08-12".into();
+        form.cursors.modified_before = form.draft.modified_before.len();
+        app.mode = AppMode::SearchForm(form);
+        let mut terminal = Terminal::new(TestBackend::new(52, 10)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter().any(|row| {
+                row.contains("> Modified before:") && row.contains("12") && row.contains('│')
+            }),
+            "active text field must retain its marker, label, value tail, and caret: {rows:?}"
+        );
     }
 
     #[test]
