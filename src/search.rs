@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
-        mpsc::{self, Receiver, SyncSender},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc,
     },
     thread,
@@ -73,7 +73,7 @@ fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<At
     let mut skipped = 0_usize;
     let mut matches = 0_usize;
     let mut truncated = false;
-    for item in builder.build().skip(1) {
+    for item in builder.build() {
         if cancel.load(AtomicOrdering::Relaxed) {
             break;
         }
@@ -85,6 +85,9 @@ fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<At
             }
         };
         let path = item.path();
+        if path == request.root() {
+            continue;
+        }
         if request.scope() == SearchScope::CurrentDirectory
             && item
                 .file_type()
@@ -104,6 +107,15 @@ fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<At
                 continue;
             }
         };
+        let kind = FileEntry::kind_from_metadata(&metadata);
+        let modified = metadata.modified().ok();
+        if !request.matches_metadata(kind, metadata.len(), modified) {
+            continue;
+        }
+        #[cfg(test)]
+        if let Some(counter) = &request.construction_counter {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let entry = match FileEntry::from_path_metadata(path.to_path_buf(), metadata) {
             Ok(entry) => entry,
             Err(_) => {
@@ -111,13 +123,14 @@ fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<At
                 continue;
             }
         };
-        if !request.matches_metadata(entry.kind, entry.size, entry.modified) {
+        if !request.content().is_empty() {
             continue;
         }
-        if sender
-            .send(SearchUpdate::Match(SearchHit { entry, rank }))
-            .is_err()
-        {
+        #[cfg(test)]
+        if let Some(counter) = &request.send_attempt_counter {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        if !send_match_cancellable(&sender, SearchHit { entry, rank }, Arc::as_ref(&cancel)) {
             return;
         }
         matches += 1;
@@ -126,14 +139,35 @@ fn run(request: CompiledSearch, sender: SyncSender<SearchUpdate>, cancel: Arc<At
             break;
         }
     }
-    if skipped > 0 && sender.send(SearchUpdate::Skipped).is_err() {
-        return;
+    if skipped > 0 {
+        let _ = sender.try_send(SearchUpdate::Skipped);
     }
-    let _ = sender.send(SearchUpdate::Finished(SearchCompletion {
+    let _ = sender.try_send(SearchUpdate::Finished(SearchCompletion {
         cancelled: cancel.load(AtomicOrdering::Relaxed),
         truncated,
         incomplete: skipped > 0,
     }));
+}
+
+fn send_match_cancellable(
+    sender: &SyncSender<SearchUpdate>,
+    hit: SearchHit,
+    cancel: &AtomicBool,
+) -> bool {
+    let mut update = SearchUpdate::Match(hit);
+    loop {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return true;
+        }
+        match sender.try_send(update) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                update = returned;
+                thread::yield_now();
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
 }
 
 fn filesystem_entry_allowed(path: &Path) -> bool {
@@ -342,6 +376,10 @@ pub struct CompiledSearch {
     result_limit: ResultLimit,
     #[cfg(test)]
     result_limit_override: Option<usize>,
+    #[cfg(test)]
+    construction_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    send_attempt_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl SearchDraft {
@@ -427,6 +465,10 @@ impl SearchDraft {
             result_limit: self.result_limit,
             #[cfg(test)]
             result_limit_override: None,
+            #[cfg(test)]
+            construction_counter: None,
+            #[cfg(test)]
+            send_attempt_counter: None,
         })
     }
 }
@@ -1106,6 +1148,92 @@ mod tests {
         };
         assert!(completion.cancelled);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancellation_exits_when_the_update_queue_is_saturated() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..(UPDATE_QUEUE_CAPACITY + 32) {
+            fs::write(temp.path().join(format!("item-{index}.txt")), "item").unwrap();
+        }
+        let mut draft =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::RecursiveHere);
+        draft.name = "item".into();
+        let mut request = draft.compile(true).unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        request.send_attempt_counter = Some(Arc::clone(&attempts));
+        let (sender, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (done_sender, done_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            run(request, sender, worker_cancel);
+            done_sender.send(()).unwrap();
+        });
+
+        let saturation_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while attempts.load(AtomicOrdering::Relaxed) <= UPDATE_QUEUE_CAPACITY {
+            assert!(
+                std::time::Instant::now() < saturation_deadline,
+                "worker did not saturate the update queue"
+            );
+            thread::yield_now();
+        }
+        cancel.store(true, AtomicOrdering::Relaxed);
+
+        done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let updates: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(updates.len(), UPDATE_QUEUE_CAPACITY);
+        assert!(updates
+            .iter()
+            .all(|update| matches!(update, SearchUpdate::Match(_))));
+    }
+
+    #[test]
+    fn metadata_rejections_do_not_construct_file_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("too-small.txt"), "x").unwrap();
+        let mut draft =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::CurrentDirectory);
+        draft.name = "too-small".into();
+        draft.minimum_size = "2".into();
+        let mut request = draft.compile(true).unwrap();
+        let constructions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        request.construction_counter = Some(Arc::clone(&constructions));
+
+        let (hits, completion) = run_traversal(request);
+
+        assert!(hits.is_empty());
+        assert_eq!(completion, SearchCompletion::default());
+        assert_eq!(constructions.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn missing_root_is_reported_as_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let mut draft = SearchDraft::advanced(missing, SearchScope::RecursiveHere);
+        draft.name = "anything".into();
+
+        let (hits, completion) = run_traversal(draft.compile(true).unwrap());
+
+        assert!(hits.is_empty());
+        assert!(completion.incomplete);
+    }
+
+    #[test]
+    fn content_requests_do_not_emit_unverified_filename_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("report.txt"), "not the requested content").unwrap();
+        let mut draft =
+            SearchDraft::advanced(temp.path().to_path_buf(), SearchScope::CurrentDirectory);
+        draft.name = "report".into();
+        draft.content = "needle".into();
+
+        let (hits, completion) = run_traversal(draft.compile(true).unwrap());
+
+        assert!(hits.is_empty());
+        assert_eq!(completion, SearchCompletion::default());
     }
 
     #[test]
