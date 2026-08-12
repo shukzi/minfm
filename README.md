@@ -105,10 +105,10 @@ primary text font. Reinstalling or updating minfm preserves every icon override.
 
 The basic file manager needs only a Linux terminal and the installed binary.
 The single install command above handles the rest: it installs minfm, checks the
-tools used by its optional device, Samba, partition, and filesystem features,
-and shows what is missing. It then asks whether it may install the corresponding
-packages with your distribution's package manager. Nothing is installed without
-your confirmation.
+tools used by its optional content-search, device, Samba, partition, and
+filesystem features, and shows what is missing. It then asks whether it may
+install the corresponding packages with your distribution's package manager.
+Nothing is installed without your confirmation.
 
 The installer supports Fedora, Debian/Ubuntu, and Arch Linux. These package
 names are the same on all three:
@@ -116,7 +116,7 @@ names are the same on all three:
 `fontconfig`, `xdg-utils`, `util-linux`, `udisks2`, `cryptsetup`,
 `smartmontools`, `hdparm`, `parted`, `sudo`, `coreutils`, `e2fsprogs`,
 `ntfs-3g`, `dosfstools`, `xfsprogs`, `btrfs-progs`, `f2fs-tools`,
-`exfatprogs`, and `udftools`.
+`exfatprogs`, `udftools`, and `ripgrep`.
 
 Only the Samba package names differ:
 
@@ -124,8 +124,9 @@ Only the Samba package names differ:
 - Debian and Ubuntu: `gvfs-backends`, `libsecret-tools`
 
 You may decline any package prompt and continue using the basic file manager.
-If an optional tool in `M` is unavailable, minfm explains what packages are
-required when you open it.
+Without `ripgrep`, filename and metadata search remain available but content
+search is disabled. If an optional tool in `M` is unavailable, minfm explains
+what packages are required when you open it.
 
 ## Uninstall
 
