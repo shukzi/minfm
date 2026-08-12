@@ -23,6 +23,11 @@ use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use unicode_casefold::UnicodeCaseFold;
 
+#[cfg(test)]
+thread_local! {
+    static CASE_FOLD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use crate::entry::{EntryKind, FileEntry};
 
 const UPDATE_QUEUE_CAPACITY: usize = 256;
@@ -632,7 +637,36 @@ pub(crate) fn hit_for_test(path: PathBuf, query: &str) -> SearchHit {
     let metadata = fs::symlink_metadata(&path).unwrap();
     let entry = FileEntry::from_path_metadata(path, metadata).unwrap();
     let rank = smart_rank(&case_fold(query), &case_fold(&entry.name)).unwrap();
-    SearchHit { entry, rank }
+    SearchHit::new(entry, rank)
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_hit_for_test(path: PathBuf, name: String) -> SearchHit {
+    SearchHit::new(
+        FileEntry {
+            path,
+            name,
+            kind: EntryKind::File,
+            size: 0,
+            mode: 0,
+            modified: None,
+            selected: false,
+        },
+        MatchRank {
+            tier: 0,
+            penalty: 0,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn reset_case_fold_calls_for_test() {
+    CASE_FOLD_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn case_fold_calls_for_test() -> usize {
+    CASE_FOLD_CALLS.get()
 }
 
 fn run(
@@ -820,13 +854,6 @@ fn run_worker_body(
         if let Some(metrics) = &metrics {
             metrics.lock().unwrap().candidates_examined += 1;
         }
-        if request.scope() == SearchScope::CurrentDirectory
-            && item
-                .file_type()
-                .is_some_and(|file_type| file_type.is_symlink())
-        {
-            continue;
-        }
         let relative = path.strip_prefix(request.root()).unwrap_or(path);
         let basename = path.file_name().unwrap_or(path.as_os_str());
         let Some(rank) = request.matches_name(relative, basename) else {
@@ -902,7 +929,7 @@ fn run_worker_body(
             }
             #[cfg(test)]
             update_batch_metrics(metrics.as_ref(), &rg_batch);
-            rg_hits.push(SearchHit { entry, rank });
+            rg_hits.push(SearchHit::new(entry, rank));
             continue;
         }
         #[cfg(test)]
@@ -911,7 +938,7 @@ fn run_worker_body(
         }
         if !send_match_cancellable(
             &match_sender,
-            SearchHit { entry, rank },
+            SearchHit::new(entry, rank),
             Arc::as_ref(&cancel),
         ) {
             return;
@@ -1179,6 +1206,33 @@ pub struct MatchRank {
 pub struct SearchHit {
     pub entry: FileEntry,
     pub rank: MatchRank,
+    sort_name: SortName,
+}
+
+#[derive(Debug, Clone)]
+struct SortName {
+    basename: OsString,
+    folded: Option<String>,
+}
+
+impl SearchHit {
+    fn new(entry: FileEntry, rank: MatchRank) -> Self {
+        let basename = entry
+            .path
+            .file_name()
+            .unwrap_or(entry.path.as_os_str())
+            .to_os_string();
+        let folded = basename.to_str().map(case_fold);
+        Self {
+            entry,
+            rank,
+            sort_name: SortName { basename, folded },
+        }
+    }
+
+    fn refresh_sort_name(&mut self) {
+        self.sort_name = Self::new(self.entry.clone(), self.rank).sort_name;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1209,6 +1263,7 @@ pub fn refresh_hits(hits: &mut Vec<SearchHit>, renamed: Option<(&Path, &Path)>) 
         entry.selected = hit.entry.selected;
         summary.renamed |= entry.path != hit.entry.path;
         hit.entry = entry;
+        hit.refresh_sort_name();
         summary.retained += 1;
         true
     });
@@ -1233,17 +1288,11 @@ impl Ord for SearchHit {
     fn cmp(&self, other: &Self) -> Ordering {
         self.rank
             .cmp(&other.rank)
-            .then_with(|| compare_basenames(&self.entry.path, &other.entry.path))
+            .then_with(|| match (&self.sort_name.folded, &other.sort_name.folded) {
+                (Some(left), Some(right)) => left.cmp(right),
+                _ => self.sort_name.basename.cmp(&other.sort_name.basename),
+            })
             .then_with(|| self.entry.path.cmp(&other.entry.path))
-    }
-}
-
-fn compare_basenames(left: &Path, right: &Path) -> Ordering {
-    let left = left.file_name().unwrap_or(left.as_os_str());
-    let right = right.file_name().unwrap_or(right.as_os_str());
-    match (left.to_str(), right.to_str()) {
-        (Some(left), Some(right)) => case_fold(left).cmp(&case_fold(right)),
-        _ => left.cmp(right),
     }
 }
 
@@ -1315,6 +1364,12 @@ impl SearchDraft {
         }
         if !self.content.is_empty() && !rg_available {
             return Err(SearchValidationError::RipgrepRequired);
+        }
+        if !self.content.is_empty() && self.content_mode == ContentMode::Regex {
+            Regex::new(&self.content).map_err(|error| SearchValidationError::InvalidPattern {
+                mode: "content regex",
+                message: error.to_string(),
+            })?;
         }
 
         let minimum =
@@ -1517,7 +1572,9 @@ impl CompiledSearch {
         if !self.types.contains(kind) {
             return false;
         }
-        if (self.size.minimum.is_some() || self.size.maximum.is_some()) && kind != EntryKind::File {
+        if (self.size.minimum.is_some() || self.size.maximum.is_some())
+            && kind == EntryKind::Directory
+        {
             return false;
         }
         if self.size.minimum.is_some_and(|minimum| size < minimum)
@@ -1540,6 +1597,8 @@ impl CompiledSearch {
 }
 
 fn case_fold(text: &str) -> String {
+    #[cfg(test)]
+    CASE_FOLD_CALLS.set(CASE_FOLD_CALLS.get() + 1);
     text.case_fold().collect()
 }
 
@@ -2435,6 +2494,27 @@ mod tests {
         assert!(!search.matches_metadata(EntryKind::Directory, 15, Some(day_start)));
         assert!(search.matches_metadata(EntryKind::File, 10, Some(day_start)));
         assert!(search.matches_metadata(EntryKind::File, 20, Some(day_end)));
+        for kind in [EntryKind::Symlink, EntryKind::BlockDevice, EntryKind::Other] {
+            assert!(
+                search.matches_metadata(kind, 10, Some(day_start)),
+                "{kind:?}"
+            );
+            assert!(search.matches_metadata(kind, 20, Some(day_end)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn compile_rejects_invalid_content_regex_before_search_runs() {
+        let mut draft = SearchDraft::quick(PathBuf::from("/tmp"));
+        draft.content = "(".into();
+        draft.content_mode = ContentMode::Regex;
+        assert!(matches!(
+            draft.compile(true),
+            Err(SearchValidationError::InvalidPattern {
+                mode: "content regex",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2564,17 +2644,19 @@ mod tests {
         first.push(&first_name);
         let mut second = PathBuf::from("/a");
         second.push(&second_name);
-        let make_hit = |path: PathBuf, display_name: &str| SearchHit {
-            entry: FileEntry {
-                path,
-                name: display_name.into(),
-                kind: EntryKind::File,
-                size: 0,
-                mode: 0,
-                modified: None,
-                selected: false,
-            },
-            rank,
+        let make_hit = |path: PathBuf, display_name: &str| {
+            SearchHit::new(
+                FileEntry {
+                    path,
+                    name: display_name.into(),
+                    kind: EntryKind::File,
+                    size: 0,
+                    mode: 0,
+                    modified: None,
+                    selected: false,
+                },
+                rank,
+            )
         };
         let first = make_hit(first, "same replacement display");
         let second = make_hit(second, "same replacement display");
@@ -2592,8 +2674,32 @@ mod tests {
 
         assert_eq!(
             paths(fixture.root(), &hits),
-            BTreeSet::from(["top.txt".into()])
+            BTreeSet::from(["top.txt".into(), "loop".into()])
         );
+        assert_eq!(count_named(&hits, "deep.txt"), 0);
+        assert_eq!(
+            hits.iter()
+                .find(|hit| hit.entry.name == "loop")
+                .unwrap()
+                .entry
+                .kind,
+            EntryKind::Symlink
+        );
+        assert_eq!(completion, SearchCompletion::default());
+    }
+
+    #[test]
+    fn traversal_current_directory_symlink_filter_returns_loop_without_following_it() {
+        let fixture = TraversalFixture::new();
+        let mut request = traversal_request(fixture.root(), SearchScope::CurrentDirectory, false);
+        request.types = EntryKinds::SYMLINKS;
+        let (hits, completion) = run_traversal(request);
+
+        assert_eq!(
+            paths(fixture.root(), &hits),
+            BTreeSet::from(["loop".into()])
+        );
+        assert_eq!(count_named(&hits, "deep.txt"), 0);
         assert_eq!(completion, SearchCompletion::default());
     }
 
@@ -2793,8 +2899,8 @@ mod tests {
         for index in 0..UPDATE_QUEUE_CAPACITY {
             let path = PathBuf::from(format!("item-{index}.txt"));
             match_sender
-                .send(SearchUpdate::Match(SearchHit {
-                    entry: FileEntry {
+                .send(SearchUpdate::Match(SearchHit::new(
+                    FileEntry {
                         name: path.to_string_lossy().into_owned(),
                         path,
                         kind: EntryKind::File,
@@ -2803,11 +2909,11 @@ mod tests {
                         modified: None,
                         selected: false,
                     },
-                    rank: MatchRank {
+                    MatchRank {
                         tier: 0,
                         penalty: 0,
                     },
-                }))
+                )))
                 .unwrap();
         }
         control_sender.send(SearchUpdate::Skipped(7)).unwrap();
@@ -3440,8 +3546,8 @@ mod tests {
     #[test]
     fn hits_sort_by_rank_case_folded_name_then_absolute_path() {
         fn hit(name: &str, path: &str, rank: MatchRank) -> SearchHit {
-            SearchHit {
-                entry: FileEntry {
+            SearchHit::new(
+                FileEntry {
                     path: PathBuf::from(path),
                     name: name.into(),
                     kind: EntryKind::File,
@@ -3451,7 +3557,7 @@ mod tests {
                     selected: false,
                 },
                 rank,
-            }
+            )
         }
         let best = MatchRank {
             tier: 0,

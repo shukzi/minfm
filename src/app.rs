@@ -1407,6 +1407,13 @@ impl App {
         let mut disconnected = false;
         let mut changed = false;
         let mut hits_changed = false;
+        let selected_path = self.search_results.as_ref().and_then(|view| {
+            view.selected_path.clone().or_else(|| {
+                view.results
+                    .get(view.selected)
+                    .map(|hit| hit.entry.path.clone())
+            })
+        });
         for _ in 0..UPDATES_PER_UI_TICK {
             let update = match search.receiver.try_recv() {
                 Ok(update) => update,
@@ -1422,7 +1429,11 @@ impl App {
                     let Some(view) = &mut self.search_results else {
                         continue;
                     };
-                    view.results.push(hit);
+                    let insertion = view
+                        .results
+                        .binary_search(&hit)
+                        .unwrap_or_else(|index| index);
+                    view.results.insert(insertion, hit);
                     self.search_matches = view.results.len();
                     hits_changed = true;
                 }
@@ -1445,12 +1456,6 @@ impl App {
         }
         if let Some(view) = &mut self.search_results {
             if hits_changed {
-                let selected_path = view.selected_path.clone().or_else(|| {
-                    view.results
-                        .get(view.selected)
-                        .map(|hit| hit.entry.path.clone())
-                });
-                view.results.sort();
                 view.selected = selected_path
                     .as_ref()
                     .and_then(|path| view.results.iter().position(|hit| &hit.entry.path == path))
@@ -8081,6 +8086,39 @@ mod tests {
     }
 
     #[test]
+    fn invalid_content_regex_keeps_form_and_does_not_start_or_replace_search() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_path = temp.path().join("old-result");
+        std::fs::write(&old_path, []).unwrap();
+        let mut app = test_app(temp.path());
+        let mut old_draft = SearchDraft::quick(temp.path().to_path_buf());
+        old_draft.name = "old".into();
+        app.search_results = Some(SearchView {
+            request: old_draft.compile(true).unwrap(),
+            results: vec![search::hit_for_test(old_path.clone(), "old")],
+            selected: 0,
+            selected_path: Some(old_path.clone()),
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        app.mode = AppMode::SearchResults;
+        app.handle_key(key('F'));
+        if let AppMode::SearchForm(form) = &mut app.mode {
+            form.draft.content = "(".into();
+            form.draft.content_mode = crate::search::ContentMode::Regex;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search.is_none());
+        assert_eq!(
+            app.search_results.as_ref().unwrap().results[0].entry.path,
+            old_path
+        );
+        assert!(matches!(&app.mode, AppMode::SearchForm(form)
+            if form.draft.content == "(" && form.error.as_deref().is_some_and(|e| e.contains("invalid content regex"))));
+    }
+
+    #[test]
     fn advanced_search_preserves_validation_error_while_navigating() {
         let mut app = test_app(tempfile::tempdir().unwrap().path());
         app.handle_key(key('F'));
@@ -8349,6 +8387,66 @@ mod tests {
         assert_eq!(app.search_matches, UPDATES_PER_UI_TICK);
         assert!(app.search.is_some());
         assert!(matches!(app.mode, AppMode::SearchProgress));
+    }
+
+    fn poll_synthetic_hits(count: usize) -> (App, Duration) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path());
+        let mut draft = SearchDraft::quick(temp.path().to_path_buf());
+        draft.name = "item".into();
+        app.search_results = Some(SearchView {
+            request: draft.compile(true).unwrap(),
+            results: Vec::new(),
+            selected: 0,
+            selected_path: None,
+            skipped: 0,
+            truncated: false,
+            incomplete: false,
+        });
+        let updates = (0..count)
+            .rev()
+            .map(|index| {
+                let name = format!("item-{index:05}-Straße");
+                SearchUpdate::Match(search::synthetic_hit_for_test(
+                    PathBuf::from("/benchmark").join(&name),
+                    name,
+                ))
+            })
+            .chain(std::iter::once(SearchUpdate::Finished(Default::default())))
+            .collect();
+        app.search = Some(search::running_search_for_test(updates));
+        app.mode = AppMode::SearchProgress;
+        search::reset_case_fold_calls_for_test();
+        let started = Instant::now();
+        while app.search.is_some() {
+            app.poll_search();
+        }
+        (app, started.elapsed())
+    }
+
+    #[test]
+    fn poll_search_sorts_ten_thousand_streamed_hits_without_comparator_folding() {
+        let (app, _) = poll_synthetic_hits(10_000);
+        let results = &app.search_results.as_ref().unwrap().results;
+        assert_eq!(results.len(), 10_000);
+        assert!(results.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(search::case_fold_calls_for_test(), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_poll_search_stream_sort_ten_thousand() {
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let (_, elapsed) = poll_synthetic_hits(10_000);
+            assert_eq!(search::case_fold_calls_for_test(), 0);
+            samples.push(elapsed.as_micros());
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "PERF app_search_sort hits=10000 median_us={} comparator_case_folds=0",
+            samples[samples.len() / 2]
+        );
     }
 
     #[test]

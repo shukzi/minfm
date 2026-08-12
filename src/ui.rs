@@ -18,6 +18,7 @@ use crate::{
     icons::Icons,
     partition::Filesystem,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const ACCENT: Color = Color::Gray;
@@ -1314,14 +1315,17 @@ fn draw_quick_search(frame: &mut Frame, app: &App, form: &SearchForm) {
         .title(format!(" {title} "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let query = cursor_window(
+        &form.draft.name,
+        form.cursors.name,
+        "<name or pattern>",
+        usize::from(inner.width.saturating_sub(2)),
+    );
     let body = match &form.error {
-        Some(error) => format!(
-            "{}\n\n{}\n\nEnter search · Esc cancel",
-            form.draft.name, error
-        ),
+        Some(error) => format!("{}\n\n{}\n\nEnter search · Esc cancel", query, error),
         None => format!(
             "{}\n\nEnter search · {} advanced · Esc cancel",
-            form.draft.name,
+            query,
             app.config.hotkeys.search_filesystem.display()
         ),
     };
@@ -1357,7 +1361,12 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     frame.render_widget(
         Paragraph::new(format!(
             "Query  {}",
-            cursor_text(&form.draft.name, form.cursors.name, "<name or pattern>")
+            cursor_text(
+                &form.draft.name,
+                form.cursors.name,
+                "<name or pattern>",
+                usize::from(rows[0].width.saturating_sub(9)),
+            )
         ))
         .block(Block::default().borders(Borders::BOTTOM)),
         rows[0],
@@ -1393,9 +1402,12 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
         vertical: 0,
     });
     let (controls, active_line) = if area.height < 16 {
-        (active_search_control_text(form), 0)
+        (
+            active_search_control_text(form, usize::from(control_area.width)),
+            0,
+        )
     } else {
-        search_section_text(form)
+        search_section_text(form, usize::from(control_area.width))
     };
     let scroll = active_line.saturating_sub(usize::from(control_area.height).saturating_sub(1));
     frame.render_widget(
@@ -1435,7 +1447,7 @@ fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchForm) {
     let _ = app;
 }
 
-fn active_search_control_text(form: &SearchForm) -> String {
+fn active_search_control_text(form: &SearchForm, width: usize) -> String {
     use crate::search::{ContentMode, NameMode, ResultLimit, SearchScope};
     match (form.section, form.field) {
         (crate::app::SearchSection::Scope, _) => format!(
@@ -1456,7 +1468,12 @@ fn active_search_control_text(form: &SearchForm) -> String {
         ),
         (crate::app::SearchSection::Match, 1) => format!(
             "> Content: {}",
-            cursor_text(&form.draft.content, form.cursors.content, "<optional>")
+            cursor_text(
+                &form.draft.content,
+                form.cursors.content,
+                "<optional>",
+                width.saturating_sub(11)
+            )
         ),
         (crate::app::SearchSection::Match, _) => format!(
             "> Content mode: {}",
@@ -1487,22 +1504,38 @@ fn active_search_control_text(form: &SearchForm) -> String {
         ),
         (crate::app::SearchSection::Filters, 5) => format!(
             "> Minimum size: {}",
-            cursor_text(&form.draft.minimum_size, form.cursors.minimum_size, "—")
+            cursor_text(
+                &form.draft.minimum_size,
+                form.cursors.minimum_size,
+                "—",
+                width.saturating_sub(16)
+            )
         ),
         (crate::app::SearchSection::Filters, 6) => format!(
             "> Maximum size: {}",
-            cursor_text(&form.draft.maximum_size, form.cursors.maximum_size, "—")
+            cursor_text(
+                &form.draft.maximum_size,
+                form.cursors.maximum_size,
+                "—",
+                width.saturating_sub(16)
+            )
         ),
         (crate::app::SearchSection::Filters, 7) => format!(
             "> Modified after: {}",
-            cursor_text(&form.draft.modified_after, form.cursors.modified_after, "—")
+            cursor_text(
+                &form.draft.modified_after,
+                form.cursors.modified_after,
+                "—",
+                width.saturating_sub(18)
+            )
         ),
         (crate::app::SearchSection::Filters, 8) => format!(
             "> Modified before: {}",
             cursor_text(
                 &form.draft.modified_before,
                 form.cursors.modified_before,
-                "—"
+                "—",
+                width.saturating_sub(18),
             )
         ),
         (crate::app::SearchSection::Filters, _) => format!(
@@ -1524,7 +1557,7 @@ fn active_search_control_text(form: &SearchForm) -> String {
     }
 }
 
-fn search_section_text(form: &SearchForm) -> (String, usize) {
+fn search_section_text(form: &SearchForm, width: usize) -> (String, usize) {
     use crate::search::{ContentMode, NameMode, ResultLimit, SearchScope};
     let mark = |field: usize| if form.field == field { ">" } else { " " };
     match form.section {
@@ -1540,7 +1573,7 @@ fn search_section_text(form: &SearchForm) -> (String, usize) {
             "Match\n{} Name mode: {}\n{} Content: {}\n{} Content mode: {}",
             mark(0),
             match form.draft.name_mode { NameMode::Smart => "Smart", NameMode::Glob => "Glob", NameMode::Regex => "Regex" },
-            mark(1), cursor_text(&form.draft.content, form.cursors.content, "<optional content>"),
+            mark(1), cursor_text(&form.draft.content, form.cursors.content, "<optional content>", width.saturating_sub(11)),
             mark(2),
             match form.draft.content_mode { ContentMode::Literal => "Literal", ContentMode::Regex => "Regex" },
         ), form.field + 1),
@@ -1548,10 +1581,10 @@ fn search_section_text(form: &SearchForm) -> (String, usize) {
             "Filters\n{} {} Files\n{} {} Directories\n{} {} Symlinks\n{} {} Block devices\n{} {} Other\n{} Minimum size: {}\n{} Maximum size: {}\n{} Modified after: {}\n{} Modified before: {}\n{} Include ignored/hidden: {}",
             mark(0), selected(form.draft.types.contains(EntryKind::File)), mark(1), selected(form.draft.types.contains(EntryKind::Directory)), mark(2), selected(form.draft.types.contains(EntryKind::Symlink)),
             mark(3), selected(form.draft.types.contains(EntryKind::BlockDevice)), mark(4), selected(form.draft.types.contains(EntryKind::Other)),
-            mark(5), cursor_text(&form.draft.minimum_size, form.cursors.minimum_size, "—"),
-            mark(6), cursor_text(&form.draft.maximum_size, form.cursors.maximum_size, "—"),
-            mark(7), cursor_text(&form.draft.modified_after, form.cursors.modified_after, "—"),
-            mark(8), cursor_text(&form.draft.modified_before, form.cursors.modified_before, "—"),
+            mark(5), cursor_text(&form.draft.minimum_size, form.cursors.minimum_size, "—", width.saturating_sub(16)),
+            mark(6), cursor_text(&form.draft.maximum_size, form.cursors.maximum_size, "—", width.saturating_sub(16)),
+            mark(7), cursor_text(&form.draft.modified_after, form.cursors.modified_after, "—", width.saturating_sub(17)),
+            mark(8), cursor_text(&form.draft.modified_before, form.cursors.modified_before, "—", width.saturating_sub(18)),
             mark(9),
             if form.draft.include_ignored_hidden { "Yes" } else { "No" }
         ), form.field + 1),
@@ -1570,15 +1603,74 @@ fn selected(value: bool) -> &'static str {
         "[ ]"
     }
 }
-fn cursor_text(value: &str, cursor: usize, hint: &str) -> String {
-    if value.is_empty() {
-        return format!("│{hint}");
+fn cursor_text(value: &str, cursor: usize, hint: &str, width: usize) -> String {
+    cursor_window(value, cursor, hint, width)
+}
+
+fn cursor_window(value: &str, cursor: usize, hint: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
     }
-    let index = value
+    if value.is_empty() {
+        let mut output = String::from("│");
+        for grapheme in hint.graphemes(true) {
+            if UnicodeWidthStr::width(output.as_str()) + UnicodeWidthStr::width(grapheme) > width {
+                break;
+            }
+            output.push_str(grapheme);
+        }
+        return output;
+    }
+    let cursor_byte = value
         .char_indices()
-        .nth(cursor)
+        .nth(cursor.min(value.chars().count()))
         .map_or(value.len(), |(index, _)| index);
-    format!("{}│{}", &value[..index], &value[index..])
+    let graphemes = value.grapheme_indices(true).collect::<Vec<_>>();
+    let caret = graphemes
+        .iter()
+        .find_map(|(index, grapheme)| {
+            let end = index + grapheme.len();
+            (cursor_byte > *index && cursor_byte < end).then_some(end)
+        })
+        .unwrap_or(cursor_byte);
+    let content_width = width.saturating_sub(1);
+    let left_budget = content_width / 2;
+    let mut start = caret;
+    let mut used = 0;
+    for (index, grapheme) in graphemes.iter().rev().filter(|(index, _)| *index < caret) {
+        let grapheme_width = UnicodeWidthStr::width(*grapheme);
+        if used + grapheme_width > left_budget {
+            break;
+        }
+        start = *index;
+        used += grapheme_width;
+    }
+    let mut end = caret;
+    for (index, grapheme) in graphemes.iter().filter(|(index, _)| *index >= caret) {
+        let grapheme_width = UnicodeWidthStr::width(*grapheme);
+        if used + grapheme_width > content_width {
+            break;
+        }
+        used += grapheme_width;
+        end = index + grapheme.len();
+    }
+    let initial_start = start;
+    for (index, grapheme) in graphemes
+        .iter()
+        .rev()
+        .filter(|(index, _)| *index < initial_start)
+    {
+        let grapheme_width = UnicodeWidthStr::width(*grapheme);
+        if used + grapheme_width > content_width {
+            break;
+        }
+        start = *index;
+        used += grapheme_width;
+    }
+    if end == caret {
+        end = caret;
+    }
+    format!("{}│{}", &value[start..caret], &value[caret..end])
 }
 
 fn draw_update_progress(frame: &mut Frame) {
@@ -3595,6 +3687,45 @@ mod performance_tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 
         assert!(rendered_text(&terminal).contains("enter a search or choose a filter"));
+    }
+
+    #[test]
+    fn search_text_window_keeps_ascii_and_wide_unicode_carets_visible() {
+        assert_eq!(cursor_window("abcdefghijk", 10, "", 6), "ghij│k");
+        assert_eq!(
+            UnicodeWidthStr::width(cursor_window("ab界cd界ef", 6, "", 7).as_str()),
+            7
+        );
+        assert!(cursor_window("ab界cd界ef", 6, "", 7).contains('│'));
+        assert_eq!(cursor_window("a\u{301}bcdef", 1, "", 4), "a\u{301}│bc");
+    }
+
+    #[test]
+    fn active_search_text_controls_window_query_content_size_and_dates() {
+        let root = PathBuf::from("/tmp");
+        let mut form = SearchForm::advanced(
+            root,
+            crate::search::SearchScope::CurrentDirectory,
+            crate::app::SearchReturn::Browser,
+        );
+        form.draft.content = "prefix界content-suffix".into();
+        form.draft.minimum_size = "12345678901234567890".into();
+        form.draft.modified_after = "2026-08-12-and-more".into();
+        form.cursors.content = 14;
+        form.cursors.minimum_size = 18;
+        form.cursors.modified_after = 15;
+        for (field, expected) in [(1, "Content"), (5, "Minimum size"), (7, "Modified after")] {
+            form.section = if field == 1 {
+                crate::app::SearchSection::Match
+            } else {
+                crate::app::SearchSection::Filters
+            };
+            form.field = field;
+            let rendered = active_search_control_text(&form, 24);
+            assert!(rendered.contains(expected));
+            assert!(rendered.contains('│'));
+            assert!(UnicodeWidthStr::width(rendered.as_str()) <= 24);
+        }
     }
 
     #[test]
