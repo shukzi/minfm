@@ -12,6 +12,8 @@ mod network;
 mod operation;
 mod partition;
 mod safety;
+#[allow(dead_code)] // Foundational API consumed by the following search slices.
+mod search;
 mod trash;
 mod ui;
 mod updater;
