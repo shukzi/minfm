@@ -50,6 +50,14 @@ The principal modules are:
 - Optional system helpers must be detected cleanly. When unavailable, the UI
   should identify the required packages without breaking core file-manager
   functionality.
+- Any change that introduces, removes, renames, or otherwise alters a system
+  package or external runtime helper must update the complete integration in
+  the same pull request: runtime detection, `install.sh` prompts and graceful
+  fallback behavior, package mappings for every supported distribution,
+  README installation and feature documentation, relevant installer and
+  integration tests, and any affected CI or release checks. Keep these sources
+  consistent, and preserve unaffected core functionality when an optional
+  helper is unavailable or installation is declined.
 
 ## Working with changes
 

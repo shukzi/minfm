@@ -116,6 +116,15 @@ Runtime integrations use Linux tools described in the README and checked by
 - Keep dependencies necessary and narrowly featured. Explain why a new crate is
   preferable to the standard library or existing dependencies, update
   `Cargo.lock`, and satisfy `cargo deny` policy.
+- Treat system packages and external runtime helpers as complete integrations.
+  A change that introduces, removes, renames, or alters one must update, in the
+  same pull request, runtime detection, `install.sh` prompts and graceful
+  fallback behavior, package mappings for every supported distribution
+  (currently Fedora, Debian/Ubuntu, and Arch), README installation and feature
+  documentation, relevant installer and integration tests, and any affected CI
+  or release checks. Keep these sources consistent. Optional helpers must not
+  prevent unaffected core functionality when unavailable or when installation
+  is declined.
 - Avoid unrelated cleanup in a functional change. Architectural cleanup should
   have its own proposal and focused sequence of reviews.
 
