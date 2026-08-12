@@ -1,6 +1,6 @@
 [package]
 name = "minfm"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.97.1"
 description = "minfm is a minimal terminal file manager for Linux, written in Rust. It provides intuitive keyboard navigation and integrated disk management (including LUKS functionality)."
@@ -11,18 +11,19 @@ repository = "https://github.com/shukzi/minfm"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29"
 filetime = "0.2"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 nix = { version = "0.29", default-features = false, features = ["fs", "user"] }
 percent-encoding = "2.3"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
+tar = "0.4"
+tempfile = "3"
 thiserror = "2"
 toml = "0.8"
 unicode-width = "0.2"
 xattr = "1.6"
-
-[dev-dependencies]
-tempfile = "3"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 
 [profile.release]
 lto = "thin"

@@ -254,6 +254,7 @@ pub struct HotkeyConfig {
     pub copy: KeyBinding,
     pub cut: KeyBinding,
     pub paste: KeyBinding,
+    pub archive: KeyBinding,
     pub trash: KeyBinding,
     pub quick_trash: KeyBinding,
     pub trash_bin: KeyBinding,
@@ -309,6 +310,7 @@ impl Default for HotkeyConfig {
             copy: key("c"),
             cut: key("x"),
             paste: key("p"),
+            archive: key("z"),
             trash: key("d"),
             quick_trash: key("D"),
             trash_bin: key("T"),
@@ -366,6 +368,7 @@ impl HotkeyConfig {
                 ("copy", &self.copy),
                 ("cut", &self.cut),
                 ("paste", &self.paste),
+                ("archive", &self.archive),
                 ("trash", &self.trash),
                 ("quick_trash", &self.quick_trash),
                 ("trash_bin", &self.trash_bin),
@@ -448,6 +451,10 @@ impl HotkeyConfig {
                 ("search", &self.search),
                 ("search_filesystem", &self.search_filesystem),
             ],
+        )?;
+        self.validate_context(
+            "archive contents",
+            &[("quit", &self.quit), ("down", &self.down), ("up", &self.up)],
         )?;
         self.validate_context(
             "configuration error",
@@ -793,7 +800,31 @@ mod tests {
         assert_eq!(config.open.opener, "xdg-open");
         assert!(config.behavior.verify_copies);
         assert_eq!(config.hotkeys.tools.display(), "M");
+        assert_eq!(config.hotkeys.archive.display(), "z");
         assert!(config.icons.overrides.file.is_none());
+    }
+
+    #[test]
+    fn older_hotkey_configs_gain_archive_without_being_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let original = "# existing configuration\n[hotkeys]\ncopy = 'F6'\n";
+        std::fs::write(&path, original).unwrap();
+        let ConfigLoad::Valid { config, .. } = load_from(path.clone()) else {
+            panic!("older configuration must remain valid");
+        };
+        assert_eq!(config.hotkeys.copy.display(), "F6");
+        assert_eq!(config.hotkeys.archive.display(), "z");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn archive_hotkey_conflicts_are_rejected_in_the_browser_context() {
+        let config = toml::from_str::<Config>("[hotkeys]\narchive = 'c'\n").unwrap();
+        let error = config.hotkeys.validate().unwrap_err();
+        assert!(error.contains("copy"));
+        assert!(error.contains("archive"));
+        assert!(error.contains("browser"));
     }
 
     #[test]

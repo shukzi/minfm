@@ -18,6 +18,7 @@ functionality.
 - **Views:** Tree view by default with a toggleable table and details view
 - **Search:** Search the current directory or across the filesystem
 - **Files:** Create, rename, cut, copy, paste, and open files with a preferred text editor or default application
+- **Archives:** Create, inspect, and safely extract TAR, TAR.GZ/TGZ, and ZIP archives
 - **Selection:** Multi-entry selection
 - **Display:** File size, permissions, and modification time
 - **Icons:** Rounded monochrome icons with focused per-icon overrides
@@ -140,11 +141,11 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.5.3` in
+Pin both the installer and release asset to the same tag. Replace `v0.6.0` in
 both places with the version you want:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.5.3/install.sh | MINFM_VERSION=v0.5.3 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.6.0/install.sh | MINFM_VERSION=v0.6.0 sh
 minfm
 ```
 
@@ -185,6 +186,7 @@ For example:
 [hotkeys]
 tools = "F2"
 devices = "F4"
+archive = "F5"
 ```
 
 Files open with the Linux default application. To use another editor, set it in
@@ -195,6 +197,23 @@ the configuration:
 opener = "xdg-open"
 editor = "nvim"
 ```
+
+## Archiving and compression
+
+Press `z` on selected files or directories to create an archive. Press `z` on
+a `.tar`, `.tar.gz`, `.tgz`, or `.zip` file to inspect its contents or extract
+it into a chosen directory. Mark multiple entries first to place them together
+in one archive.
+
+Archive support is built into minfm and does not require additional system
+packages. Creation and extraction run in the background, can be cancelled, and
+use temporary output that is cleaned after failure or cancellation. Extraction
+refuses unsafe paths, escaping links, duplicate archive paths, special device
+entries, and existing destination items rather than silently overwriting data.
+
+ZIP support covers stored and standard Deflate compression. TAR archives retain
+safe Unix permissions, timestamps, and links; ZIP archives retain permissions
+and safe symbolic links where the format provides them.
 
 ## Build from source
 
@@ -231,6 +250,8 @@ cargo build --release --locked
   atomically installed in `/etc/fstab` or `/etc/crypttab`.
 - Copy and restore operations avoid overwriting existing destinations and clean
   up incomplete output after failure or cancellation.
+- Archive extraction validates paths and links before installation, stages
+  output privately, and refuses to overwrite existing destination items.
 - Keep independent backups of important data. Safety checks reduce risk but do
   not make partitioning, formatting, or erasure reversible.
 

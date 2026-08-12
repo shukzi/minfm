@@ -10,8 +10,9 @@ use ratatui::{
 
 use crate::{
     app::{
-        format_elapsed, App, AppMode, AppsView, BrowserView, BuiltinApp, ClipboardMode, DeviceView,
-        NetworkView, PartitionOverlay, PartitionView, Prompt, SearchScope, SearchView, TrashView,
+        format_elapsed, App, AppMode, AppsView, ArchiveView, BrowserView, BuiltinApp,
+        ClipboardMode, DeviceView, NetworkView, PartitionOverlay, PartitionView, Prompt,
+        SearchScope, SearchView, TrashView,
     },
     entry::{human_size, EntryKind},
     icons::Icons,
@@ -38,6 +39,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match &app.mode {
         AppMode::Browser => {}
+        AppMode::Archive(view) => draw_archive(frame, app, view),
         AppMode::Apps(view) => draw_apps(frame, app, view),
         AppMode::Prompt(prompt) => draw_prompt(frame, app, prompt),
         AppMode::Progress => draw_progress_modal(frame, app),
@@ -405,6 +407,19 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    if let AppMode::Archive(view) = &app.mode {
+        let noun = if view.entries.len() == 1 {
+            "archive item"
+        } else {
+            "archive items"
+        };
+        frame.render_widget(
+            Paragraph::new(format!(" {} {noun}", view.entries.len()))
+                .style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
     let selected = app.entries.iter().filter(|entry| entry.selected).count();
     let arrow = if app.config.ui.reverse_sort {
         "↓"
@@ -455,6 +470,12 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
             app.config.hotkeys.tools.display(),
             app.config.hotkeys.quit.display(),
         )),
+        AppMode::Archive(_) => Some(format!(
+            " ↑↓/{}/{} Move · {}/Esc Close ",
+            app.config.hotkeys.down.display(),
+            app.config.hotkeys.up.display(),
+            app.config.hotkeys.quit.display(),
+        )),
         AppMode::Partitions(view) => Some(partition_shortcuts(app, view)),
         AppMode::Prompt(Prompt::PartitionAuthentication { .. }) => {
             Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into())
@@ -499,6 +520,7 @@ fn browser_shortcut_items(app: &App) -> Vec<(String, &'static str)> {
         (app.config.hotkeys.cut.display().into(), "Cut"),
         (app.config.hotkeys.copy.display().into(), "Copy"),
         (app.config.hotkeys.paste.display().into(), "Paste"),
+        (app.config.hotkeys.archive.display().into(), "Archive"),
         (app.config.hotkeys.rename.display().into(), "Rename"),
         (app.config.hotkeys.create_file.display().into(), "File"),
         (
@@ -665,6 +687,67 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             input,
             *cursor,
             "create",
+        ),
+        Prompt::ArchiveFormat { selected, .. } => {
+            let body = crate::archive::ArchiveFormat::ALL
+                .iter()
+                .enumerate()
+                .map(|(index, format)| {
+                    format!(
+                        "{} {}",
+                        if index == *selected { ">" } else { " " },
+                        format.label()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            message_modal(
+                frame,
+                "Create archive",
+                &format!("Choose a format:\n\n{body}"),
+                "↑/↓ choose · Enter continue · Esc cancel",
+                58,
+                13,
+            );
+        }
+        Prompt::ArchiveName {
+            input, cursor, ..
+        } => cursor_input_modal(
+            frame,
+            "Create archive",
+            "Archive filename:",
+            input,
+            *cursor,
+            "create",
+        ),
+        Prompt::ArchiveActions { archive, selected } => {
+            let actions = ["Inspect contents", "Extract archive"];
+            let body = actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    format!("{} {action}", if index == *selected { ">" } else { " " })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            message_modal(
+                frame,
+                "Archive actions",
+                &format!("{}\n\n{body}", archive.display()),
+                "↑/↓ choose · Enter continue · Esc cancel",
+                72,
+                14,
+            );
+        }
+        Prompt::ArchiveDestination {
+            input, cursor, ..
+        } => cursor_input_modal(
+            frame,
+            "Extract archive",
+            "Destination directory:",
+            input,
+            *cursor,
+            "extract",
         ),
         Prompt::ConfirmTrash { paths } => {
             let mut body = format!("Move {} item(s) to trash?\n\n", paths.len());
@@ -1285,6 +1368,57 @@ fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchView) {
             .style(Style::default().fg(MUTED)),
         footer_area,
     );
+}
+
+fn draw_archive(frame: &mut Frame, app: &App, view: &ArchiveView) {
+    let screen = frame.area();
+    let reserved = 1_u16.saturating_add(shortcut_bar_height(app, screen.width));
+    let area = Rect {
+        height: screen.height.saturating_sub(reserved),
+        ..screen
+    };
+    frame.render_widget(Clear, area);
+    let visible_count = usize::from(area.height.saturating_sub(3)).max(1);
+    let start = viewport_start(view.selected, view.entries.len(), visible_count);
+    let end = (start + visible_count).min(view.entries.len());
+    let rows = view
+        .entries
+        .get(start..end)
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            Row::new([
+                Cell::from(entry.path.display().to_string()),
+                Cell::from(entry.kind.label()),
+                Cell::from(if entry.kind == crate::archive::ArchiveEntryKind::File {
+                    human_size(entry.size)
+                } else {
+                    String::new()
+                }),
+            ])
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(24),
+            Constraint::Length(12),
+            Constraint::Length(12),
+        ],
+    )
+    .header(
+        Row::new(["Path", "Type", "Size"])
+            .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+    )
+    .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+    .highlight_symbol("> ")
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Archive contents · {} · {} item(s) ",
+        view.archive.display(),
+        view.entries.len()
+    )));
+    let selected = (!view.entries.is_empty()).then_some(view.selected.saturating_sub(start));
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn append_trash_names(body: &mut String, entries: &[crate::trash::TrashEntry]) {
@@ -2611,10 +2745,10 @@ fn draw_network_progress(frame: &mut Frame) {
 fn draw_help(frame: &mut Frame, app: &App) {
     let h = &app.config.hotkeys;
     let body = format!(
-        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nTools and devices\n  {}              built-in tools launcher\n  {}              device manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
+        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nArchives\n  {}              create, inspect, or extract archive\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nTools and devices\n  {}              built-in tools launcher\n  {}              device manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
         h.up.display(), h.down.display(), h.expand.display(), h.collapse.display(),
         h.toggle_view.display(), h.go_to.display(), h.search.display(), h.search_filesystem.display(),
-        h.cut.display(), h.copy.display(), h.paste.display(), h.select.display(), h.edit.display(),
+        h.cut.display(), h.copy.display(), h.paste.display(), h.archive.display(), h.select.display(), h.edit.display(),
         h.rename.display(), h.trash.display(), h.quick_trash.display(), h.trash_bin.display(),
         h.select.display(), h.restore.display(), h.permanent_delete.display(),
         h.quick_permanent_delete.display(), h.clear_trash.display(), h.create_file.display(),
@@ -3010,7 +3144,8 @@ fn viewport_start(selected: usize, item_count: usize, visible_count: usize) -> u
 mod performance_tests {
     use super::*;
     use crate::{
-        app::PartitionView,
+        app::{ArchiveView, PartitionView},
+        archive::{ArchiveEntry, ArchiveEntryKind},
         config::{Config, ConfigLoad},
         network::{NetworkSecret, ShareAddress},
         partition,
@@ -3119,9 +3254,10 @@ mod performance_tests {
     #[test]
     fn footer_and_help_render_configured_hotkeys() {
         let temp = tempfile::tempdir().unwrap();
-        let config =
-            toml::from_str("[hotkeys]\ntools = 'F2'\nnetwork_shares = 'F3'\ndevices = 'F4'\n")
-                .unwrap();
+        let config = toml::from_str(
+            "[hotkeys]\ntools = 'F2'\nnetwork_shares = 'F3'\ndevices = 'F4'\narchive = 'F5'\n",
+        )
+        .unwrap();
         let mut app = App::new(
             temp.path().to_path_buf(),
             ConfigLoad::Valid {
@@ -3137,6 +3273,7 @@ mod performance_tests {
         assert!(text.contains("F2 Tools"));
         assert!(text.contains("F3 Shares"));
         assert!(text.contains("F4"));
+        assert!(text.contains("F5 Archive"));
         assert!(!text.contains("M Tools"));
 
         app.mode = AppMode::Help;
@@ -3145,6 +3282,58 @@ mod performance_tests {
         assert!(text.contains("F2              built-in tools launcher"));
         assert!(text.contains("F3              network shares"));
         assert!(text.contains("F4              device manager"));
+        assert!(text.contains("F5              create, inspect, or extract archive"));
+    }
+
+    #[test]
+    fn archive_workflow_renders_at_narrow_and_wide_sizes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ConfigLoad::Valid {
+                config: Config::default(),
+                path: temp.path().join("config.toml"),
+            },
+            false,
+        );
+        app.mode = AppMode::Archive(ArchiveView {
+            archive: PathBuf::from("example.tar.gz"),
+            entries: vec![
+                ArchiveEntry {
+                    path: PathBuf::from("folder"),
+                    kind: ArchiveEntryKind::Directory,
+                    size: 0,
+                },
+                ArchiveEntry {
+                    path: PathBuf::from("folder/document.txt"),
+                    kind: ArchiveEntryKind::File,
+                    size: 4096,
+                },
+            ],
+            selected: 1,
+        });
+        for width in [60, 100, 160] {
+            let backend = TestBackend::new(width, 25);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let text = rendered_text(&terminal);
+            assert!(text.contains("Archive contents"));
+            assert!(text.contains("document.txt"));
+            assert!(text.contains("4.0 KiB"));
+            assert!(text.contains("2 archive items"));
+            assert!(!text.contains("selected:"));
+        }
+
+        app.mode = AppMode::Prompt(Prompt::ArchiveFormat {
+            sources: vec![PathBuf::from("document.txt")],
+            selected: 1,
+        });
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("Create archive"));
+        assert!(text.contains("> ZIP"));
     }
 
     #[test]
