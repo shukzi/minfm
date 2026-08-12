@@ -259,6 +259,27 @@ def assert_dialog_preserves_surroundings(session, before, dialog):
             f"{session.name}: search dialog painted a black halo outside its rectangle: {painted_black}"
         )
 
+def assert_type_filter_rows(session, active, checked):
+    rows = {}
+    for line in session.screen.text().splitlines():
+        match = re.search(
+            r"([> ]) \[([x ])\] (Files|Directories|Symlinks|Block devices|Other)", line
+        )
+        if match:
+            rows[match.group(3)] = (match.group(1) == ">", match.group(2) == "x")
+    expected_labels = {"Files", "Directories", "Symlinks", "Block devices", "Other"}
+    if set(rows) != expected_labels:
+        session.dump()
+        raise AssertionError(f"{session.name}: incomplete type-filter rows: {rows}")
+    actual_active = {label for label, (selected, _) in rows.items() if selected}
+    actual_checked = {label for label, (_, selected) in rows.items() if selected}
+    if actual_active != {active} or actual_checked != set(checked):
+        session.dump()
+        raise AssertionError(
+            f"{session.name}: active/check state {(actual_active, actual_checked)} "
+            f"!= expected {({active}, set(checked))}"
+        )
+
 def quick_and_fuzzy():
     root=fixture("quick")
     s=Session(root,name="quick")
@@ -357,7 +378,18 @@ def type_size_filter():
     try:
         s.send("/"); s.send("F")
         s.send(DOWN); s.send(DOWN)  # Filters
-        s.send(SPACE)  # select Files
+        all_types = {"Files", "Directories", "Symlinks", "Block devices", "Other"}
+        assert_type_filter_rows(s, "Files", all_types)
+        for active in ("Directories", "Symlinks", "Block devices", "Other", "Files"):
+            s.send(RIGHT)
+            assert_type_filter_rows(s, active, all_types)
+        s.send(LEFT)
+        assert_type_filter_rows(s, "Other", all_types)
+        s.send(SPACE)
+        assert_type_filter_rows(s, "Other", {"Other"})
+        s.send(SPACE)  # restore the unconstrained mask
+        s.send(RIGHT)  # wrap back to Files
+        s.send(SPACE)  # select only Files
         for _ in range(5): s.send(TAB,.03)
         s.send("10")  # min size
         s.send(ENTER,.6); s.wait_for(RESULTS)
