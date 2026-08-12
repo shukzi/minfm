@@ -26,6 +26,7 @@ use unicode_casefold::UnicodeCaseFold;
 #[cfg(test)]
 thread_local! {
     static CASE_FOLD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SORT_KEY_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 use crate::entry::{EntryKind, FileEntry};
@@ -662,11 +663,17 @@ pub(crate) fn synthetic_hit_for_test(path: PathBuf, name: String) -> SearchHit {
 #[cfg(test)]
 pub(crate) fn reset_case_fold_calls_for_test() {
     CASE_FOLD_CALLS.set(0);
+    SORT_KEY_ALLOCATIONS.set(0);
 }
 
 #[cfg(test)]
 pub(crate) fn case_fold_calls_for_test() -> usize {
     CASE_FOLD_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn sort_key_allocations_for_test() -> usize {
+    SORT_KEY_ALLOCATIONS.get()
 }
 
 fn run(
@@ -1206,13 +1213,28 @@ pub struct MatchRank {
 pub struct SearchHit {
     pub entry: FileEntry,
     pub rank: MatchRank,
-    sort_name: SortName,
+    sort_name: SearchNameKey,
 }
 
-#[derive(Debug, Clone)]
-struct SortName {
-    basename: OsString,
-    folded: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SearchNameKey {
+    Utf8 { folded: String, raw: OsString },
+    NonUtf8(OsString),
+}
+
+impl SearchNameKey {
+    fn new(basename: OsString) -> Self {
+        #[cfg(test)]
+        SORT_KEY_ALLOCATIONS
+            .set(SORT_KEY_ALLOCATIONS.get() + usize::from(basename.to_str().is_some()));
+        match basename.to_str() {
+            Some(raw) => Self::Utf8 {
+                folded: case_fold(raw),
+                raw: basename,
+            },
+            None => Self::NonUtf8(basename),
+        }
+    }
 }
 
 impl SearchHit {
@@ -1222,11 +1244,11 @@ impl SearchHit {
             .file_name()
             .unwrap_or(entry.path.as_os_str())
             .to_os_string();
-        let folded = basename.to_str().map(case_fold);
+        let sort_name = SearchNameKey::new(basename);
         Self {
             entry,
             rank,
-            sort_name: SortName { basename, folded },
+            sort_name,
         }
     }
 
@@ -1288,10 +1310,7 @@ impl Ord for SearchHit {
     fn cmp(&self, other: &Self) -> Ordering {
         self.rank
             .cmp(&other.rank)
-            .then_with(|| match (&self.sort_name.folded, &other.sort_name.folded) {
-                (Some(left), Some(right)) => left.cmp(right),
-                _ => self.sort_name.basename.cmp(&other.sort_name.basename),
-            })
+            .then_with(|| self.sort_name.cmp(&other.sort_name))
             .then_with(|| self.entry.path.cmp(&other.entry.path))
     }
 }
@@ -1662,6 +1681,7 @@ fn fuzzy_penalty(query: &str, candidate: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
 
     const BENCHMARK_RUNS: usize = 9;
     const BENCHMARK_BATCH_SIZES: [usize; 4] = [1, 32, 64, 128];
@@ -3578,11 +3598,76 @@ mod tests {
         assert_eq!(
             paths,
             [
-                Path::new("/a/alpha"),
                 Path::new("/z/Alpha"),
+                Path::new("/a/alpha"),
                 Path::new("/root/beta"),
                 Path::new("/root/aardvark")
             ]
         );
+    }
+
+    #[test]
+    fn mixed_utf8_and_non_utf8_names_obey_total_order_laws() {
+        fn hit(bytes: &[u8], suffix: &str) -> SearchHit {
+            let basename = OsString::from_vec(bytes.to_vec());
+            SearchHit::new(
+                FileEntry {
+                    path: PathBuf::from("/root").join(suffix).join(&basename),
+                    name: basename.to_string_lossy().into_owned(),
+                    kind: EntryKind::File,
+                    size: 0,
+                    mode: 0,
+                    modified: None,
+                    selected: false,
+                },
+                MatchRank {
+                    tier: 0,
+                    penalty: 0,
+                },
+            )
+        }
+
+        let z = hit(b"Z", "z");
+        let a = hit(b"a", "a");
+        let invalid = hit(&[0x60, 0x80], "invalid");
+        let concrete = [&z, &a, &invalid];
+        for left in concrete {
+            for right in concrete {
+                assert_eq!(left.cmp(right), right.cmp(left).reverse());
+            }
+        }
+        for left in concrete {
+            for middle in concrete {
+                for right in concrete {
+                    if left <= middle && middle <= right {
+                        assert!(left <= right, "comparison is not transitive");
+                    }
+                }
+            }
+        }
+
+        let cases = [
+            hit(b"Alpha", "0"),
+            hit(b"alpha", "1"),
+            hit("Straße".as_bytes(), "2"),
+            hit(b"STRASSE", "3"),
+            hit("İ".as_bytes(), "4"),
+            hit("i̇".as_bytes(), "5"),
+            hit(&[0x60, 0x80], "6"),
+            hit(&[0x61, 0xff], "7"),
+            hit(&[0xfe], "8"),
+        ];
+        for left in &cases {
+            assert_eq!(left.cmp(left), Ordering::Equal);
+            for right in &cases {
+                assert_eq!(left.cmp(right), right.cmp(left).reverse());
+                assert_eq!(left == right, left.cmp(right) == Ordering::Equal);
+                for third in &cases {
+                    if left <= right && right <= third {
+                        assert!(left <= third, "comparison is not transitive");
+                    }
+                }
+            }
+        }
     }
 }
