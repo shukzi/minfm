@@ -21,7 +21,7 @@ pub(super) fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         "↑"
     };
     let full_actions = format!(
-        "{} Trash   {} Info   {} Devices   Sort: {} {}",
+        "{} Open Trash   {} Info   {} Devices   Sort: {} {}",
         app.config.hotkeys.trash_bin.display(),
         app.config.hotkeys.info.display(),
         app.config.hotkeys.devices.display(),
@@ -73,7 +73,7 @@ pub(super) fn header_action_line(app: &App, arrow: &str, compact: bool) -> Line<
     let label_style = Style::default().fg(MUTED);
     let mut spans = Vec::new();
     for (key, label) in [
-        (app.config.hotkeys.trash_bin.display(), "Trash"),
+        (app.config.hotkeys.trash_bin.display(), "Open Trash"),
         (app.config.hotkeys.info.display(), "Info"),
         (app.config.hotkeys.devices.display(), "Devices"),
     ] {

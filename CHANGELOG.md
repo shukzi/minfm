@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.8.4
+
+### Changed
+
+- Help is now a compact browser-focused shortcut reference using the same
+  key-and-label visual hierarchy as the browser footer.
+- Browser labels now distinguish opening the Trash view from moving selected
+  items to Trash.
+- Trash, network, device, and modal actions remain documented in their own
+  contextual footers instead of being mixed into browser Help.
+
 ## v0.8.3
 
 ### Changed
