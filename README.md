@@ -143,11 +143,11 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.7.0` in
+Pin both the installer and release asset to the same tag. Replace `v0.8.0` in
 both places with the version you want:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.7.0/install.sh | MINFM_VERSION=v0.7.0 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.8.0/install.sh | MINFM_VERSION=v0.8.0 sh
 minfm
 ```
 

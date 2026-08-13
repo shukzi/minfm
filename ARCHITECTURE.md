@@ -1,6 +1,7 @@
 # minfm architecture
 
-This repository is the local, performance-first rewrite of minfm 0.7.0. It
+This repository contains the performance-first architecture introduced in
+minfm 0.8.0. It
 preserves the reference application's features, configuration, safety rules,
 and hot-path implementations while replacing the large central source files
 with explicit runtime, application-workflow, rendering, search, and storage
