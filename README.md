@@ -28,7 +28,7 @@ functionality.
   filesystem maintenance, raw images, SMART tests, ATA drive settings, LUKS,
   persistent mount/encryption options, and safe eject
 - **Network:** Discover, add, open, remember, and safely disconnect Samba shares
-- **Tools:** Open the built-in launcher with `M` for device management and network shares
+- **Tools:** Open the built-in launcher with `m`; use `M` for direct device management and `N` for network shares
 - **Updates:** Background startup checks with checksum-verified installation
 - **Configuration:** Invalid-configuration detection with safe-operation blocking
 
@@ -143,11 +143,11 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.7.0` in
+Pin both the installer and release asset to the same tag. Replace `v0.8.0` in
 both places with the version you want:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.7.0/install.sh | MINFM_VERSION=v0.7.0 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.8.0/install.sh | MINFM_VERSION=v0.8.0 sh
 minfm
 ```
 

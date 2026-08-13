@@ -16,14 +16,23 @@ compression features. The supported minimum Rust version is declared in
 
 The principal modules are:
 
-- `app.rs` and `ui.rs`: application state, input handling, and rendering.
+- `lib.rs`, `cli.rs`, and `runtime.rs`: crate composition, command-line
+  compatibility, terminal lifecycle, and the event-driven runtime.
+- `app/`: shared application state plus browser, file, search, network, device,
+  partition, input, and background-completion workflows.
+- `ui/`: root layout plus browser, search, storage, tools, dialogs, and chrome
+  rendering.
 - `operation.rs`, `trash.rs`, and `archive.rs`: file operations, trash, and
   archive/compression behavior.
-- `partition.rs`, `luks.rs`, and `safety.rs`: device management and destructive
-  operation safeguards.
+- `partition/`, `luks.rs`, and `safety.rs`: storage inventory, geometry, policy,
+  validation, command planning, trusted execution, and destructive-operation
+  safeguards.
 - `network.rs`: optional network-share integration.
 - `config.rs`, `icons.rs`, and `updater.rs`: configuration, bundled icon use,
   and safe self-updates.
+
+See `ARCHITECTURE.md` before changing module boundaries or performance-sensitive
+behavior.
 
 ## Safety and compatibility
 
