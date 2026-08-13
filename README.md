@@ -10,7 +10,7 @@ minfm is a minimal terminal file manager for Linux, written in Rust. It provides
 intuitive keyboard navigation and integrated disk management, including LUKS
 functionality.
 
-![minfm preview](assets/preview.png)
+![minfm terminal file manager preview](assets/minfm-hero.png)
 
 ## Features
 
