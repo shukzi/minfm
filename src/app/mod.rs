@@ -40,12 +40,14 @@ use crate::{
 };
 
 mod browser;
+mod device;
 mod file_flow;
 mod input;
 mod network_flow;
+mod partition_input;
+mod partition_menu;
 mod polling;
 mod search_flow;
-mod storage;
 mod update_flow;
 
 #[derive(Debug, Clone)]
