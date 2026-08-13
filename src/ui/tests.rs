@@ -1065,6 +1065,92 @@ fn expanded_tree_renders_continuing_and_last_branch_lines() {
 }
 
 #[test]
+fn tree_reuses_the_table_details_panel_without_changing_browser_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let nested = temp.path().join("nested");
+    let focused = nested.join("focused-details.txt");
+    let copied = temp.path().join("copied.txt");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(&focused, b"details").unwrap();
+    std::fs::write(&copied, b"clipboard").unwrap();
+    let mut app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config: Config::default(),
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    app.cursor = app
+        .entries
+        .iter()
+        .position(|entry| entry.path == nested)
+        .unwrap();
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    app.cursor = app
+        .entries
+        .iter()
+        .position(|entry| entry.path == focused)
+        .unwrap();
+    app.clipboard = Some(crate::app::Clipboard {
+        mode: crate::app::ClipboardMode::Copy,
+        paths: vec![copied],
+    });
+    let selected_before = app.selected_entry().map(|entry| entry.path.clone());
+    let current_before = app.current_dir.clone();
+    let depths_before = app.tree_depths.clone();
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let tree_text = rendered_text(&terminal);
+    assert!(tree_text.contains(" Details "));
+    assert!(tree_text.contains("Name: focused-details.txt"));
+    assert!(tree_text.contains("Clipboard: 1 item(s) copied"));
+    assert_eq!(
+        app.selected_entry().map(|entry| entry.path.clone()),
+        selected_before
+    );
+    assert_eq!(app.current_dir, current_before);
+    assert_eq!(app.tree_depths, depths_before);
+    assert!(app.is_tree_directory_expanded(&nested));
+
+    app.toggle_browser_view();
+    let mut table_terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    table_terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let table_text = rendered_text(&table_terminal);
+    for detail in [
+        " Details ",
+        "Name: focused-details.txt",
+        "Clipboard: 1 item(s) copied",
+    ] {
+        assert!(table_text.contains(detail));
+    }
+}
+
+#[test]
+fn narrow_tree_keeps_the_existing_full_width_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("wide-tree-name.txt"), b"content").unwrap();
+    let app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config: Config::default(),
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("wide-tree-name.txt"));
+    assert!(!text.contains(" Details "));
+    assert!(!text.contains("Clipboard:"));
+}
+
+#[test]
 fn footer_and_help_expose_the_network_share_hotkey() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = App::new(

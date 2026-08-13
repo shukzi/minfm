@@ -143,7 +143,7 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.8.1` in
+Pin both the installer and release asset to the same tag. Replace `v0.8.2` in
 both places with the version you want:
 
 ```sh
