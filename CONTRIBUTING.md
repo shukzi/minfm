@@ -137,9 +137,18 @@ reason some specialized fast paths intentionally remain separate.
 
 ## Validation
 
-Run checks proportionate to the change. A Markdown typo does not require a
-static release build; code touching shared state or safety-sensitive behavior
-usually requires the complete gate.
+Every change requires a repository-wide impact audit. Review all affected
+behavior, callers, tests, configuration, examples, README and contributor
+documentation, changelog and release metadata, installer behavior, CI
+workflows, and optional-helper integration. Update every affected surface in
+the same pull request so behavior and documentation cannot drift apart.
+
+All code changes, including small refactors and UI text changes, must run the
+complete release-quality gate below. Documentation-only changes do not require
+an unrelated binary rebuild, but they must be verified against current code,
+commands, versions, links, and related documentation and run every applicable
+syntax and consistency check. Focused tests are useful while developing, but
+they do not replace the complete gate before a code change is merged.
 
 The normal CI contract is:
 
@@ -148,13 +157,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked
 cargo test --release --locked
-cargo build --release --locked
-```
-
-Dependency changes should also run:
-
-```sh
 cargo deny check advisories bans licenses sources
+cargo build --release --locked
+/bin/sh -n install.sh
+git diff --check
 ```
 
 Release-relevant Linux builds use the static target:

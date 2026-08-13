@@ -65,7 +65,7 @@ pub(super) fn append_trash_names(body: &mut String, entries: &[crate::trash::Tra
 }
 
 pub(super) fn draw_trash(frame: &mut Frame, app: &App, view: &TrashView) {
-    let screen = frame.area();
+    let screen = manager_content_area(app, frame.area());
     let area = Rect {
         x: screen.x.saturating_add(1),
         y: screen.y.saturating_add(1),
@@ -73,11 +73,7 @@ pub(super) fn draw_trash(frame: &mut Frame, app: &App, view: &TrashView) {
         height: screen.height.saturating_sub(2).max(1),
     };
     frame.render_widget(Clear, area);
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(4)])
-        .split(area);
-    let visible_count = usize::from(sections[0].height.saturating_sub(3)).max(1);
+    let visible_count = usize::from(area.height.saturating_sub(3)).max(1);
     let start = viewport_start(view.selected, view.entries.len(), visible_count);
     let end = (start + visible_count).min(view.entries.len());
     let rows = view.entries[start..end].iter().map(|entry| {
@@ -111,29 +107,13 @@ pub(super) fn draw_trash(frame: &mut Frame, app: &App, view: &TrashView) {
     )));
     let selected = (!view.entries.is_empty()).then_some(view.selected.saturating_sub(start));
     let mut state = TableState::default().with_selected(selected);
-    frame.render_stateful_widget(table, sections[0], &mut state);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{}: select │ Enter/{}: restore │ {}: permanent delete │ {}: quick permanent delete\n{}: clear trash │ {}/Esc: return",
-            app.config.hotkeys.select.display(), app.config.hotkeys.restore.display(),
-            app.config.hotkeys.permanent_delete.display(), app.config.hotkeys.quick_permanent_delete.display(),
-            app.config.hotkeys.clear_trash.display(), app.config.hotkeys.trash_bin.display()
-        ))
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(ACCENT))
-            .block(Block::default().borders(Borders::ALL)),
-        sections[1],
-    );
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 pub(super) fn draw_network(frame: &mut Frame, app: &App, view: &NetworkView) {
-    let area = frame.area();
+    let area = manager_content_area(app, frame.area());
     frame.render_widget(Clear, area);
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(4)])
-        .split(area);
-    let visible_count = usize::from(sections[0].height.saturating_sub(3)).max(1);
+    let visible_count = usize::from(area.height.saturating_sub(3)).max(1);
     let start = viewport_start(view.selected, view.shares.len(), visible_count);
     let end = (start + visible_count).min(view.shares.len());
     let rows = view.shares[start..end].iter().map(|share| {
@@ -178,45 +158,7 @@ pub(super) fn draw_network(frame: &mut Frame, app: &App, view: &NetworkView) {
     )));
     let selected = (!view.shares.is_empty()).then_some(view.selected.saturating_sub(start));
     let mut state = TableState::default().with_selected(selected);
-    frame.render_stateful_widget(table, sections[0], &mut state);
-    let selected_share = view.shares.get(view.selected);
-    let contextual = selected_share
-        .map(|share| {
-            let mut actions = if share.mount_path.is_some() {
-                format!(
-                    "Enter: open · {}: disconnect",
-                    app.config.hotkeys.network_disconnect.display()
-                )
-            } else {
-                "Enter: connect".to_string()
-            };
-            if share.saved {
-                actions.push_str(&format!(
-                    " · {}: forget",
-                    app.config.hotkeys.network_forget.display()
-                ));
-            }
-            actions
-        })
-        .unwrap_or_else(|| {
-            format!(
-                "No shares found · use {} to add one",
-                app.config.hotkeys.network_add.display()
-            )
-        });
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{contextual}\n{}: add share · {}: refresh · {}/Esc: return · {}: browser",
-            app.config.hotkeys.network_add.display(),
-            app.config.hotkeys.refresh.display(),
-            app.config.hotkeys.network_shares.display(),
-            app.config.hotkeys.quit.display()
-        ))
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(ACCENT))
-        .block(Block::default().borders(Borders::ALL)),
-        sections[1],
-    );
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 pub(super) fn draw_network_progress(frame: &mut Frame) {

@@ -4,7 +4,8 @@ impl App {
     pub(crate) fn handle_device_key(&mut self, mut view: DeviceView, key: KeyEvent) -> AppMode {
         let hotkeys = self.config.hotkeys.clone();
         match key.code {
-            KeyCode::Esc => AppMode::Browser,
+            KeyCode::Esc => self.manager_return_mode(),
+            _ if hotkeys.tools.matches(key) => AppMode::Tools(ToolsView { selected: 0 }),
             _ if hotkeys.quit.matches(key) => AppMode::Browser,
             KeyCode::Down => {
                 if !view.devices.is_empty() {

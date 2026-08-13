@@ -20,7 +20,7 @@ impl App {
             AppMode::Browser => self.handle_browser_key(key),
             AppMode::SearchForm(form) => self.handle_search_form_key(form, key),
             AppMode::Archive(view) => self.handle_archive_key(view, key),
-            AppMode::Apps(view) => self.handle_apps_key(view, key),
+            AppMode::Tools(view) => self.handle_tools_key(view, key),
             AppMode::Prompt(prompt) => self.handle_prompt_key(prompt, key),
             AppMode::Progress => self.handle_progress_key(key),
             AppMode::SearchProgress => self.handle_search_progress_key(key),
@@ -141,7 +141,7 @@ impl App {
         } else if hotkeys.trash_bin.matches(key) {
             return self.open_trash();
         } else if hotkeys.tools.matches(key) {
-            return AppMode::Apps(AppsView { selected: 0 });
+            return AppMode::Tools(ToolsView { selected: 0 });
         } else if hotkeys.info.matches(key) {
             self.modal_return = ReturnDestination::Browser;
             return AppMode::Info(self.selected_entry().cloned());
@@ -150,34 +150,34 @@ impl App {
         } else if hotkeys.open.matches(key) || hotkeys.edit.matches(key) {
             return self.open_external(hotkeys.edit.matches(key));
         } else if hotkeys.devices.matches(key) {
-            return self.open_partitions(false);
+            return self.open_partitions(ManagerReturn::Files);
         } else if hotkeys.network_shares.matches(key) {
-            return self.open_network();
+            return self.open_network_from(ManagerReturn::Files);
         }
         AppMode::Browser
     }
 
-    pub(crate) fn handle_apps_key(&mut self, mut view: AppsView, key: KeyEvent) -> AppMode {
+    pub(crate) fn handle_tools_key(&mut self, mut view: ToolsView, key: KeyEvent) -> AppMode {
         let hotkeys = self.config.hotkeys.clone();
         if key.code == KeyCode::Esc || hotkeys.quit.matches(key) || hotkeys.tools.matches(key) {
             AppMode::Browser
         } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
-            view.selected = (view.selected + 1).min(BuiltinApp::ALL.len() - 1);
-            AppMode::Apps(view)
+            view.selected = (view.selected + 1).min(BuiltinTool::ALL.len() - 1);
+            AppMode::Tools(view)
         } else if key.code == KeyCode::Up || hotkeys.up.matches(key) {
             view.selected = view.selected.saturating_sub(1);
-            AppMode::Apps(view)
+            AppMode::Tools(view)
         } else if key.code == KeyCode::Enter
             || key.code == KeyCode::Right
             || hotkeys.expand.matches(key)
         {
-            match BuiltinApp::ALL.get(view.selected).copied() {
-                Some(BuiltinApp::DeviceManager) => self.open_partitions(true),
-                Some(BuiltinApp::NetworkShares) => self.open_network(),
-                None => AppMode::Apps(view),
+            match BuiltinTool::ALL.get(view.selected).copied() {
+                Some(BuiltinTool::DeviceManager) => self.open_partitions(ManagerReturn::Tools),
+                Some(BuiltinTool::NetworkShares) => self.open_network_from(ManagerReturn::Tools),
+                None => AppMode::Tools(view),
             }
         } else {
-            AppMode::Apps(view)
+            AppMode::Tools(view)
         }
     }
 

@@ -88,7 +88,19 @@ behavior.
 
 ## Validation
 
-Run checks proportionate to the change. The full release-quality gate is:
+Every change requires a repository-wide impact audit before completion. Review
+all affected behavior, callers, tests, configuration, examples, README and
+contributor documentation, changelog and release metadata, installer behavior,
+CI workflows, and optional-helper integration. Update every affected surface in
+the same change; do not leave stale documentation or compatibility behavior.
+
+Code changes must pass the full release-quality gate regardless of apparent
+size. Documentation-only changes must still be checked against current code,
+commands, versions, links, and related documentation, and must run applicable
+syntax and consistency checks. Do not treat a focused test as sufficient proof
+that unrelated behavior remains intact.
+
+The full release-quality gate is:
 
 ```sh
 cargo fmt --all -- --check

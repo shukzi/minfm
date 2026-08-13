@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    app::{ArchiveView, NetworkView, PartitionView, TrashView},
+    app::{ArchiveView, ManagerReturn, NetworkView, PartitionView, TrashView},
     archive::{ArchiveEntry, ArchiveEntryKind},
     config::{Config, ConfigLoad},
     network::{NetworkSecret, NetworkShare, ShareAddress},
@@ -1208,6 +1208,61 @@ fn network_footer_exposes_disconnect_and_forget_for_selected_share() {
 }
 
 #[test]
+fn manager_footers_match_the_recorded_return_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config: Config::default(),
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    app.mode = AppMode::Partitions(PartitionView {
+        entries: Vec::new(),
+        selected: 0,
+        overlay: None,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let direct = rendered_text(&terminal);
+    assert!(direct.contains("m Tools"));
+    assert!(direct.contains("Esc/q Files"));
+    assert!(!direct.contains("apps"));
+
+    app.set_manager_return_for_test(ManagerReturn::Tools);
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let via_tools = rendered_text(&terminal);
+    assert!(via_tools.contains("Esc/m Tools"));
+    assert!(via_tools.contains("q Files"));
+}
+
+#[test]
+fn partition_overlays_own_their_footer_without_global_shortcuts() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config: Config::default(),
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    app.mode = AppMode::Partitions(PartitionView {
+        entries: Vec::new(),
+        selected: 0,
+        overlay: Some(PartitionOverlay::Actions { selected: 0 }),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+
+    assert!(text.contains("Enter: continue"));
+    assert!(!text.contains("m Tools"));
+    assert!(!text.contains("A dialog owns input"));
+}
+
+#[test]
 fn footer_and_help_render_configured_hotkeys() {
     let temp = tempfile::tempdir().unwrap();
     let config = toml::from_str(
@@ -1290,11 +1345,11 @@ fn trash_footer_keeps_contextual_configured_actions() {
     terminal.draw(|frame| draw(frame, &app)).unwrap();
     let text = rendered_text(&terminal);
 
-    assert!(text.contains("Enter/F2: restore"));
-    assert!(text.contains("F3: permanent delete"));
-    assert!(text.contains("F4: quick permanent delete"));
-    assert!(text.contains("F5: clear trash"));
-    assert!(text.contains("F6/Esc: return"));
+    assert!(text.contains("Enter/F2 Restore"));
+    assert!(text.contains("F3 Delete permanently"));
+    assert!(text.contains("F4 Quick delete"));
+    assert!(text.contains("F5 Empty Trash"));
+    assert!(text.contains("F6/Esc Files"));
 }
 
 #[test]
@@ -1456,10 +1511,10 @@ fn partition_modals_expand_with_the_terminal_up_to_a_readable_limit() {
 }
 
 #[test]
-fn apps_window_expands_with_the_terminal() {
-    let small = apps_area(Rect::new(0, 0, 90, 30));
-    let medium = apps_area(Rect::new(0, 0, 140, 30));
-    let large = apps_area(Rect::new(0, 0, 220, 30));
+fn tools_window_expands_with_the_terminal() {
+    let small = tools_area(Rect::new(0, 0, 90, 30));
+    let medium = tools_area(Rect::new(0, 0, 140, 30));
+    let large = tools_area(Rect::new(0, 0, 220, 30));
     assert!(small.width < medium.width);
     assert!(medium.width < large.width);
     assert_eq!(large.width, 150);
@@ -1501,7 +1556,7 @@ fn partition_manager_renders_topology_details_and_safety_state() {
     assert!(rendered.contains("sda1"));
     assert!(rendered.contains("Protected system storage"));
     assert!(rendered.contains("UUID: test-uuid"));
-    assert!(rendered.contains("Enter/a: actions"));
+    assert!(rendered.contains("Enter/a Actions"));
 
     if let AppMode::Partitions(view) = &mut app.mode {
         view.overlay = Some(PartitionOverlay::Actions { selected: 0 });

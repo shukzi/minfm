@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v0.8.5
+
+### Changed
+
+- Browser and manager views now share one contextual global shortcut footer;
+  prompts and overlays retain their own focused controls.
+- Renamed the former Apps launcher and related Rust types to Tools for one
+  consistent user-facing and internal vocabulary.
+- Device Manager and Network Shares now remember whether they were opened
+  directly or through Tools, so Escape returns to the correct context.
+- Manager views reclaim space previously reserved for duplicate local footers
+  and unrelated browser status text.
+- Contributor guidance now requires a repository-wide impact audit and the
+  complete release gate for every code change.
+
+### Fixed
+
+- Hardened network-command test fixtures against executable publication races
+  under optimized parallel test runs.
+
 ## v0.8.4
 
 ### Changed

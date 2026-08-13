@@ -433,7 +433,7 @@ impl HotkeyConfig {
             ],
         )?;
         self.validate_context(
-            "apps launcher",
+            "tools launcher",
             &[
                 ("quit", &self.quit),
                 ("down", &self.down),

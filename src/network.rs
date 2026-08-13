@@ -1171,15 +1171,22 @@ fn wipe(bytes: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{io::Write, os::unix::fs::PermissionsExt};
 
     fn executable(path: &Path, body: &str) {
         let staged = path.with_extension("staged");
-        fs::write(&staged, body).unwrap();
-        let mut permissions = fs::metadata(&staged).unwrap().permissions();
+        let mut file = fs::File::create(&staged).unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        let mut permissions = file.metadata().unwrap().permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(&staged, permissions).unwrap();
-        fs::rename(staged, path).unwrap();
+        file.set_permissions(permissions).unwrap();
+        drop(file);
+        fs::rename(&staged, path).unwrap();
+        fs::File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
     }
 
     fn environment(temp: &tempfile::TempDir) -> NetworkEnvironment {
@@ -1549,10 +1556,15 @@ mod tests {
         );
         assert!(secret_service_available(&environment));
 
+        let unavailable_tool = temp.path().join("secret-tool-unavailable");
         executable(
-            &environment.secret_tool.clone().unwrap(),
+            &unavailable_tool,
             "#!/bin/sh\nprintf 'Secret Service unavailable' >&2\nexit 1\n",
         );
+        let environment = NetworkEnvironment {
+            secret_tool: Some(unavailable_tool),
+            ..environment
+        };
         assert!(!secret_service_available(&environment));
     }
 

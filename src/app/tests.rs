@@ -2518,22 +2518,28 @@ fn read_only_network_manager_can_open_connected_share_but_not_change_it() {
 }
 
 #[test]
-fn lowercase_m_opens_and_navigates_the_apps_launcher() {
+fn lowercase_m_opens_and_navigates_the_tools_launcher() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app(temp.path());
 
     app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-    assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 0 })));
+    assert!(matches!(
+        app.mode,
+        AppMode::Tools(ToolsView { selected: 0 })
+    ));
 
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 1 })));
+    assert!(matches!(
+        app.mode,
+        AppMode::Tools(ToolsView { selected: 1 })
+    ));
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(matches!(app.mode, AppMode::Browser));
 }
 
 #[test]
-fn configured_app_hotkey_replaces_the_default() {
+fn configured_tools_hotkey_replaces_the_default() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app(temp.path());
     app.config = toml::from_str("[hotkeys]\ntools = 'F2'\n").unwrap();
@@ -2542,7 +2548,10 @@ fn configured_app_hotkey_replaces_the_default() {
     assert!(matches!(app.mode, AppMode::Browser));
 
     app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-    assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 0 })));
+    assert!(matches!(
+        app.mode,
+        AppMode::Tools(ToolsView { selected: 0 })
+    ));
 }
 
 #[test]
@@ -2558,12 +2567,64 @@ fn uppercase_m_opens_the_unified_device_manager() {
 }
 
 #[test]
-fn partition_view_navigation_is_modal_and_returns_to_apps() {
+fn device_manager_escape_returns_to_its_entry_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app(temp.path());
+
+    app.set_manager_return_for_test(ManagerReturn::Files);
+    app.mode = AppMode::Partitions(PartitionView {
+        entries: Vec::new(),
+        selected: 0,
+        overlay: None,
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(app.mode, AppMode::Browser));
+
+    app.set_manager_return_for_test(ManagerReturn::Tools);
+    app.mode = AppMode::Partitions(PartitionView {
+        entries: Vec::new(),
+        selected: 0,
+        overlay: None,
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(
+        app.mode,
+        AppMode::Tools(ToolsView { selected: 0 })
+    ));
+}
+
+#[test]
+fn network_manager_escape_returns_to_its_entry_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app(temp.path());
+
+    app.set_manager_return_for_test(ManagerReturn::Files);
+    app.mode = AppMode::Network(NetworkView {
+        shares: Vec::new(),
+        selected: 0,
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(app.mode, AppMode::Browser));
+
+    app.set_manager_return_for_test(ManagerReturn::Tools);
+    app.mode = AppMode::Network(NetworkView {
+        shares: Vec::new(),
+        selected: 0,
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(
+        app.mode,
+        AppMode::Tools(ToolsView { selected: 0 })
+    ));
+}
+
+#[test]
+fn partition_view_navigation_is_modal_and_returns_to_tools() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("untouched.txt");
     std::fs::write(&file, b"safe").unwrap();
     let mut app = test_app(temp.path());
-    app.partition_return_to_apps = true;
+    app.set_manager_return_for_test(ManagerReturn::Tools);
     app.mode = AppMode::Partitions(PartitionView {
         entries: Vec::new(),
         selected: 0,
@@ -2577,7 +2638,10 @@ fn partition_view_navigation_is_modal_and_returns_to_apps() {
     assert!(matches!(app.mode, AppMode::Partitions(_)));
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 0 })));
+    assert!(matches!(
+        app.mode,
+        AppMode::Tools(ToolsView { selected: 0 })
+    ));
 }
 
 #[test]
@@ -2591,7 +2655,7 @@ fn read_only_mode_opens_device_manager_for_safe_inspection() {
         },
         true,
     );
-    app.mode = AppMode::Apps(AppsView { selected: 0 });
+    app.mode = AppMode::Tools(ToolsView { selected: 0 });
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 

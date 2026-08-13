@@ -1,62 +1,38 @@
 use super::dialogs::{centered, responsive_centered, viewport_start};
 use super::*;
 
-pub(super) fn draw_apps(frame: &mut Frame, app: &App, view: &AppsView) {
-    let area = apps_area(frame.area());
+pub(super) fn draw_tools(frame: &mut Frame, app: &App, view: &ToolsView) {
+    let area = tools_area(manager_content_area(app, frame.area()));
     frame.render_widget(Clear, area);
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(3)])
-        .split(area);
-    let rows = BuiltinApp::ALL.into_iter().map(|builtin| {
+    let rows = BuiltinTool::ALL.into_iter().map(|builtin| {
         let status = match builtin {
-            BuiltinApp::DeviceManager
+            BuiltinTool::DeviceManager
                 if app.config.behavior.read_only || !app.device_manager_available() =>
             {
                 "Unavailable"
             }
-            BuiltinApp::NetworkShares if !app.network_shares_available() => "Unavailable",
+            BuiltinTool::NetworkShares if !app.network_shares_available() => "Unavailable",
             _ => "Available",
         };
         Row::new([builtin.name(), builtin.description(), status])
     });
-    let table = Table::new(rows, apps_table_widths(area.width))
-        .header(Row::new(["App", "Purpose", "State"]).style(Style::default().fg(MUTED)))
+    let table = Table::new(rows, tools_table_widths(area.width))
+        .header(Row::new(["Tool", "Purpose", "State"]).style(Style::default().fg(MUTED)))
         .row_highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ")
-        .block(Block::default().borders(Borders::ALL).title(" Apps "));
+        .block(Block::default().borders(Borders::ALL).title(" Tools "));
     let mut state = TableState::default().with_selected(Some(view.selected));
-    frame.render_stateful_widget(table, sections[0], &mut state);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "↑/{} ↓/{} move · Enter: open · {}/{}/Esc: close",
-            app.config.hotkeys.up.display(),
-            app.config.hotkeys.down.display(),
-            app.config.hotkeys.tools.display(),
-            app.config.hotkeys.quit.display()
-        ))
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(ACCENT))
-        .block(Block::default().borders(Borders::ALL)),
-        sections[1],
-    );
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
-pub(super) fn apps_area(area: Rect) -> Rect {
+pub(super) fn tools_area(area: Rect) -> Rect {
     responsive_centered(area, 88, 68, 150, 12)
 }
 
 pub(super) fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView) {
-    let area = responsive_centered(frame.area(), 96, 72, 150, 92);
+    let area = responsive_centered(manager_content_area(app, frame.area()), 96, 72, 150, 92);
     frame.render_widget(Clear, area);
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(8),
-            Constraint::Length(10),
-            Constraint::Length(3),
-        ])
-        .split(area);
+    let sections = Layout::vertical([Constraint::Min(8), Constraint::Length(10)]).split(area);
     let visible_count = usize::from(sections[0].height.saturating_sub(3)).max(1);
     let start = viewport_start(view.selected, view.entries.len(), visible_count);
     let end = (start + visible_count).min(view.entries.len());
@@ -149,21 +125,6 @@ pub(super) fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView
                 .title(" Selected device "),
         ),
         sections[1],
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Enter/{}: actions · {}: refresh · ↑/{} ↓/{}: move · {}/Esc: apps · {}: browser",
-            app.config.hotkeys.partition_actions.display(),
-            app.config.hotkeys.refresh.display(),
-            app.config.hotkeys.up.display(),
-            app.config.hotkeys.down.display(),
-            app.config.hotkeys.tools.display(),
-            app.config.hotkeys.quit.display()
-        ))
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(ACCENT))
-        .block(Block::default().borders(Borders::ALL)),
-        sections[2],
     );
     if let Some(overlay) = &view.overlay {
         draw_partition_overlay(frame, app, view, overlay);
@@ -887,7 +848,7 @@ pub(super) fn partition_button_width(area_width: u16) -> u16 {
     area_width.saturating_sub(6).saturating_div(2).clamp(8, 16)
 }
 
-pub(super) fn apps_table_widths(width: u16) -> Vec<Constraint> {
+pub(super) fn tools_table_widths(width: u16) -> Vec<Constraint> {
     if width < 90 {
         vec![
             Constraint::Length(20),
@@ -1058,7 +1019,7 @@ pub(super) fn display_or_dash(value: Option<&str>) -> &str {
 }
 
 pub(super) fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
-    let area = centered(frame.area(), 92, 80);
+    let area = centered(manager_content_area(app, frame.area()), 92, 80);
     frame.render_widget(Clear, area);
     let rows = view.devices.iter().map(|device| {
         Row::new(vec![
@@ -1111,67 +1072,4 @@ pub(super) fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
         Some(view.selected)
     });
     frame.render_stateful_widget(table, area, &mut state);
-    let footer = Rect {
-        x: area.x + 2,
-        y: area.y + area.height.saturating_sub(2),
-        width: area.width.saturating_sub(4),
-        height: 1,
-    };
-    let action = view
-        .devices
-        .get(view.selected)
-        .map(|device| {
-            if device.system_protected {
-                return "Protected system volume · disk actions unavailable".to_string();
-            }
-            let mut action = if !device.encrypted && device.filesystem.is_none() {
-                "No directly mountable filesystem".to_string()
-            } else if device.encrypted && device.is_locked() {
-                format!(
-                    "Enter/{}: unlock and mount",
-                    app.config.hotkeys.device_unmount.display()
-                )
-            } else if device.encrypted && device.is_mounted() {
-                format!(
-                    "Enter/{}: unmount and lock",
-                    app.config.hotkeys.device_unmount.display()
-                )
-            } else if device.is_mounted() {
-                format!(
-                    "Enter/{}: unmount",
-                    app.config.hotkeys.device_unmount.display()
-                )
-            } else {
-                format!(
-                    "Enter/{}: mount",
-                    app.config.hotkeys.device_action.display()
-                )
-            };
-            if device.ejectable && !device.eject_blocked {
-                action.push_str(&format!(
-                    " · {} eject",
-                    app.config.hotkeys.device_eject.display()
-                ));
-            } else if device.ejectable && device.eject_blocked {
-                action.push_str(" · eject unavailable: drive in use");
-            }
-            action
-        })
-        .unwrap_or_else(|| {
-            if app.device_refreshing {
-                "Refreshing devices…".into()
-            } else {
-                "No storage devices found".into()
-            }
-        });
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{action} · {}: refresh · Esc: return · {}: browser",
-            app.config.hotkeys.refresh.display(),
-            app.config.hotkeys.quit.display()
-        ))
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(ACCENT)),
-        footer,
-    );
 }
