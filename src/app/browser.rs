@@ -1,7 +1,7 @@
 use super::*;
 
 impl App {
-    pub(super) fn refresh(&mut self) {
+    pub(crate) fn refresh(&mut self) {
         let same_root = self.loaded_dir == self.current_dir;
         let preferred = if same_root {
             self.selected_entry().map(|entry| entry.path.clone())
@@ -14,7 +14,7 @@ impl App {
         self.refresh_browser(preferred);
     }
 
-    pub(super) fn refresh_search_results(&mut self, renamed: Option<(&Path, &Path)>) {
+    pub(crate) fn refresh_search_results(&mut self, renamed: Option<(&Path, &Path)>) {
         let Some(view) = &mut self.search_results else {
             return;
         };
@@ -39,7 +39,7 @@ impl App {
         self.search_matches = view.results.len();
     }
 
-    pub(super) fn refresh_browser(&mut self, preferred: Option<PathBuf>) {
+    pub(crate) fn refresh_browser(&mut self, preferred: Option<PathBuf>) {
         if cfg!(test) {
             match self.browser_view {
                 BrowserView::Tree => self.refresh_tree(preferred),
@@ -50,7 +50,7 @@ impl App {
         }
     }
 
-    pub(super) fn request_browser_load(&mut self, preferred: Option<PathBuf>) {
+    pub(crate) fn request_browser_load(&mut self, preferred: Option<PathBuf>) {
         self.browser_generation = self.browser_generation.wrapping_add(1);
         let marked = self
             .entries
@@ -84,7 +84,7 @@ impl App {
         }
     }
 
-    pub(super) fn refresh_table(&mut self, preferred: Option<PathBuf>) {
+    pub(crate) fn refresh_table(&mut self, preferred: Option<PathBuf>) {
         let marked = self
             .entries
             .iter()
@@ -124,7 +124,7 @@ impl App {
         }
     }
 
-    pub(super) fn refresh_tree(&mut self, preferred: Option<PathBuf>) {
+    pub(crate) fn refresh_tree(&mut self, preferred: Option<PathBuf>) {
         let marked = self
             .entries
             .iter()
@@ -162,7 +162,7 @@ impl App {
         }
     }
 
-    pub(super) fn read_expanded_tree(
+    pub(crate) fn read_expanded_tree(
         &self,
     ) -> crate::error::Result<(Vec<FileEntry>, Vec<usize>, Option<String>)> {
         fn append_directory(
@@ -218,7 +218,7 @@ impl App {
         Ok((entries, depths, nested_error))
     }
 
-    pub(super) fn toggle_browser_view(&mut self) {
+    pub(crate) fn toggle_browser_view(&mut self) {
         let selected = self.selected_entry().map(|entry| entry.path.clone());
         self.remember_selection();
         match self.browser_view {
@@ -242,14 +242,14 @@ impl App {
         }
     }
 
-    pub(super) fn remember_selection(&mut self) {
+    pub(crate) fn remember_selection(&mut self) {
         if let Some(entry) = self.selected_entry() {
             self.selector_memory
                 .insert(self.current_dir.clone(), entry.path.clone());
         }
     }
 
-    pub(super) fn move_cursor(&mut self, delta: isize) {
+    pub(crate) fn move_cursor(&mut self, delta: isize) {
         if self.entries.is_empty() {
             self.cursor = 0;
             return;
@@ -261,7 +261,7 @@ impl App {
         }
     }
 
-    pub(super) fn open_selected_table(&mut self) -> AppMode {
+    pub(crate) fn open_selected_table(&mut self) -> AppMode {
         let Some(entry) = self.selected_entry() else {
             return AppMode::Browser;
         };
@@ -273,7 +273,7 @@ impl App {
         }
     }
 
-    pub(super) fn activate_tree_entry(&mut self) -> AppMode {
+    pub(crate) fn activate_tree_entry(&mut self) -> AppMode {
         let Some(entry) = self.selected_entry().cloned() else {
             return AppMode::Browser;
         };
@@ -288,7 +288,7 @@ impl App {
         }
     }
 
-    pub(super) fn tree_right(&mut self) -> AppMode {
+    pub(crate) fn tree_right(&mut self) -> AppMode {
         let Some(entry) = self.selected_entry().cloned() else {
             return AppMode::Browser;
         };
@@ -308,7 +308,7 @@ impl App {
         AppMode::Browser
     }
 
-    pub(super) fn tree_left(&mut self) {
+    pub(crate) fn tree_left(&mut self) {
         let Some(entry) = self.selected_entry().cloned() else {
             self.go_parent();
             return;
@@ -330,7 +330,7 @@ impl App {
         }
     }
 
-    pub(super) fn go_parent(&mut self) {
+    pub(crate) fn go_parent(&mut self) {
         let Some(parent) = self.current_dir.parent().map(Path::to_path_buf) else {
             return;
         };
@@ -342,7 +342,7 @@ impl App {
         self.refresh_browser(Some(previous_root));
     }
 
-    pub(super) fn go_to(&mut self, path: PathBuf) {
+    pub(crate) fn go_to(&mut self, path: PathBuf) {
         self.remember_selection();
         let path = if path.is_absolute() {
             path
@@ -359,7 +359,7 @@ impl App {
         }
     }
 
-    pub(super) fn open_search_result(&mut self, path: &Path) {
+    pub(crate) fn open_search_result(&mut self, path: &Path) {
         if path.is_dir() {
             self.go_to(path.to_path_buf());
             return;
@@ -375,13 +375,13 @@ impl App {
         self.refresh_browser(Some(path.to_path_buf()));
     }
 
-    pub(super) fn toggle_selection(&mut self) {
+    pub(crate) fn toggle_selection(&mut self) {
         if let Some(entry) = self.entries.get_mut(self.cursor) {
             entry.selected = !entry.selected;
         }
     }
 
-    pub(super) fn cycle_sort(&mut self) {
+    pub(crate) fn cycle_sort(&mut self) {
         self.config.ui.sort = match self.config.ui.sort {
             SortSetting::Name => SortSetting::Extension,
             SortSetting::Extension => SortSetting::Size,
@@ -392,15 +392,15 @@ impl App {
         };
     }
 
-    pub(super) fn selected_paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn selected_paths(&self) -> Vec<PathBuf> {
         target_paths_from(&self.entries, self.cursor)
     }
 
-    pub(super) fn mutation_targets(&mut self) -> Option<Vec<PathBuf>> {
+    pub(crate) fn mutation_targets(&mut self) -> Option<Vec<PathBuf>> {
         self.mutation_targets_from(self.selected_paths())
     }
 
-    pub(super) fn mutation_targets_from(&mut self, paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
+    pub(crate) fn mutation_targets_from(&mut self, paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
         if self.config.behavior.read_only {
             self.status = "Read-only mode: file operations are disabled".into();
             return None;
