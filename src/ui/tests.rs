@@ -223,7 +223,13 @@ fn search_dialogs_have_no_popup_halo() {
                 Block::default().style(Style::default().bg(SENTINEL)),
                 frame.area(),
             );
-            draw_format_options(frame, "/dev/test", 0, false);
+            draw_format_options(
+                frame,
+                "/dev/test",
+                0,
+                false,
+                partition::FilesystemAccess::SystemDefault,
+            );
         })
         .unwrap();
     assert_eq!(
@@ -1405,6 +1411,7 @@ fn partition_manager_renders_topology_details_and_safety_state() {
         view.overlay = Some(PartitionOverlay::FormatOptions {
             selected: 0,
             encrypted: false,
+            access: partition::FilesystemAccess::SystemDefault,
         });
     }
     terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -1417,13 +1424,14 @@ fn partition_manager_renders_topology_details_and_safety_state() {
         .collect::<String>();
     assert!(rendered.contains("Recommended Linux default"));
     assert!(rendered.contains("exFAT"));
-    assert!(rendered.contains("Choose filesystem"));
+    assert!(rendered.contains("Access: System defaults"));
 
     if let AppMode::Partitions(view) = &mut app.mode {
         let action = partition::PartitionAction::Format {
             target: partition::DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
             filesystem: partition::Filesystem::Ext4,
             label: None,
+            access: partition::FilesystemAccess::SystemDefault,
         };
         view.overlay = Some(PartitionOverlay::Confirm {
             action,

@@ -364,7 +364,9 @@ pub(super) fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -
             return format!(" ↑↓/{down}/{up} Move · Enter Continue · {actions}/Esc Back ")
         }
         Some(crate::app::PartitionOverlay::FormatOptions { .. }) => {
-            return format!(" ↑↓/{down}/{up} Choose filesystem · Enter Continue · Esc Back ")
+            return format!(
+                " ↑↓/{down}/{up} Filesystem · o Access · e Encrypt · Enter Continue · Esc Back "
+            )
         }
         Some(crate::app::PartitionOverlay::EncryptionFilesystem { .. }) => {
             return format!(" ↑↓/{down}/{up} Choose inner filesystem · Enter Continue · Esc Back ")
