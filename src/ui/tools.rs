@@ -246,21 +246,122 @@ pub(super) fn draw_network_progress(frame: &mut Frame) {
 
 pub(super) fn draw_help(frame: &mut Frame, app: &App) {
     let h = &app.config.hotkeys;
-    let body = format!(
-        "Navigation\n  ↑/{} ↓/{}       move\n  Enter          toggle directory or open file\n  →/{}            expand/child in tree; open in table\n  ←/{}            collapse/parent in tree; parent in table\n  {}              toggle tree/table view\n  {}              go to path\n  {}              search current directory\n  {}              search entire filesystem\n\nClipboard\n  {}              cut\n  {}              copy\n  {}              paste\n\nArchives\n  {}              create, inspect, or extract archive\n\nFiles\n  {}          select\n  {}              edit selected text file\n  {}              rename file or directory\n  {} / {}          trash with prompt / quick trash\n  {}              trash bin\n\nTrash bin\n  {}          select\n  Enter / {}      restore\n  {} / {}          permanent delete / quick permanent delete\n  {}              clear trash with confirmation\n\nCreate\n  {}              create file\n  {}              create directory\n\nTools and devices\n  {}              built-in tools launcher\n  {}              device manager\n  {}              safely eject selected removable device\n\nNetwork shares\n  {}              network shares\n  {}              add share\n  Enter          open or connect\n  {}              disconnect\n  {}              forget saved share\n  {}              refresh\n\nView\n  {}              hidden files\n  {} / {}          sort mode / reverse\n  {}              information\n  Esc            close this view",
-        h.up.display(), h.down.display(), h.expand.display(), h.collapse.display(),
-        h.toggle_view.display(), h.go_to.display(), h.search.display(), h.search_filesystem.display(),
-        h.cut.display(), h.copy.display(), h.paste.display(), h.archive.display(), h.select.display(), h.edit.display(),
-        h.rename.display(), h.trash.display(), h.quick_trash.display(), h.trash_bin.display(),
-        h.select.display(), h.restore.display(), h.permanent_delete.display(),
-        h.quick_permanent_delete.display(), h.clear_trash.display(), h.create_file.display(),
-        h.create_directory.display(), h.tools.display(), h.devices.display(),
-        h.device_eject.display(), h.network_shares.display(), h.network_add.display(),
-        h.network_disconnect.display(), h.network_forget.display(), h.refresh.display(),
-        h.hidden.display(), h.sort.display(), h.reverse_sort.display(), h.info.display(),
-    );
     let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
-    message_modal(frame, &title, &body, "Enter: close · Esc: close", 70, 94);
+    let area = centered(frame.area(), 84, 88);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+
+    let left = help_column(&[
+        (
+            "Navigation",
+            vec![
+                (
+                    format!("↑↓/{}/{}", h.down.display(), h.up.display()),
+                    "Move",
+                ),
+                (format!("←/{}", h.collapse.display()), "Parent / collapse"),
+                (format!("→/{}", h.expand.display()), "Open / expand"),
+                (format!("Enter/{}", h.open.display()), "Open selected item"),
+                (h.toggle_view.display().into(), "Toggle tree/table"),
+            ],
+        ),
+        (
+            "File actions",
+            vec![
+                (h.select.display().into(), "Mark"),
+                (h.cut.display().into(), "Cut"),
+                (h.copy.display().into(), "Copy"),
+                (h.paste.display().into(), "Paste"),
+                (h.rename.display().into(), "Rename"),
+                (h.edit.display().into(), "Edit text file"),
+                (h.archive.display().into(), "Archive actions"),
+            ],
+        ),
+        (
+            "Trash",
+            vec![
+                (h.trash.display().into(), "Move to Trash"),
+                (h.quick_trash.display().into(), "Quick Trash"),
+                (h.trash_bin.display().into(), "Open Trash"),
+            ],
+        ),
+    ]);
+    let right = help_column(&[
+        (
+            "Find and create",
+            vec![
+                (h.go_to.display().into(), "Go to path"),
+                (h.search.display().into(), "Search directory"),
+                (h.search_filesystem.display().into(), "Search filesystem"),
+                (h.create_file.display().into(), "Create file"),
+                (h.create_directory.display().into(), "Create directory"),
+            ],
+        ),
+        (
+            "View and tools",
+            vec![
+                (h.hidden.display().into(), "Toggle hidden files"),
+                (h.sort.display().into(), "Change sort mode"),
+                (h.reverse_sort.display().into(), "Reverse sort"),
+                (h.tools.display().into(), "Open tools"),
+                (h.network_shares.display().into(), "Open shares"),
+                (h.devices.display().into(), "Open devices"),
+                (h.info.display().into(), "Information"),
+            ],
+        ),
+        (
+            "Application",
+            vec![
+                (h.help.display().into(), "Help"),
+                (h.quit.display().into(), "Quit"),
+                (h.force_quit.display().into(), "Force quit"),
+            ],
+        ),
+    ]);
+
+    if rows[0].width >= 50 {
+        let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+        frame.render_widget(Paragraph::new(left), columns[0]);
+        frame.render_widget(Paragraph::new(right), columns[1]);
+    } else {
+        let mut combined = left;
+        combined.lines.extend(right.lines);
+        frame.render_widget(Paragraph::new(combined), rows[0]);
+    }
+    frame.render_widget(
+        Paragraph::new("Enter: close · Esc: close")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT)),
+        rows[1],
+    );
+}
+
+fn help_column(sections: &[(&str, Vec<(String, &str)>)]) -> Text<'static> {
+    let mut lines = Vec::new();
+    for (title, items) in sections {
+        lines.push(Line::from(Span::styled(
+            (*title).to_owned(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        for (key, label) in items {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key:<11}"),
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled((*label).to_owned(), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
+    Text::from(lines)
 }
 
 pub(super) fn draw_info(frame: &mut Frame, app: &App, entry: Option<&crate::entry::FileEntry>) {

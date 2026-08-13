@@ -1,13 +1,14 @@
 use super::*;
 use crate::{
-    app::{ArchiveView, NetworkView, PartitionView},
+    app::{ArchiveView, NetworkView, PartitionView, TrashView},
     archive::{ArchiveEntry, ArchiveEntryKind},
     config::{Config, ConfigLoad},
     network::{NetworkSecret, NetworkShare, ShareAddress},
     partition,
+    trash::TrashManager,
 };
 use ratatui::{backend::TestBackend, Terminal};
-use std::{path::PathBuf, time::Instant};
+use std::{collections::HashSet, path::PathBuf, time::Instant};
 
 #[test]
 fn viewport_tracks_selection_without_exceeding_bounds() {
@@ -1151,7 +1152,7 @@ fn narrow_tree_keeps_the_existing_full_width_fallback() {
 }
 
 #[test]
-fn footer_and_help_expose_the_network_share_hotkey() {
+fn footer_and_browser_help_expose_the_network_share_hotkey() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = App::new(
         temp.path().to_path_buf(),
@@ -1168,7 +1169,7 @@ fn footer_and_help_expose_the_network_share_hotkey() {
 
     app.mode = AppMode::Help;
     terminal.draw(|frame| draw(frame, &app)).unwrap();
-    assert!(rendered_text(&terminal).contains("N              network shares"));
+    assert!(rendered_text(&terminal).contains("N          Open shares"));
 }
 
 #[test]
@@ -1234,10 +1235,87 @@ fn footer_and_help_render_configured_hotkeys() {
     app.mode = AppMode::Help;
     terminal.draw(|frame| draw(frame, &app)).unwrap();
     let text = rendered_text(&terminal);
-    assert!(text.contains("F2              built-in tools launcher"));
-    assert!(text.contains("F3              network shares"));
-    assert!(text.contains("F4              device manager"));
-    assert!(text.contains("F5              create, inspect, or extract archive"));
+    assert!(text.contains("F2         Open tools"));
+    assert!(text.contains("F3         Open shares"));
+    assert!(text.contains("F4         Open devices"));
+    assert!(text.contains("F5         Archive actions"));
+}
+
+#[test]
+fn help_is_browser_focused_and_distinguishes_trash_actions() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config: Config::default(),
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    app.mode = AppMode::Help;
+    let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+
+    assert!(text.contains("d          Move to Trash"));
+    assert!(text.contains("D          Quick Trash"));
+    assert!(text.contains("T          Open Trash"));
+    assert!(!text.contains("permanent delete"));
+    assert!(!text.contains("clear trash"));
+    assert!(!text.contains("disconnect"));
+}
+
+#[test]
+fn trash_footer_keeps_contextual_configured_actions() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = toml::from_str(
+        "[hotkeys]\nrestore = 'F2'\npermanent_delete = 'F3'\nquick_permanent_delete = 'F4'\nclear_trash = 'F5'\ntrash_bin = 'F6'\n",
+    )
+    .unwrap();
+    let mut app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config,
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    app.mode = AppMode::Trash(TrashView {
+        manager: TrashManager::isolated(temp.path()),
+        entries: Vec::new(),
+        selected: 0,
+        marked: HashSet::new(),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+
+    assert!(text.contains("Enter/F2: restore"));
+    assert!(text.contains("F3: permanent delete"));
+    assert!(text.contains("F4: quick permanent delete"));
+    assert!(text.contains("F5: clear trash"));
+    assert!(text.contains("F6/Esc: return"));
+}
+
+#[test]
+fn help_keeps_core_actions_and_close_footer_on_narrow_terminals() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config: Config::default(),
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    app.mode = AppMode::Help;
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+
+    assert!(text.contains("Navigation"));
+    assert!(text.contains("Open Trash"));
+    assert!(text.contains("Enter: close · Esc: close"));
 }
 
 #[test]
