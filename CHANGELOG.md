@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.8.2
+
+### Changed
+
+- Tree view now reuses the same responsive Details side panel as table view.
+- Tree and table views share one browser-panel layout while retaining their
+  existing navigation behavior and narrow-terminal fallback.
+
+### Fixed
+
+- Added regression coverage for creating and pasting into a focused tree
+  directory, and for pasting beside a focused file in an expanded directory.
+
 ## v0.8.1
 
 ### Changed

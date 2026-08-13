@@ -9,22 +9,35 @@ pub(super) fn draw_browser(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn draw_table_view(frame: &mut Frame, app: &App, area: Rect) {
+    draw_browser_with_details(frame, app, area, draw_file_table);
+}
+
+fn draw_browser_with_details(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    draw_entries: fn(&mut Frame, &App, Rect),
+) {
     if area.width < 86 {
-        draw_file_table(frame, app, area);
+        draw_entries(frame, app, area);
         return;
     }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(area);
-    draw_file_table(frame, app, columns[0]);
+    draw_entries(frame, app, columns[0]);
     draw_details(frame, app, columns[1]);
 }
 
 pub(super) fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
+    draw_browser_with_details(frame, app, area, draw_tree_table);
+}
+
+fn draw_tree_table(frame: &mut Frame, app: &App, area: Rect) {
     let icons = Icons::new(&app.config.icons);
     let search_query: Option<&str> = None;
-    let visible_count = usize::from(area.height.saturating_sub(1)).max(1);
+    let visible_count = usize::from(area.height.saturating_sub(3)).max(1);
     let start = viewport_start(app.cursor, app.entries.len(), visible_count);
     let end = (start + visible_count).min(app.entries.len());
     let rows = app.entries[start..end]
@@ -96,7 +109,8 @@ pub(super) fn draw_tree_view(frame: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
         )
         .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .highlight_symbol("> ");
+        .highlight_symbol("> ")
+        .block(Block::default().borders(Borders::ALL).title(" Files "));
     let selected = (!app.entries.is_empty()).then_some(app.cursor.saturating_sub(start));
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);

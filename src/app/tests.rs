@@ -1337,6 +1337,9 @@ fn tree_paste_targets_the_focused_directory_and_selects_the_result() {
         .iter()
         .position(|entry| entry.path == nested)
         .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.is_tree_directory_expanded(&nested));
+    assert_eq!(app.selected_entry().map(|entry| &entry.path), Some(&nested));
     app.clipboard = Some(Clipboard {
         mode: ClipboardMode::Copy,
         paths: vec![source],
@@ -1355,7 +1358,48 @@ fn tree_paste_targets_the_focused_directory_and_selects_the_result() {
     assert!(pasted.is_file());
     assert_eq!(std::fs::read(&pasted).unwrap(), b"copy me");
     assert_eq!(app.selected_entry().map(|entry| &entry.path), Some(&pasted));
+    assert!(app.is_tree_directory_expanded(&nested));
     assert!(matches!(app.mode, AppMode::Browser));
+}
+
+#[test]
+fn tree_paste_targets_the_parent_of_a_focused_nested_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.txt");
+    let nested = temp.path().join("nested");
+    let focused = nested.join("focused.txt");
+    std::fs::write(&source, b"copy me").unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(&focused, b"focused").unwrap();
+    let mut app = test_app(temp.path());
+    app.cursor = app
+        .entries
+        .iter()
+        .position(|entry| entry.path == nested)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.cursor = app
+        .entries
+        .iter()
+        .position(|entry| entry.path == focused)
+        .unwrap();
+    app.clipboard = Some(Clipboard {
+        mode: ClipboardMode::Copy,
+        paths: vec![source],
+    });
+
+    app.mode = app.prepare_paste();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.operation.is_some() && Instant::now() < deadline {
+        if !app.poll_operation() {
+            thread::yield_now();
+        }
+    }
+
+    let pasted = nested.join("source.txt");
+    assert_eq!(std::fs::read(&pasted).unwrap(), b"copy me");
+    assert_eq!(app.selected_entry().map(|entry| &entry.path), Some(&pasted));
+    assert!(app.is_tree_directory_expanded(&nested));
 }
 
 #[test]
