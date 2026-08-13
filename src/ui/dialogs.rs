@@ -3,7 +3,7 @@ use super::{storage::draw_popup_halo, tools::append_trash_names};
 
 pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
     match prompt {
-        Prompt::GoTo { input } => input_modal(frame, "Go to path", input, "Enter go · Esc cancel"),
+        Prompt::GoTo { input } => input_modal(frame, "Go to path", input, "Enter: go · Esc: cancel"),
         Prompt::Rename { input, cursor, .. } => cursor_input_modal(
             frame,
             "Rename",
@@ -16,7 +16,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             frame,
             "Create directory",
             input,
-            "Enter create · Esc cancel",
+            "Enter: create · Esc: cancel",
         ),
         Prompt::CreateFile { input, cursor } => cursor_input_modal(
             frame,
@@ -43,7 +43,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 frame,
                 "Create archive",
                 &format!("Choose a format:\n\n{body}"),
-                "↑/↓ choose · Enter continue · Esc cancel",
+                "↑/↓: choose · Enter: continue · Esc: cancel",
                 58,
                 13,
             );
@@ -72,7 +72,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 frame,
                 "Archive actions",
                 &format!("{}\n\n{body}", archive.display()),
-                "↑/↓ choose · Enter continue · Esc cancel",
+                "↑/↓: choose · Enter: continue · Esc: cancel",
                 72,
                 14,
             );
@@ -100,7 +100,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 "Confirm move to trash",
                 &body,
                 &format!(
-                    "{}/Enter confirm · {}/Esc cancel",
+                    "{}/Enter: confirm · {}/Esc: cancel",
                     app.config.hotkeys.confirm_yes.display(),
                     app.config.hotkeys.confirm_no.display()
                 ),
@@ -120,7 +120,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 "Destination already exists",
                 &format!("Existing destination items will be moved to trash before replacement.\n\n{conflicts}"),
                 &format!(
-                    "{}/Enter overwrite · {} skip conflicts · {}/Esc abort",
+                    "{}/Enter: overwrite · {}: skip conflicts · {}/Esc: abort",
                     app.config.hotkeys.overwrite.display(),
                     app.config.hotkeys.skip.display(),
                     app.config.hotkeys.abort.display()
@@ -137,7 +137,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 "Confirm restore",
                 &body,
                 &format!(
-                    "{}/Enter restore · Esc cancel",
+                    "{}/Enter: restore · Esc: cancel",
                     app.config.hotkeys.restore.display()
                 ),
                 76,
@@ -170,7 +170,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 },
                 &body,
                 &format!(
-                    "{}/Enter permanently delete · Esc cancel",
+                    "{}/Enter: permanently delete · Esc: cancel",
                     app.config.hotkeys.permanent_delete.display()
                 ),
                 78,
@@ -178,7 +178,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             );
         }
         Prompt::ConfirmLuks { title, body, .. } => {
-            message_modal(frame, title, body, "Enter continue · Esc cancel", 80, 17)
+            message_modal(frame, title, body, "Enter: continue · Esc: cancel", 80, 17)
         }
         Prompt::LuksPassphrase {
             source,
@@ -229,7 +229,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 rows[2],
             );
             frame.render_widget(
-                Paragraph::new("Enter unlock · Esc cancel")
+                Paragraph::new("Enter: unlock · Esc: cancel")
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(ACCENT)),
                 rows[3],
@@ -285,7 +285,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 rows[2],
             );
             frame.render_widget(
-                Paragraph::new("Enter authenticate · Esc cancel")
+                Paragraph::new("Enter: authenticate · Esc: cancel")
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(ACCENT)),
                 rows[3],
@@ -298,7 +298,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             frame,
             "Volume mounted",
             &format!("Mounted successfully:\n\n{}", path.display()),
-            "[Enter] Open volume   [Esc] Stay in current directory",
+            "Enter: open volume · Esc: stay here",
             78,
             12,
         ),
@@ -367,18 +367,18 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 "Samba password",
                 &body,
                 input.character_count(),
-                "Enter continue · Esc cancel",
+                "Enter: continue · Esc: cancel",
             );
         }
         Prompt::SmbRemember { available, .. } => {
             let footer = if *available {
                 format!(
-                    "{} remember · {}/Enter this session only · Esc cancel",
+                    "{}: remember · {}/Enter: this session only · Esc: cancel",
                     app.config.hotkeys.confirm_yes.display(),
                     app.config.hotkeys.confirm_no.display()
                 )
             } else {
-                "Enter this session only · Esc cancel".into()
+                "Enter: this session only · Esc: cancel".into()
             };
             message_modal(
                 frame,
@@ -398,7 +398,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             "Disconnect network share",
             &format!("Disconnect {}?\n\nOpen files on this share may prevent disconnection.", share.address.uri),
             &format!(
-                "{}/Enter disconnect · Esc cancel",
+                "{}/Enter: disconnect · Esc: cancel",
                 app.config.hotkeys.network_disconnect.display()
             ),
             76,
@@ -412,7 +412,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
                 share.address.uri
             ),
             &format!(
-                "{}/Enter forget · Esc cancel",
+                "{}/Enter: forget · Esc: cancel",
                 app.config.hotkeys.network_forget.display()
             ),
             76,
@@ -422,30 +422,30 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             frame,
             "Network share connected",
             &format!("{}\n\n{}", address.uri, path.display()),
-            "[Enter] Open share   [Esc] Stay in current directory",
+            "Enter: open share · Esc: stay here",
             78,
             13,
         ),
         Prompt::SmbMessage { title, body, .. } => {
-            message_modal(frame, title, body, "Enter/Esc close", 76, 14)
+            message_modal(frame, title, body, "Enter: close · Esc: close", 76, 14)
         }
         Prompt::UpdateAvailable { current, latest } => message_modal(
             frame,
             "Update available",
             &format!("Installed: {current}\nLatest:    {latest}"),
-            "[Enter] Update now   [Esc] Continue",
+            "Enter: update now · Esc: continue",
             62,
             11,
         ),
         Prompt::Message { title, body } => {
-            message_modal(frame, title, body, "Enter/Esc close", 72, 12)
+            message_modal(frame, title, body, "Enter: close · Esc: close", 72, 12)
         }
         Prompt::SmartReport { body, scroll, .. } => smart_report_modal(frame, body, *scroll),
         Prompt::OpenError { body, .. } => message_modal(
             frame,
             "Unable to open file",
             body,
-            "Enter/Esc close",
+            "Enter: close · Esc: close",
             72,
             12,
         ),
@@ -467,7 +467,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &App, prompt: &Prompt) {
             {
                 body.push_str(&format!("\n\nWarning\n  {warning}"));
             }
-            message_modal(frame, "Operation summary", &body, "Enter/Esc close", 80, 20);
+            message_modal(frame, "Operation summary", &body, "Enter: close · Esc: close", 80, 20);
         }
     }
 }
@@ -583,7 +583,7 @@ pub(super) fn draw_progress_modal(frame: &mut Frame, app: &App) {
         Paragraph::new(if app.progress.cancelling {
             "Cancellation requested…"
         } else if app.progress.cancellable {
-            "Esc requests cancellation"
+            "Esc: request cancellation"
         } else if device_slow {
             "Still working · some devices take longer · do not disconnect"
         } else {
@@ -692,7 +692,7 @@ pub(super) fn cursor_input_modal(
     frame.set_cursor_position((cursor_x, rows[1].y + 1));
     frame.render_widget(
         Paragraph::new(format!(
-            "←/→ move · Home/End jump · Enter {action} · Esc cancel"
+            "←/→: move · Home/End: jump · Enter: {action} · Esc: cancel"
         ))
         .alignment(Alignment::Center)
         .style(Style::default().fg(MUTED)),
@@ -751,7 +751,7 @@ pub(super) fn cursor_input_modal_with_error(
     }
     frame.render_widget(
         Paragraph::new(format!(
-            "←/→ move · Home/End jump · Enter {action} · Esc cancel"
+            "←/→: move · Home/End: jump · Enter: {action} · Esc: cancel"
         ))
         .alignment(Alignment::Center)
         .style(Style::default().fg(MUTED)),
@@ -813,7 +813,36 @@ pub(super) fn message_modal(
     width: u16,
     height: u16,
 ) {
-    let area = centered(frame.area(), width, height);
+    let maximum_height = if height > 50 {
+        (frame.area().height.saturating_mul(height) / 100).max(8)
+    } else {
+        height.max(8)
+    };
+    let responsive_width = frame
+        .area()
+        .width
+        .saturating_mul(78)
+        .saturating_div(100)
+        .max(56)
+        .min(width);
+    let content_width = usize::from(responsive_width.saturating_sub(4).max(1));
+    let body_lines = body
+        .lines()
+        .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let desired_height = if height > 50 {
+        maximum_height
+    } else {
+        u16::try_from(body_lines)
+            .unwrap_or(u16::MAX)
+            .saturating_add(4)
+            .clamp(8, maximum_height)
+    };
+    let area = if height > 50 {
+        centered(frame.area(), responsive_width, height)
+    } else {
+        centered(frame.area(), responsive_width, desired_height)
+    };
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -855,7 +884,7 @@ pub(super) fn smart_report_modal(frame: &mut Frame, body: &str, scroll: u16) {
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new("↑/↓ scroll · PageUp/PageDown jump · Enter/Esc close")
+        Paragraph::new("↑/↓: scroll · PageUp/PageDown: jump · Enter: close · Esc: close")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT)),
         rows[1],
@@ -886,7 +915,7 @@ pub(super) fn partition_error_modal(frame: &mut Frame, body: &str) {
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new("Enter/Esc return")
+        Paragraph::new("Enter: return · Esc: return")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT)),
         rows[1],

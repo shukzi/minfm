@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## v0.8.3
+
+### Changed
+
+- Formatting now keeps KDE-like default filesystem permissions unless the
+  explicit `Allow everyone to read and write` option is enabled.
+- Replaced the previous current-user ownership option with an opt-in Everyone
+  permission that changes only the new filesystem's top-level directory.
+- Standardized modal controls as `Key: action` throughout the TUI.
+- Ordinary message modals now size to their wrapped content within their
+  existing bounds; large Help and report views retain their dedicated sizes.
+- Storage and network failures use clearer `What happened`, `Reason`, and
+  `What to do` sections where actionable context is available.
+- Simplified the connected-share settling message while retaining technical
+  package names in the missing-dependency explanation.
+
+### Performance
+
+- Permission handling remains post-format only, and modal sizing uses existing
+  in-memory text without filesystem access or background work.
+
 ## v0.8.2
 
 ### Changed

@@ -39,7 +39,7 @@ pub(super) fn draw_search_progress(frame: &mut Frame, app: &App) {
         if app.search_cancelling {
             "Waiting for worker to stop"
         } else {
-            "Esc cancel"
+            "Esc: cancel"
         }
     );
     frame.render_widget(
@@ -105,7 +105,7 @@ pub(super) fn draw_quick_search(frame: &mut Frame, app: &App, form: &SearchForm)
     };
     frame.render_widget(
         Paragraph::new(format!(
-            "Enter search · {} advanced · Esc cancel",
+            "Enter: search · {} advanced · Esc: cancel",
             app.config.hotkeys.search_filesystem.display()
         ))
         .alignment(Alignment::Center)
@@ -234,7 +234,7 @@ pub(super) fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchFo
     frame.render_widget(
         Paragraph::new(if area.width < 90 {
             format!(
-                "Tab field · Enter search · Esc {}",
+                "Tab: field · Enter: search · Esc: {}",
                 match form.return_to {
                     crate::app::SearchReturn::Browser => "cancel",
                     crate::app::SearchReturn::Results => "results",
@@ -242,7 +242,7 @@ pub(super) fn draw_advanced_search(frame: &mut Frame, app: &App, form: &SearchFo
             )
         } else {
             format!(
-                "↑/↓ section · Tab field · ←/→ choice · Space toggle · Enter search · Esc {}",
+                "↑/↓: section · Tab: field · ←/→: choice · Space: toggle · Enter: search · Esc: {}",
                 match form.return_to {
                     crate::app::SearchReturn::Browser => "cancel",
                     crate::app::SearchReturn::Results => "results",
@@ -888,14 +888,14 @@ pub(super) fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchVie
     frame.render_stateful_widget(table, table_area, &mut state);
     let footer = if view.truncated {
         format!(
-            "{} result limit reached · ↑/↓ {}/{} Move · Enter open · Esc return",
+            "{} result limit reached · ↑/↓/{}/{}: move · Enter: open · Esc: return",
             format_count(view.request.result_limit().get()),
             app.config.hotkeys.down.display(),
             app.config.hotkeys.up.display()
         )
     } else if view.skipped == 0 {
         format!(
-            "↑/↓ {}/{} Move · Enter open · {} Search here · {} Search filesystem · Esc return",
+            "↑/↓/{}/{}: move · Enter: open · {}: search here · {}: search filesystem · Esc: return",
             app.config.hotkeys.down.display(),
             app.config.hotkeys.up.display(),
             app.config.hotkeys.search.display(),
@@ -903,7 +903,7 @@ pub(super) fn draw_search_results(frame: &mut Frame, app: &App, view: &SearchVie
         )
     } else {
         format!(
-            "↑/↓ {}/{} Move · Enter open · Esc return · {} permission error(s) skipped",
+            "↑/↓/{}/{}: move · Enter: open · Esc: return · {} permission error(s) skipped",
             app.config.hotkeys.down.display(),
             app.config.hotkeys.up.display(),
             view.skipped

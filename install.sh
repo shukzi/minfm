@@ -259,7 +259,7 @@ partition_packages=""
 if command -v dnf >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1 || command -v pacman >/dev/null 2>&1; then
     missing_any parted && add_partition_package parted
     missing_any mount umount wipefs sfdisk blockdev mkswap swaplabel && add_partition_package util-linux
-    missing_any chown dd cp install mkdir mv && add_partition_package coreutils
+    missing_any chown chmod dd cp install mkdir mv && add_partition_package coreutils
     missing_any sudo && add_partition_package sudo
     missing_any mkfs.ext4 e2fsck resize2fs e2label && add_partition_package e2fsprogs
     missing_any mkfs.xfs xfs_repair xfs_admin && add_partition_package xfsprogs
@@ -272,7 +272,7 @@ if command -v dnf >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1 || comma
     missing_any smartctl && add_partition_package smartmontools
     missing_any hdparm && add_partition_package hdparm
 else
-    for tool in parted mount umount wipefs sfdisk blockdev chown dd cp install mkdir mv sudo mkfs.ext4 e2fsck resize2fs e2label mkfs.xfs xfs_repair xfs_admin mkfs.btrfs btrfs mkfs.fat fsck.fat fatlabel mkfs.exfat fsck.exfat exfatlabel mkfs.ntfs ntfsfix ntfslabel mkfs.f2fs fsck.f2fs f2fslabel mkudffs smartctl hdparm mkswap swaplabel; do
+    for tool in parted mount umount wipefs sfdisk blockdev chown chmod dd cp install mkdir mv sudo mkfs.ext4 e2fsck resize2fs e2label mkfs.xfs xfs_repair xfs_admin mkfs.btrfs btrfs mkfs.fat fsck.fat fatlabel mkfs.exfat fsck.exfat exfatlabel mkfs.ntfs ntfsfix ntfslabel mkfs.f2fs fsck.f2fs f2fslabel mkudffs smartctl hdparm mkswap swaplabel; do
         command -v "$tool" >/dev/null 2>&1 || add_partition_package "$tool"
     done
 fi

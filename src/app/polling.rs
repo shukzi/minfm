@@ -588,7 +588,7 @@ impl App {
                     self.mode = AppMode::Prompt(Prompt::SmbMessage {
                         title: "Share connected".into(),
                         body: format!(
-                            "{} connected, but its local GVFS path is not available yet.{}\n\nRefresh Network Shares to open it.",
+                            "{} is connected, but its local folder is still becoming available.{}\n\nRefresh Network Shares if it does not appear.",
                             address.uri, remembered
                         ),
                         return_to_network: true,
@@ -615,7 +615,9 @@ impl App {
                 Err(error) => {
                     self.mode = AppMode::Prompt(Prompt::SmbMessage {
                         title: "Network operation failed".into(),
-                        body: error,
+                        body: format!(
+                            "What happened\nThe network-share operation could not be completed.\n\nReason\n{error}\n\nWhat to do\nCheck the address and connection, then try again."
+                        ),
                         return_to_network: true,
                     });
                 }
@@ -796,7 +798,9 @@ impl App {
                             .unwrap_or_else(|| "Unknown device".into());
                         self.status = "Partition operation failed".into();
                         self.mode = AppMode::Prompt(Prompt::PartitionError {
-                            body: format!("{action}\n{target}\n\n{error}\n\nCheck the device before retrying."),
+                            body: format!(
+                                "What happened\n{action} could not be completed.\n\nTarget\n{target}\n\nReason\n{error}\n\nWhat to do\nRefresh the device list, check the selected device, and try again."
+                            ),
                             view,
                         });
                         return true;

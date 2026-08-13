@@ -208,16 +208,16 @@ pub enum Filesystem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilesystemAccess {
+pub enum FilesystemPermissions {
     SystemDefault,
-    CurrentUser,
+    Everyone,
 }
 
-impl FilesystemAccess {
+impl FilesystemPermissions {
     pub fn description(self) -> &'static str {
         match self {
-            Self::SystemDefault => "System defaults (conventional)",
-            Self::CurrentUser => "Assign filesystem root to current user",
+            Self::SystemDefault => "Default permissions (recommended)",
+            Self::Everyone => "Everyone can read and write",
         }
     }
 
@@ -380,21 +380,21 @@ pub enum PartitionAction {
         target: DeviceIdentity,
         filesystem: Filesystem,
         label: Option<String>,
-        access: FilesystemAccess,
+        permissions: FilesystemPermissions,
     },
     EncryptFormat {
         target: DeviceIdentity,
         filesystem: Filesystem,
         label: Option<String>,
         passphrase: SecretInput,
-        access: FilesystemAccess,
+        permissions: FilesystemPermissions,
     },
     CreateEncryptedDisk {
         disk: DeviceIdentity,
         filesystem: Filesystem,
         label: Option<String>,
         passphrase: SecretInput,
-        access: FilesystemAccess,
+        permissions: FilesystemPermissions,
     },
     Grow {
         target: DeviceIdentity,
@@ -628,34 +628,34 @@ impl PartitionAction {
             Self::Format {
                 filesystem,
                 label,
-                access,
+                permissions,
                 ..
             } => format!(
-                "Erase {path} and format it as {}{}. Access: {}.",
+                "Erase {path} and format it as {}{}. Permissions: {}.",
                 filesystem.name(),
                 label
                     .as_ref()
                     .map(|label| format!(" labeled {label:?}"))
                     .unwrap_or_default(),
-                access.description()
+                permissions.description()
             ),
             Self::EncryptFormat {
                 filesystem,
-                access,
+                permissions,
                 ..
             } => format!(
-                "Erase {path}, create a LUKS2 encrypted container, and format its unlocked contents as {}. Access: {}.",
+                "Erase {path}, create a LUKS2 encrypted container, and format its unlocked contents as {}. Permissions: {}.",
                 filesystem.name(),
-                access.description()
+                permissions.description()
             ),
             Self::CreateEncryptedDisk {
                 filesystem,
-                access,
+                permissions,
                 ..
             } => format!(
-                "Erase {path}, create GPT with one LUKS2 encrypted partition, and format its unlocked contents as {}. Access: {}.",
+                "Erase {path}, create GPT with one LUKS2 encrypted partition, and format its unlocked contents as {}. Permissions: {}.",
                 filesystem.name(),
-                access.description()
+                permissions.description()
             ),
             Self::Grow { end_bytes, .. } => format!(
                 "Grow {path} to end at {}. Shrinking is never performed.",
@@ -739,8 +739,8 @@ pub fn execute(
     let mut inventory = discover()?;
     validate_action(action, &inventory)?;
     let commands = command_plan(action, &inventory)?;
-    if let Some(filesystem) = newly_created_filesystem(action) {
-        ensure_ownership_helpers(filesystem)?;
+    if let Some(filesystem) = filesystem_needing_permission_change(action) {
+        ensure_permission_helpers(filesystem)?;
     }
     let custom_elevated = matches!(
         action,
@@ -827,18 +827,15 @@ pub fn execute(
         if let PartitionAction::Format {
             target,
             filesystem,
-            access,
+            permissions,
             ..
         } = action
         {
-            if *access == FilesystemAccess::CurrentUser && take_ownership_supported(*filesystem) {
-                report_phase("Assigning filesystem ownership");
-                take_filesystem_ownership(
-                    &target.path,
-                    *filesystem,
-                    use_sudo,
-                    administrator_password,
-                )?;
+            if *permissions == FilesystemPermissions::Everyone
+                && permission_change_supported(*filesystem)
+            {
+                report_phase("Allowing access for everyone");
+                allow_everyone_access(&target.path, *filesystem, use_sudo, administrator_password)?;
             }
         }
     }
@@ -1191,26 +1188,26 @@ fn execute_encrypted_format(
             "encrypted mapping {mapping_name} already exists; close it before retrying"
         )));
     }
-    let (filesystem, label, passphrase, target_path, access) = match action {
+    let (filesystem, label, passphrase, target_path, permissions) = match action {
         PartitionAction::EncryptFormat {
             target,
             filesystem,
             label,
             passphrase,
-            access,
+            permissions,
         } => (
             *filesystem,
             label.as_deref(),
             passphrase,
             target.path.clone(),
-            *access,
+            *permissions,
         ),
         PartitionAction::CreateEncryptedDisk {
             disk,
             filesystem,
             label,
             passphrase,
-            access,
+            permissions,
         } => {
             report_phase("Creating GPT partition layout");
             let mut commands = wipe_disk_commands(disk, inventory);
@@ -1262,7 +1259,7 @@ fn execute_encrypted_format(
                 label.as_deref(),
                 passphrase,
                 partition.device.path.clone(),
-                *access,
+                *permissions,
             )
         }
         _ => {
@@ -1320,12 +1317,12 @@ fn execute_encrypted_format(
         use_sudo,
         administrator_password,
     );
-    let access_result = if format_result.is_ok()
-        && access == FilesystemAccess::CurrentUser
-        && take_ownership_supported(filesystem)
+    let permission_result = if format_result.is_ok()
+        && permissions == FilesystemPermissions::Everyone
+        && permission_change_supported(filesystem)
     {
-        report_phase("Assigning filesystem ownership");
-        take_filesystem_ownership(&mapping, filesystem, use_sudo, administrator_password)
+        report_phase("Allowing access for everyone");
+        allow_everyone_access(&mapping, filesystem, use_sudo, administrator_password)
     } else {
         Ok(())
     };
@@ -1339,78 +1336,75 @@ fn execute_encrypted_format(
         administrator_password,
     );
     format_result?;
-    access_result?;
+    permission_result?;
     close_result?;
     Ok(())
 }
 
-fn take_filesystem_ownership(
+fn allow_everyone_access(
     device: &Path,
     filesystem: Filesystem,
     use_sudo: bool,
     administrator_password: Option<&[u8]>,
 ) -> Result<()> {
-    if !take_ownership_supported(filesystem) {
+    if !permission_change_supported(filesystem) {
         return Ok(());
     }
 
     let mountpoint = tempfile::Builder::new()
-        .prefix("minfm-filesystem-access-")
+        .prefix("minfm-filesystem-permissions-")
         .tempdir()
-        .map_err(|error| crate::error::io_error("could not prepare filesystem access", error))?;
-    let commands = ownership_commands(device, mountpoint.path(), Uid::current(), Gid::current());
+        .map_err(|error| {
+            crate::error::io_error("could not prepare filesystem permissions", error)
+        })?;
+    let commands = permission_commands(device, mountpoint.path());
     run_command(&commands[0], use_sudo, administrator_password)?;
-    let ownership_result = run_command(&commands[1], use_sudo, administrator_password);
+    let permission_result = run_command(&commands[1], use_sudo, administrator_password);
     let unmount_result = run_command(&commands[2], use_sudo, administrator_password);
-    match (ownership_result, unmount_result) {
+    match (permission_result, unmount_result) {
         (Ok(_), Ok(_)) => Ok(()),
         (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
-        (Err(ownership_error), Err(unmount_error)) => Err(MinfmError::Message(format!(
-            "{ownership_error}; additionally failed to unmount the temporary filesystem: {unmount_error}"
+        (Err(permission_error), Err(unmount_error)) => Err(MinfmError::Message(format!(
+            "{permission_error}; additionally failed to unmount the temporary filesystem: {unmount_error}"
         ))),
     }
 }
 
-fn take_ownership_supported(filesystem: Filesystem) -> bool {
+fn permission_change_supported(filesystem: Filesystem) -> bool {
     filesystem.supports_unix_ownership()
 }
 
-fn newly_created_filesystem(action: &PartitionAction) -> Option<Filesystem> {
+fn filesystem_needing_permission_change(action: &PartitionAction) -> Option<Filesystem> {
     match action {
         PartitionAction::Format {
             filesystem,
-            access: FilesystemAccess::CurrentUser,
+            permissions: FilesystemPermissions::Everyone,
             ..
         }
         | PartitionAction::EncryptFormat {
             filesystem,
-            access: FilesystemAccess::CurrentUser,
+            permissions: FilesystemPermissions::Everyone,
             ..
         }
         | PartitionAction::CreateEncryptedDisk {
             filesystem,
-            access: FilesystemAccess::CurrentUser,
+            permissions: FilesystemPermissions::Everyone,
             ..
         } => Some(*filesystem),
         _ => None,
     }
 }
 
-fn ensure_ownership_helpers(filesystem: Filesystem) -> Result<()> {
-    if take_ownership_supported(filesystem) {
-        for helper in ["mount", "chown", "umount"] {
+fn ensure_permission_helpers(filesystem: Filesystem) -> Result<()> {
+    if permission_change_supported(filesystem) {
+        for helper in ["mount", "chmod", "umount"] {
             let _ = trusted_program(&OsString::from(helper))?;
         }
     }
     Ok(())
 }
 
-fn ownership_commands(
-    device: &Path,
-    mountpoint: &Path,
-    owner: Uid,
-    group: Gid,
-) -> [CommandSpec; 3] {
+fn permission_commands(device: &Path, mountpoint: &Path) -> [CommandSpec; 3] {
     [
         CommandSpec::elevated(
             "mount",
@@ -1423,9 +1417,9 @@ fn ownership_commands(
             ],
         ),
         CommandSpec::elevated(
-            "chown",
+            "chmod",
             [
-                OsString::from(format!("{owner}:{group}")),
+                OsString::from("0777"),
                 OsString::from("--"),
                 mountpoint.as_os_str().to_owned(),
             ],

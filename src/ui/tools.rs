@@ -114,7 +114,7 @@ pub(super) fn draw_trash(frame: &mut Frame, app: &App, view: &TrashView) {
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
         Paragraph::new(format!(
-            "{} select │ Enter/{} restore │ {} permanent delete │ {} quick permanent delete\n{} clear trash │ {}/Esc return",
+            "{}: select │ Enter/{}: restore │ {}: permanent delete │ {}: quick permanent delete\n{}: clear trash │ {}/Esc: return",
             app.config.hotkeys.select.display(), app.config.hotkeys.restore.display(),
             app.config.hotkeys.permanent_delete.display(), app.config.hotkeys.quick_permanent_delete.display(),
             app.config.hotkeys.clear_trash.display(), app.config.hotkeys.trash_bin.display()
@@ -184,15 +184,15 @@ pub(super) fn draw_network(frame: &mut Frame, app: &App, view: &NetworkView) {
         .map(|share| {
             let mut actions = if share.mount_path.is_some() {
                 format!(
-                    "Enter open · {} disconnect",
+                    "Enter: open · {}: disconnect",
                     app.config.hotkeys.network_disconnect.display()
                 )
             } else {
-                "Enter connect".to_string()
+                "Enter: connect".to_string()
             };
             if share.saved {
                 actions.push_str(&format!(
-                    " · {} forget",
+                    " · {}: forget",
                     app.config.hotkeys.network_forget.display()
                 ));
             }
@@ -206,7 +206,7 @@ pub(super) fn draw_network(frame: &mut Frame, app: &App, view: &NetworkView) {
         });
     frame.render_widget(
         Paragraph::new(format!(
-            "{contextual}\n{} add share · {} refresh · {}/Esc return · {} browser",
+            "{contextual}\n{}: add share · {}: refresh · {}/Esc: return · {}: browser",
             app.config.hotkeys.network_add.display(),
             app.config.hotkeys.refresh.display(),
             app.config.hotkeys.network_shares.display(),
@@ -260,7 +260,7 @@ pub(super) fn draw_help(frame: &mut Frame, app: &App) {
         h.hidden.display(), h.sort.display(), h.reverse_sort.display(), h.info.display(),
     );
     let title = format!("Help · minfm {}", env!("CARGO_PKG_VERSION"));
-    message_modal(frame, &title, &body, "Esc/Enter close", 70, 94);
+    message_modal(frame, &title, &body, "Enter: close · Esc: close", 70, 94);
 }
 
 pub(super) fn draw_info(frame: &mut Frame, app: &App, entry: Option<&crate::entry::FileEntry>) {
@@ -304,7 +304,7 @@ pub(super) fn draw_info(frame: &mut Frame, app: &App, entry: Option<&crate::entr
         frame,
         "Application information",
         &body,
-        "Esc/Enter close",
+        "Enter: close · Esc: close",
         78,
         32,
     );

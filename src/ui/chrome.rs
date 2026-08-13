@@ -162,21 +162,21 @@ pub(super) fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     let context = match &app.mode {
         AppMode::Browser => None,
         AppMode::Apps(_) => Some(format!(
-            " ↑↓/{}/{} Move · Enter Open · {}/{}/Esc Close ",
+            " ↑↓/{}/{}: move · Enter: open · {}/{}/Esc: close ",
             app.config.hotkeys.down.display(),
             app.config.hotkeys.up.display(),
             app.config.hotkeys.tools.display(),
             app.config.hotkeys.quit.display(),
         )),
         AppMode::Archive(_) => Some(format!(
-            " ↑↓/{}/{} Move · {}/Esc Close ",
+            " ↑↓/{}/{}: move · {}/Esc: close ",
             app.config.hotkeys.down.display(),
             app.config.hotkeys.up.display(),
             app.config.hotkeys.quit.display(),
         )),
         AppMode::Partitions(view) => Some(partition_shortcuts(app, view)),
         AppMode::Prompt(Prompt::PartitionAuthentication { .. }) => {
-            Some(" Type administrator password · Enter Authenticate · Esc Cancel ".into())
+            Some(" Type administrator password · Enter: authenticate · Esc: cancel ".into())
         }
         _ => Some(" A dialog owns input · File shortcuts are disabled until it closes. ".into()),
     };
@@ -346,50 +346,50 @@ pub(super) fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -
         None => {
             let exit = if app.partition_returns_to_apps() {
                 format!(
-                    "Esc Back to menu · {} Files",
+                    "Esc: back to menu · {}: files",
                     app.config.hotkeys.quit.display()
                 )
             } else {
                 format!(
-                    "Esc/{} Back to files · {} Menu",
+                    "Esc/{}: back to files · {}: menu",
                     app.config.hotkeys.quit.display(),
                     app.config.hotkeys.tools.display()
                 )
             };
             return format!(
-                " ↑↓/{down}/{up} Move · Enter/{actions} Actions · {refresh} Refresh · {exit} "
+                " ↑↓/{down}/{up}: move · Enter/{actions}: actions · {refresh}: refresh · {exit} "
             );
         }
         Some(crate::app::PartitionOverlay::Actions { .. }) => {
-            return format!(" ↑↓/{down}/{up} Move · Enter Continue · {actions}/Esc Back ")
+            return format!(" ↑↓/{down}/{up}: move · Enter: continue · {actions}/Esc: back ")
         }
         Some(crate::app::PartitionOverlay::FormatOptions { .. }) => {
             return format!(
-                " ↑↓/{down}/{up} Filesystem · o Access · e Encrypt · Enter Continue · Esc Back "
+                " ↑↓/{down}/{up}: filesystem · p: permissions · e: encryption · Enter: continue · Esc: back "
             )
         }
         Some(crate::app::PartitionOverlay::EncryptionFilesystem { .. }) => {
-            return format!(" ↑↓/{down}/{up} Choose inner filesystem · Enter Continue · Esc Back ")
+            return format!(" ↑↓/{down}/{up}: filesystem · Enter: continue · Esc: back ")
         }
         Some(crate::app::PartitionOverlay::EncryptionPassphrase { .. })
         | Some(crate::app::PartitionOverlay::ChangePassphrase { .. }) => {
-            " Enter Continue · Esc Back "
+            " Enter: continue · Esc: back "
         }
         Some(crate::app::PartitionOverlay::DiskLayoutOptions { .. }) => {
-            return format!(" ↑↓/{down}/{up} Choose layout · Enter Review · Esc Back ")
+            return format!(" ↑↓/{down}/{up}: layout · Enter: review · Esc: back ")
         }
         Some(crate::app::PartitionOverlay::FreeRegionOptions { .. }) => {
-            return format!(" ↑↓/{down}/{up} Choose free space · Enter Continue · Esc Back ")
+            return format!(" ↑↓/{down}/{up}: free space · Enter: continue · Esc: back ")
         }
         Some(crate::app::PartitionOverlay::PartitionSize { .. }) => {
-            " Type size or max · Enter Review · Esc Regions "
+            " Type size or max · Enter: review · Esc: regions "
         }
         Some(crate::app::PartitionOverlay::FormatLabel { .. }) => {
-            " Type optional label · Enter Review · Esc Filesystems "
+            " Type optional label · Enter: review · Esc: filesystems "
         }
-        Some(crate::app::PartitionOverlay::Input { .. }) => " Enter Review · Esc Back ",
+        Some(crate::app::PartitionOverlay::Input { .. }) => " Enter: review · Esc: back ",
         Some(crate::app::PartitionOverlay::Confirm { .. }) => {
-            " ←/→ Choose · Enter Apply · Esc Cancel "
+            " ←/→: choose · Enter: apply · Esc: cancel "
         }
     };
     hint.into()
