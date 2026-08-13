@@ -164,7 +164,11 @@ impl App {
         };
         self.operation = None;
         let return_to_trash = self.operation_trash_manager.take();
-        self.refresh();
+        if let Some(preferred) = self.operation_refresh_preferred.take() {
+            self.refresh_browser(Some(preferred));
+        } else {
+            self.refresh();
+        }
         if !self.operation_search_paths.is_empty() {
             self.refresh_search_results(None);
             self.operation_search_paths.clear();

@@ -47,32 +47,43 @@ impl App {
             self.status = "Read-only mode: file operations are disabled".into();
             return AppMode::Browser;
         }
-        let Some(clipboard) = &self.clipboard else {
-            self.status = "File clipboard is empty".into();
-            return AppMode::Browser;
+        let (sources, cut) = {
+            let Some(clipboard) = &self.clipboard else {
+                self.status = "File clipboard is empty".into();
+                return AppMode::Browser;
+            };
+            (
+                clipboard.paths.clone(),
+                matches!(clipboard.mode, ClipboardMode::Cut),
+            )
         };
-        let conflicts = clipboard.paths.iter().any(|source| {
+        let destination = self.browser_action_directory();
+        let conflicts = sources.iter().any(|source| {
             source
                 .file_name()
-                .map(|name| self.current_dir.join(name).exists())
+                .map(|name| destination.join(name).exists())
                 .unwrap_or(false)
         });
         if conflicts {
             AppMode::Prompt(Prompt::ConfirmOverwrite {
-                sources: clipboard.paths.clone(),
-                cut: matches!(clipboard.mode, ClipboardMode::Cut),
+                sources,
+                destination,
+                cut,
             })
         } else {
-            self.start_copy(
-                clipboard.paths.clone(),
-                matches!(clipboard.mode, ClipboardMode::Cut),
-                false,
-            );
+            self.reveal_browser_directory(&destination);
+            self.start_copy(sources, destination, cut, false);
             AppMode::Progress
         }
     }
 
-    pub(crate) fn start_copy(&mut self, sources: Vec<PathBuf>, cut: bool, overwrite: bool) {
+    pub(crate) fn start_copy(
+        &mut self,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        cut: bool,
+        overwrite: bool,
+    ) {
         self.progress = ProgressState::default();
         self.progress.cancellable = true;
         self.operation_trash_manager = None;
@@ -90,9 +101,13 @@ impl App {
         } else {
             Vec::new()
         };
+        self.operation_refresh_preferred = sources
+            .first()
+            .and_then(|source| source.file_name())
+            .map(|name| destination.join(name));
         self.operation = Some(operation::spawn(OperationRequest::Copy {
             sources,
-            destination: self.current_dir.clone(),
+            destination,
             cut,
             overwrite,
             verify: self.config.behavior.verify_copies,
@@ -112,6 +127,7 @@ impl App {
         self.progress = ProgressState::default();
         self.progress.cancellable = true;
         self.operation_trash_manager = None;
+        self.operation_refresh_preferred = None;
         self.operation_search_paths = self
             .search_results
             .as_ref()
@@ -142,6 +158,7 @@ impl App {
         self.progress = ProgressState::default();
         self.progress.cancellable = true;
         self.operation_trash_manager = Some(manager.clone());
+        self.operation_refresh_preferred = None;
         self.operation = Some(operation::spawn(OperationRequest::PermanentlyDelete {
             entries,
             manager,
@@ -153,12 +170,16 @@ impl App {
             self.status = "Directory was not created".into();
             return;
         }
-        let path = self.current_dir.join(name);
+        let destination = self.browser_action_directory();
+        let path = destination.join(name);
         match std::fs::create_dir(&path) {
-            Ok(()) => self.set_notice(format!("Created {}", path.display())),
+            Ok(()) => {
+                self.reveal_browser_directory(&destination);
+                self.refresh_browser(Some(path.clone()));
+                self.set_notice(format!("Created {}", path.display()));
+            }
             Err(error) => self.status = format!("Could not create {}: {error}", path.display()),
         }
-        self.refresh();
     }
 
     pub(crate) fn create_file(&mut self, name: &str) -> AppMode {
@@ -172,7 +193,8 @@ impl App {
                 body: "Enter a single non-empty file name.".into(),
             });
         }
-        let path = self.current_dir.join(name);
+        let destination = self.browser_action_directory();
+        let path = destination.join(name);
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -180,6 +202,7 @@ impl App {
         {
             Ok(file) => {
                 drop(file);
+                self.reveal_browser_directory(&destination);
                 self.refresh_browser(Some(path.clone()));
                 self.set_notice(format!("Created {}", path.display()));
                 AppMode::Browser

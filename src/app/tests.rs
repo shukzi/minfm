@@ -1298,6 +1298,66 @@ fn create_file_uses_the_prompt_and_selects_the_new_empty_file() {
 }
 
 #[test]
+fn tree_creation_targets_the_focused_directory_and_selects_the_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let nested = temp.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let mut app = test_app(temp.path());
+    app.cursor = app
+        .entries
+        .iter()
+        .position(|entry| entry.path == nested)
+        .unwrap();
+
+    assert!(matches!(app.create_file("notes.txt"), AppMode::Browser));
+    let file = nested.join("notes.txt");
+    assert!(file.is_file());
+    assert_eq!(app.selected_entry().map(|entry| &entry.path), Some(&file));
+
+    app.create_directory("documents");
+    let directory = nested.join("documents");
+    assert!(directory.is_dir());
+    assert_eq!(
+        app.selected_entry().map(|entry| &entry.path),
+        Some(&directory)
+    );
+}
+
+#[test]
+fn tree_paste_targets_the_focused_directory_and_selects_the_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.txt");
+    let nested = temp.path().join("nested");
+    std::fs::write(&source, b"copy me").unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    let mut app = test_app(temp.path());
+    app.cursor = app
+        .entries
+        .iter()
+        .position(|entry| entry.path == nested)
+        .unwrap();
+    app.clipboard = Some(Clipboard {
+        mode: ClipboardMode::Copy,
+        paths: vec![source],
+    });
+
+    app.mode = app.prepare_paste();
+    assert!(matches!(app.mode, AppMode::Progress));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.operation.is_some() && Instant::now() < deadline {
+        if !app.poll_operation() {
+            thread::yield_now();
+        }
+    }
+
+    let pasted = nested.join("source.txt");
+    assert!(pasted.is_file());
+    assert_eq!(std::fs::read(&pasted).unwrap(), b"copy me");
+    assert_eq!(app.selected_entry().map(|entry| &entry.path), Some(&pasted));
+    assert!(matches!(app.mode, AppMode::Browser));
+}
+
+#[test]
 fn create_file_never_overwrites_an_existing_entry() {
     let temp = tempfile::tempdir().unwrap();
     let existing = temp.path().join("existing.txt");

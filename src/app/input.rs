@@ -357,13 +357,19 @@ impl App {
                 _ if hotkeys.confirm_no.matches(key) => return self.modal_return.mode(),
                 _ => {}
             },
-            Prompt::ConfirmOverwrite { sources, cut } => match key.code {
+            Prompt::ConfirmOverwrite {
+                sources,
+                destination,
+                cut,
+            } => match key.code {
                 KeyCode::Enter => {
-                    self.start_copy(sources.clone(), *cut, true);
+                    self.reveal_browser_directory(destination);
+                    self.start_copy(sources.clone(), destination.clone(), *cut, true);
                     return AppMode::Progress;
                 }
                 _ if hotkeys.overwrite.matches(key) => {
-                    self.start_copy(sources.clone(), *cut, true);
+                    self.reveal_browser_directory(destination);
+                    self.start_copy(sources.clone(), destination.clone(), *cut, true);
                     return AppMode::Progress;
                 }
                 _ if hotkeys.skip.matches(key) => {
@@ -372,7 +378,7 @@ impl App {
                         .filter(|source| {
                             source
                                 .file_name()
-                                .map(|name| !self.current_dir.join(name).exists())
+                                .map(|name| !destination.join(name).exists())
                                 .unwrap_or(false)
                         })
                         .cloned()
@@ -381,7 +387,8 @@ impl App {
                         self.set_notice("All conflicting items were skipped");
                         return AppMode::Browser;
                     }
-                    self.start_copy(filtered, *cut, false);
+                    self.reveal_browser_directory(destination);
+                    self.start_copy(filtered, destination.clone(), *cut, false);
                     return AppMode::Progress;
                 }
                 KeyCode::Esc => return AppMode::Browser,

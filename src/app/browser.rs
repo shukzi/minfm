@@ -1,6 +1,35 @@
 use super::*;
 
 impl App {
+    /// Returns the directory that browser-local creation and paste actions
+    /// should target. Table view has one explicit current directory. Tree view
+    /// can focus nested entries without changing `current_dir`, so actions use
+    /// the focused directory or the focused entry's parent instead.
+    pub(crate) fn browser_action_directory(&self) -> PathBuf {
+        if self.browser_view == BrowserView::Table {
+            return self.current_dir.clone();
+        }
+        let Some(entry) = self.selected_entry() else {
+            return self.current_dir.clone();
+        };
+        if entry.kind == EntryKind::Directory {
+            entry.path.clone()
+        } else {
+            entry
+                .path
+                .parent()
+                .filter(|parent| parent.starts_with(&self.current_dir))
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.current_dir.clone())
+        }
+    }
+
+    pub(crate) fn reveal_browser_directory(&mut self, directory: &Path) {
+        if self.browser_view == BrowserView::Tree && directory != self.current_dir {
+            self.expanded_directories.insert(directory.to_path_buf());
+        }
+    }
+
     pub(crate) fn refresh(&mut self) {
         let same_root = self.loaded_dir == self.current_dir;
         let preferred = if same_root {

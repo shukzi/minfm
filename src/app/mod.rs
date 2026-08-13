@@ -103,6 +103,7 @@ pub enum Prompt {
     },
     ConfirmOverwrite {
         sources: Vec<PathBuf>,
+        destination: PathBuf,
         cut: bool,
     },
     ConfirmRestore {
@@ -849,6 +850,7 @@ pub struct App {
     operation_trash_manager: Option<TrashManager>,
     operation_return: ReturnDestination,
     operation_search_paths: Vec<PathBuf>,
+    operation_refresh_preferred: Option<PathBuf>,
     archive_return: ReturnDestination,
     modal_return: ReturnDestination,
     luks_operation: Option<RunningLuks>,
@@ -924,6 +926,7 @@ impl App {
             operation_trash_manager: None,
             operation_return: ReturnDestination::Browser,
             operation_search_paths: Vec::new(),
+            operation_refresh_preferred: None,
             archive_return: ReturnDestination::Browser,
             modal_return: ReturnDestination::Browser,
             luks_operation: None,
