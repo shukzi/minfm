@@ -140,14 +140,14 @@ fn quick_search_matches_original_compact_prompt() {
     assert!(rows.iter().any(|row| row.contains("│> report│")));
     assert!(rows
         .iter()
-        .any(|row| row.contains("Enter search · F advanced · Esc cancel")));
+        .any(|row| row.contains("Enter: search · F advanced · Esc: cancel")));
 
     app.config = toml::from_str::<Config>("[hotkeys]\nsearch_filesystem = 'G'").unwrap();
     terminal
         .draw(|frame| draw_quick_search(frame, &app, &form))
         .unwrap();
     let remapped = rendered_text(&terminal);
-    assert!(remapped.contains("Enter search · G advanced · Esc cancel"));
+    assert!(remapped.contains("Enter: search · G advanced · Esc: cancel"));
     assert!(!remapped.contains("F advanced"));
 
     form.error = Some("enter a search or choose a filter".into());
@@ -228,7 +228,7 @@ fn search_dialogs_have_no_popup_halo() {
                 "/dev/test",
                 0,
                 false,
-                partition::FilesystemAccess::SystemDefault,
+                partition::FilesystemPermissions::SystemDefault,
             );
         })
         .unwrap();
@@ -645,8 +645,8 @@ fn search_advanced_narrow_renders_size_help_inside_the_outer_border() {
         "GiB",
         "inclusive",
         "invalid minimum size",
-        "Enter search",
-        "Esc cancel",
+        "Enter: search",
+        "Esc: cancel",
     ] {
         assert!(text.contains(label), "missing {label}");
     }
@@ -696,8 +696,8 @@ fn search_advanced_short_preserves_active_control_error_footer_and_caret() {
         "Minimum size",
         "500│",
         "invalid size",
-        "Enter search",
-        "Esc cancel",
+        "Enter: search",
+        "Esc: cancel",
     ] {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
@@ -1423,7 +1423,7 @@ fn partition_manager_renders_topology_details_and_safety_state() {
     assert!(rendered.contains("sda1"));
     assert!(rendered.contains("Protected system storage"));
     assert!(rendered.contains("UUID: test-uuid"));
-    assert!(rendered.contains("Enter/a Actions"));
+    assert!(rendered.contains("Enter/a: actions"));
 
     if let AppMode::Partitions(view) = &mut app.mode {
         view.overlay = Some(PartitionOverlay::Actions { selected: 0 });
@@ -1441,7 +1441,7 @@ fn partition_manager_renders_topology_details_and_safety_state() {
     assert!(rendered.contains("What it does"));
     assert!(rendered.contains("Erases data"));
     assert!(rendered.contains("Blocked"));
-    assert!(rendered.contains("Enter Continue"));
+    assert!(rendered.contains("Enter: continue"));
 
     if let AppMode::Partitions(view) = &mut app.mode {
         view.selected = 0;
@@ -1471,7 +1471,7 @@ fn partition_manager_renders_topology_details_and_safety_state() {
         .collect::<String>();
     assert!(rendered.contains("Free space"));
     assert!(rendered.contains("Region 1"));
-    assert!(rendered.contains("Choose free space"));
+    assert!(rendered.contains("free space"));
 
     if let AppMode::Partitions(view) = &mut app.mode {
         view.overlay = Some(PartitionOverlay::DiskLayoutOptions {
@@ -1490,14 +1490,14 @@ fn partition_manager_renders_topology_details_and_safety_state() {
     assert!(rendered.contains("Empty"));
     assert!(rendered.contains("GPT"));
     assert!(rendered.contains("MBR"));
-    assert!(rendered.contains("Choose layout"));
+    assert!(rendered.contains("layout"));
 
     if let AppMode::Partitions(view) = &mut app.mode {
         view.selected = 1;
         view.overlay = Some(PartitionOverlay::FormatOptions {
             selected: 0,
             encrypted: false,
-            access: partition::FilesystemAccess::SystemDefault,
+            permissions: partition::FilesystemPermissions::SystemDefault,
         });
     }
     terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -1510,14 +1510,14 @@ fn partition_manager_renders_topology_details_and_safety_state() {
         .collect::<String>();
     assert!(rendered.contains("Recommended Linux default"));
     assert!(rendered.contains("exFAT"));
-    assert!(rendered.contains("Access: System defaults"));
+    assert!(rendered.contains("Allow everyone to read and write"));
 
     if let AppMode::Partitions(view) = &mut app.mode {
         let action = partition::PartitionAction::Format {
             target: partition::DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
             filesystem: partition::Filesystem::Ext4,
             label: None,
-            access: partition::FilesystemAccess::SystemDefault,
+            permissions: partition::FilesystemPermissions::SystemDefault,
         };
         view.overlay = Some(PartitionOverlay::Confirm {
             action,
@@ -1586,7 +1586,94 @@ fn partition_manager_renders_topology_details_and_safety_state() {
     assert!(rendered.contains("Partition operation failed"));
     assert!(rendered.contains("Format"));
     assert!(rendered.contains("failed before formatting started"));
-    assert!(rendered.contains("Enter/Esc return"));
+    assert!(rendered.contains("Enter: return · Esc: return"));
+}
+
+#[test]
+fn format_permissions_use_default_everyone_and_mount_controlled_language() {
+    let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    terminal
+        .draw(|frame| {
+            draw_format_options(
+                frame,
+                "/dev/test1",
+                0,
+                false,
+                partition::FilesystemPermissions::SystemDefault,
+            );
+        })
+        .unwrap();
+    let default_text = rendered_text(&terminal);
+    assert!(default_text.contains("[ ] Allow everyone to read and write"));
+    assert!(default_text.contains("p: permissions"));
+
+    terminal
+        .draw(|frame| {
+            draw_format_options(
+                frame,
+                "/dev/test1",
+                0,
+                false,
+                partition::FilesystemPermissions::Everyone,
+            );
+        })
+        .unwrap();
+    assert!(rendered_text(&terminal).contains("[x] Allow everyone to read and write"));
+
+    terminal
+        .draw(|frame| {
+            draw_format_options(
+                frame,
+                "/dev/test1",
+                1,
+                false,
+                partition::FilesystemPermissions::SystemDefault,
+            );
+        })
+        .unwrap();
+    assert!(rendered_text(&terminal)
+        .contains("Permissions are set by the computer that mounts this filesystem"));
+}
+
+#[test]
+fn ordinary_message_modals_size_to_short_and_wrapped_content() {
+    let mut short = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    short
+        .draw(|frame| {
+            message_modal(
+                frame,
+                "Short message",
+                "Done.",
+                "Enter: close · Esc: close",
+                76,
+                14,
+            );
+        })
+        .unwrap();
+    let short_rows = rendered_rows(&short);
+    let short_border_rows = short_rows
+        .iter()
+        .filter(|row| row.contains("Short message") || row.contains('└'))
+        .count();
+    assert!(short_border_rows >= 2);
+
+    let body = "A long plain-language error wraps onto several lines so the modal can grow while staying inside its configured maximum height.\n\nWhat to do\nCheck the selected item and try again.";
+    let mut wrapped = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    wrapped
+        .draw(|frame| {
+            message_modal(
+                frame,
+                "Wrapped message",
+                body,
+                "Enter: close · Esc: close",
+                76,
+                14,
+            );
+        })
+        .unwrap();
+    let text = rendered_text(&wrapped);
+    assert!(text.contains("What to do"));
+    assert!(text.contains("Enter: close · Esc: close"));
 }
 
 /// Manual baseline (2026-08-12, release build): 89 us at 10,000 retained

@@ -120,7 +120,7 @@ impl App {
         if !self.network_environment.samba_tools_available() {
             return AppMode::Prompt(Prompt::SmbMessage {
                 title: "Network shares unavailable".into(),
-                body: "Network Shares cannot start because gio or the GVFS Samba backend is unavailable. Install the required desktop integration, then try again.".into(),
+                body: "Network Shares cannot start because the required desktop network support is unavailable. Install gio and the GVFS Samba backend, then try again.".into(),
                 return_to_network: false,
             });
         }

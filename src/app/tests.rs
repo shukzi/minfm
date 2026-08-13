@@ -1,5 +1,5 @@
 use super::*;
-use crate::partition::FilesystemAccess;
+use crate::partition::FilesystemPermissions;
 use std::{
     ffi::OsString,
     fs::File,
@@ -2628,12 +2628,12 @@ fn partition_format_flow_chooses_a_filesystem_and_optional_label() {
         })
     ));
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
     assert!(matches!(
         app.mode,
         AppMode::Partitions(PartitionView {
             overlay: Some(PartitionOverlay::FormatOptions {
-                access: FilesystemAccess::CurrentUser,
+                permissions: FilesystemPermissions::Everyone,
                 ..
             }),
             ..
@@ -2666,7 +2666,7 @@ fn partition_format_flow_chooses_a_filesystem_and_optional_label() {
                 action: PartitionAction::Format {
                     filesystem: Filesystem::Exfat,
                     label: Some(ref label),
-                    access: FilesystemAccess::SystemDefault,
+                    permissions: FilesystemPermissions::SystemDefault,
                     ..
                 },
                 yes_selected: false,
@@ -3085,7 +3085,7 @@ fn partition_confirmation_opens_masked_administrator_authentication() {
         target: DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
         filesystem: Filesystem::Ext4,
         label: None,
-        access: FilesystemAccess::SystemDefault,
+        permissions: FilesystemPermissions::SystemDefault,
     };
     if !partition::authentication_required(&action) {
         return;
@@ -3126,7 +3126,7 @@ fn failed_partition_authentication_returns_to_a_clean_masked_prompt() {
         target: DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
         filesystem: Filesystem::Ext4,
         label: None,
-        access: FilesystemAccess::SystemDefault,
+        permissions: FilesystemPermissions::SystemDefault,
     };
     let (sender, receiver) = mpsc::sync_channel(1);
     sender
@@ -3225,7 +3225,7 @@ fn partition_failures_open_a_complete_error_dialog() {
         target: DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
         filesystem: Filesystem::Ext4,
         label: None,
-        access: FilesystemAccess::SystemDefault,
+        permissions: FilesystemPermissions::SystemDefault,
     };
     let message = "mkfs.ext4 failed because the device became unavailable";
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -3245,9 +3245,11 @@ fn partition_failures_open_a_complete_error_dialog() {
     assert!(matches!(
         app.mode,
         AppMode::Prompt(Prompt::PartitionError { ref body, .. })
-            if body.contains("Format")
+            if body.contains("What happened")
+                && body.contains("Format")
                 && body.contains("/dev/sdb1")
                 && body.contains(message)
+                && body.contains("What to do")
     ));
     assert_eq!(app.status, "Partition operation failed");
     assert!(app.partition_operation.is_none());

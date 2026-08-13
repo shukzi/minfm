@@ -143,7 +143,7 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.8.2` in
+Pin both the installer and release asset to the same tag. Replace `v0.8.3` in
 both places with the version you want:
 
 ```sh
@@ -283,9 +283,10 @@ cargo build --release --locked
   a private named pipe that is removed immediately afterward.
 - Persistent mount and encryption options are validated, staged privately, and
   atomically installed in `/etc/fstab` or `/etc/crypttab`.
-- New filesystems keep conventional system ownership by default, matching KDE
-  Partition Manager. The format screen can explicitly assign the filesystem
-  root to the current user for Linux filesystems that store Unix ownership.
+- New filesystems keep their default permissions, matching KDE Partition
+  Manager. For Linux filesystems that store Unix permissions, the format screen
+  can explicitly allow everyone to read and write at the filesystem's top
+  level.
 - FAT32, exFAT, and NTFS portability is governed by filesystem support and the
   mounting computer's options; minfm does not write Linux ownership into them.
 - Copy and restore operations avoid overwriting existing destinations and clean

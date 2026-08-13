@@ -683,12 +683,12 @@ pub enum PartitionOverlay {
     FormatOptions {
         selected: usize,
         encrypted: bool,
-        access: crate::partition::FilesystemAccess,
+        permissions: crate::partition::FilesystemPermissions,
     },
     EncryptionFilesystem {
         selected: usize,
         whole_disk: bool,
-        access: crate::partition::FilesystemAccess,
+        permissions: crate::partition::FilesystemPermissions,
     },
     EncryptionPassphrase {
         filesystem: Filesystem,
@@ -698,7 +698,7 @@ pub enum PartitionOverlay {
         confirmation: SecretInput,
         confirming: bool,
         error: Option<String>,
-        access: crate::partition::FilesystemAccess,
+        permissions: crate::partition::FilesystemPermissions,
     },
     ChangePassphrase {
         old: SecretInput,
@@ -724,7 +724,7 @@ pub enum PartitionOverlay {
     FormatLabel {
         filesystem: Filesystem,
         encrypted: bool,
-        access: crate::partition::FilesystemAccess,
+        permissions: crate::partition::FilesystemPermissions,
         input: String,
         cursor: usize,
         error: Option<String>,

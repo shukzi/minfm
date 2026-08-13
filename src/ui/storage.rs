@@ -29,7 +29,7 @@ pub(super) fn draw_apps(frame: &mut Frame, app: &App, view: &AppsView) {
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
         Paragraph::new(format!(
-            "↑/{} ↓/{} move · Enter open · {}/{}/Esc close",
+            "↑/{} ↓/{} move · Enter: open · {}/{}/Esc: close",
             app.config.hotkeys.up.display(),
             app.config.hotkeys.down.display(),
             app.config.hotkeys.tools.display(),
@@ -152,7 +152,7 @@ pub(super) fn draw_partitions(frame: &mut Frame, app: &App, view: &PartitionView
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "Enter/{} actions · {} refresh · ↑/{} ↓/{} move · {}/Esc apps · {} browser",
+            "Enter/{}: actions · {}: refresh · ↑/{} ↓/{}: move · {}/Esc: apps · {}: browser",
             app.config.hotkeys.partition_actions.display(),
             app.config.hotkeys.refresh.display(),
             app.config.hotkeys.up.display(),
@@ -233,7 +233,7 @@ pub(super) fn draw_partition_overlay(
             frame.render_stateful_widget(table, sections[0], &mut state);
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Enter continue · {}/Esc back",
+                    "Enter: continue · {}/Esc: back",
                     app.config.hotkeys.partition_actions.display()
                 ))
                 .alignment(Alignment::Center)
@@ -245,14 +245,14 @@ pub(super) fn draw_partition_overlay(
         PartitionOverlay::FormatOptions {
             selected,
             encrypted,
-            access,
+            permissions,
         } => {
             let target = view
                 .entries
                 .get(view.selected)
                 .map(|entry| entry.device.path.display().to_string())
                 .unwrap_or_else(|| "selected device".into());
-            draw_format_options(frame, &target, *selected, *encrypted, *access);
+            draw_format_options(frame, &target, *selected, *encrypted, *permissions);
         }
         PartitionOverlay::EncryptionFilesystem {
             selected,
@@ -335,7 +335,7 @@ pub(super) fn draw_partition_overlay(
             input,
             *cursor,
             error.as_deref(),
-            "Enter review · Esc free regions",
+            "Enter: review · Esc: free regions",
         ),
         PartitionOverlay::FormatLabel {
             filesystem,
@@ -353,7 +353,7 @@ pub(super) fn draw_partition_overlay(
             input,
             *cursor,
             error.as_deref(),
-            "Enter review · Esc filesystems",
+            "Enter: review · Esc: filesystems",
         ),
         PartitionOverlay::Input {
             task,
@@ -368,7 +368,7 @@ pub(super) fn draw_partition_overlay(
             input,
             *cursor,
             error.as_deref(),
-            "Enter review · Esc actions",
+            "Enter: review · Esc: actions",
         ),
         PartitionOverlay::Confirm {
             action,
@@ -382,7 +382,7 @@ pub(super) fn draw_format_options(
     target: &str,
     selected: usize,
     encrypted: bool,
-    access: crate::partition::FilesystemAccess,
+    permissions: crate::partition::FilesystemPermissions,
 ) {
     let area = responsive_centered(frame.area(), 80, 60, 110, 20);
     draw_popup_halo(frame, area);
@@ -439,9 +439,16 @@ pub(super) fn draw_format_options(
     );
     frame.render_widget(
         Paragraph::new(if Filesystem::ALL[selected].supports_unix_ownership() {
-            format!("[o] Access: {}", access.description())
+            format!(
+                "[{}] Allow everyone to read and write",
+                if permissions == crate::partition::FilesystemPermissions::Everyone {
+                    "x"
+                } else {
+                    " "
+                }
+            )
         } else {
-            "Access: controlled by the mounting computer".into()
+            "Permissions are set by the computer that mounts this filesystem".into()
         })
         .alignment(Alignment::Center)
         .style(Style::default().fg(MUTED))
@@ -449,7 +456,7 @@ pub(super) fn draw_format_options(
         sections[2],
     );
     frame.render_widget(
-        Paragraph::new("Enter continue · Esc back")
+        Paragraph::new("p: permissions · Enter: continue · Esc: back")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT))
             .block(Block::default().borders(Borders::ALL)),
@@ -502,7 +509,7 @@ pub(super) fn draw_encryption_filesystems(
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
         Paragraph::new(
-            "Choose the filesystem stored inside encryption · Enter continue · Esc back",
+            "Choose the filesystem stored inside encryption · Enter: continue · Esc: back",
         )
         .alignment(Alignment::Center)
         .style(Style::default().fg(ACCENT))
@@ -568,7 +575,7 @@ pub(super) fn draw_encryption_passphrase(
         rows[3],
     );
     frame.render_widget(
-        Paragraph::new("Enter continue · Esc back")
+        Paragraph::new("Enter: continue · Esc: back")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT)),
         rows[4],
@@ -628,7 +635,7 @@ pub(super) fn draw_change_passphrase(
         rows[4],
     );
     frame.render_widget(
-        Paragraph::new("Enter continue · Esc back").alignment(Alignment::Center),
+        Paragraph::new("Enter: continue · Esc: back").alignment(Alignment::Center),
         rows[5],
     );
 }
@@ -673,7 +680,7 @@ pub(super) fn draw_disk_layout_options(
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
         Paragraph::new(format!(
-            "w Full overwrite: {} · Enter review · Esc back",
+            "w Full overwrite: {} · Enter: review · Esc: back",
             if overwrite { "on" } else { "off" }
         ))
         .alignment(Alignment::Center)
@@ -731,7 +738,7 @@ pub(super) fn draw_free_region_options(
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, sections[0], &mut state);
     frame.render_widget(
-        Paragraph::new("Choose free space · Enter continue · Esc back")
+        Paragraph::new("Choose free space · Enter: continue · Esc: back")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT))
             .block(Block::default().borders(Borders::ALL)),
@@ -869,7 +876,7 @@ pub(super) fn draw_partition_confirmation(
     frame.render_widget(button("No", !yes_selected), buttons[1]);
     frame.render_widget(button("Yes", yes_selected), buttons[3]);
     frame.render_widget(
-        Paragraph::new("←/→ choose · Enter apply · Esc cancel")
+        Paragraph::new("←/→: choose · Enter: apply · Esc: cancel")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT)),
         rows[4],
@@ -1121,21 +1128,24 @@ pub(super) fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
                 "No directly mountable filesystem".to_string()
             } else if device.encrypted && device.is_locked() {
                 format!(
-                    "Enter/{} unlock and mount",
+                    "Enter/{}: unlock and mount",
                     app.config.hotkeys.device_unmount.display()
                 )
             } else if device.encrypted && device.is_mounted() {
                 format!(
-                    "Enter/{} unmount and lock",
+                    "Enter/{}: unmount and lock",
                     app.config.hotkeys.device_unmount.display()
                 )
             } else if device.is_mounted() {
                 format!(
-                    "Enter/{} unmount",
+                    "Enter/{}: unmount",
                     app.config.hotkeys.device_unmount.display()
                 )
             } else {
-                format!("Enter/{} mount", app.config.hotkeys.device_action.display())
+                format!(
+                    "Enter/{}: mount",
+                    app.config.hotkeys.device_action.display()
+                )
             };
             if device.ejectable && !device.eject_blocked {
                 action.push_str(&format!(
@@ -1156,7 +1166,7 @@ pub(super) fn draw_devices(frame: &mut Frame, app: &App, view: &DeviceView) {
         });
     frame.render_widget(
         Paragraph::new(format!(
-            "{action} · {} refresh · Esc return · {} browser",
+            "{action} · {}: refresh · Esc: return · {}: browser",
             app.config.hotkeys.refresh.display(),
             app.config.hotkeys.quit.display()
         ))
