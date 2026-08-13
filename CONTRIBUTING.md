@@ -75,10 +75,13 @@ Runtime integrations use Linux tools described in the README and checked by
 
 ## Repository map
 
-- `src/main.rs` sets up the terminal, event loop, and command-line options.
-- `src/app.rs` coordinates application state, modes, input, background work,
-  prompts, and feature workflows.
-- `src/ui.rs` renders the browser, footer, tools, reports, and modal interfaces.
+- `src/main.rs`, `src/lib.rs`, `src/cli.rs`, and `src/runtime.rs` compose the
+  executable, parse compatible command-line options, restore the terminal, and
+  run the event-driven loop.
+- `src/app/` owns shared application state and separates browser, file, search,
+  network, device, partition, input, and background-completion workflows.
+- `src/ui/` separates browser, search, storage, tools, dialog, and shared chrome
+  rendering while keeping the root draw dispatch small.
 - `src/config.rs` loads defaults, validates hotkeys and icons, and migrates
   older configuration without discarding user values.
 - `src/entry.rs` and `src/browser_loader.rs` read, sort, search, and stream
@@ -87,9 +90,10 @@ Runtime integrations use Linux tools described in the README and checked by
   file operations, Freedesktop trash behavior, and path-safety checks.
 - `src/archive.rs` creates, inspects, validates, stages, and extracts TAR,
   TAR.GZ/TGZ, and ZIP archives.
-- `src/block.rs`, `src/luks.rs`, and `src/partition.rs` discover storage and
-  implement device, filesystem, partition, encryption, SMART, image, and
-  persistent mount/encryption operations.
+- `src/block.rs`, `src/luks.rs`, and `src/partition/` discover storage and split
+  geometry, policy validation, command planning, privileged execution, and
+  orchestration for device, filesystem, partition, encryption, SMART, image,
+  and persistent mount/encryption operations.
 - `src/network.rs` discovers and manages Samba shares while keeping credentials
   out of arguments and saved share metadata.
 - `src/launcher.rs` opens files and terminal editors; `src/updater.rs` performs
@@ -98,6 +102,9 @@ Runtime integrations use Linux tools described in the README and checked by
   placement, icon installation, and configuration preservation.
 - `.github/workflows/` defines the CI and release contracts; `deny.toml`
   defines dependency advisory, license, duplicate, and source policy.
+
+See `ARCHITECTURE.md` for ownership boundaries, performance invariants, and the
+reason some specialized fast paths intentionally remain separate.
 
 ## Development conventions
 

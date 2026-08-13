@@ -18,34 +18,20 @@ There is no committed public feature milestone at present. Current work should
 favor reliability, clear behavior, backwards-compatible configuration, and
 focused improvements justified by user problems or accepted issues.
 
-## Architecture investigation
+## Architecture direction
 
-The maintainer has raised the possibility of rewriting the app. The current
-source supports investigating that idea, but not yet committing to a
-from-scratch rewrite:
+The local rewrite established maintainable boundaries without replacing
+already optimized behavior with slower generic abstractions. Runtime and CLI
+ownership are separate from application workflows; application and rendering
+are split by feature; advanced-search tests are isolated; and storage now has
+separate geometry, validation, planning, privileged-process, and orchestration
+layers.
 
-- `app.rs` coordinates application state, input, prompts, and most background
-  workflows in one very large module;
-- `ui.rs` renders browser, tool, storage, network, and modal interfaces;
-- `partition.rs` combines discovery, validation, command planning, privilege
-  handling, execution, and verification for many storage operations;
-- feature modules are tested, but several responsibilities meet through the
-  central application state.
-
-The first step is an architectural analysis of responsibility boundaries,
-coupling, testability, state transitions, and the separation between
-application coordination, rendering, file operations, storage logic, and
-integrations. That analysis should identify safe seams for incremental
-extraction and determine whether maintainability is best served by modular
-refactoring, broader restructuring, a changed internal architecture, or a
-major rewrite.
-
-This investigation is about maintainability. It does not itself authorize
-user-facing redesign. Any future restructuring or rewrite should preserve
-minfm's established behavior, configuration compatibility, terminal-first
-scope, and safety guarantees unless a separate proposal explicitly changes
-them. A major implementation should be discussed and divided into reviewable,
-behavior-preserving stages before work begins.
+Future architecture work should continue as small, measured changes. Preserve
+configuration compatibility, terminal-first behavior, bounded background work,
+visible-row rendering, cancellation, stale-result rejection, non-UTF-8 paths,
+and all file/storage/credential safety guarantees. See `ARCHITECTURE.md` for the
+current boundaries and validation contract.
 
 ## Future considerations
 
