@@ -1,4 +1,5 @@
 use super::*;
+use crate::partition::FilesystemAccess;
 
 impl App {
     pub(crate) fn handle_partition_overlay(
@@ -73,6 +74,7 @@ impl App {
             PartitionOverlay::FormatOptions {
                 mut selected,
                 mut encrypted,
+                mut access,
             } => match key.code {
                 KeyCode::Esc => {
                     let tasks = self.partition_tasks_for_view(&view);
@@ -86,17 +88,21 @@ impl App {
                 }
                 KeyCode::Down => {
                     selected = (selected + 1).min(Filesystem::ALL.len() - 1);
+                    access = access.effective_for(Filesystem::ALL[selected]);
                     view.overlay = Some(PartitionOverlay::FormatOptions {
                         selected,
                         encrypted,
+                        access,
                     });
                     AppMode::Partitions(view)
                 }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
+                    access = access.effective_for(Filesystem::ALL[selected]);
                     view.overlay = Some(PartitionOverlay::FormatOptions {
                         selected,
                         encrypted,
+                        access,
                     });
                     AppMode::Partitions(view)
                 }
@@ -107,6 +113,21 @@ impl App {
                     view.overlay = Some(PartitionOverlay::FormatOptions {
                         selected,
                         encrypted,
+                        access,
+                    });
+                    AppMode::Partitions(view)
+                }
+                KeyCode::Char('o') => {
+                    if Filesystem::ALL[selected].supports_unix_ownership() {
+                        access = match access {
+                            FilesystemAccess::SystemDefault => FilesystemAccess::CurrentUser,
+                            FilesystemAccess::CurrentUser => FilesystemAccess::SystemDefault,
+                        };
+                    }
+                    view.overlay = Some(PartitionOverlay::FormatOptions {
+                        selected,
+                        encrypted,
+                        access,
                     });
                     AppMode::Partitions(view)
                 }
@@ -115,12 +136,14 @@ impl App {
                         view.overlay = Some(PartitionOverlay::FormatOptions {
                             selected,
                             encrypted,
+                            access,
                         });
                         return AppMode::Partitions(view);
                     };
                     view.overlay = Some(PartitionOverlay::FormatLabel {
                         filesystem,
                         encrypted,
+                        access,
                         input: String::new(),
                         cursor: 0,
                         error: None,
@@ -131,6 +154,7 @@ impl App {
                     view.overlay = Some(PartitionOverlay::FormatOptions {
                         selected,
                         encrypted,
+                        access,
                     });
                     AppMode::Partitions(view)
                 }
@@ -138,6 +162,7 @@ impl App {
             PartitionOverlay::EncryptionFilesystem {
                 mut selected,
                 whole_disk,
+                access,
             } => match key.code {
                 KeyCode::Esc => {
                     view.overlay = Some(if whole_disk {
@@ -149,6 +174,7 @@ impl App {
                         PartitionOverlay::FormatOptions {
                             selected: Filesystem::ALL.len(),
                             encrypted: false,
+                            access,
                         }
                     });
                     AppMode::Partitions(view)
@@ -158,6 +184,7 @@ impl App {
                     view.overlay = Some(PartitionOverlay::EncryptionFilesystem {
                         selected,
                         whole_disk,
+                        access,
                     });
                     AppMode::Partitions(view)
                 }
@@ -166,6 +193,7 @@ impl App {
                     view.overlay = Some(PartitionOverlay::EncryptionFilesystem {
                         selected,
                         whole_disk,
+                        access,
                     });
                     AppMode::Partitions(view)
                 }
@@ -176,6 +204,7 @@ impl App {
                     view.overlay = Some(PartitionOverlay::EncryptionPassphrase {
                         filesystem,
                         whole_disk,
+                        access,
                         label: None,
                         passphrase: SecretInput::default(),
                         confirmation: SecretInput::default(),
@@ -188,6 +217,7 @@ impl App {
                     view.overlay = Some(PartitionOverlay::EncryptionFilesystem {
                         selected,
                         whole_disk,
+                        access,
                     });
                     AppMode::Partitions(view)
                 }
@@ -200,6 +230,7 @@ impl App {
                 mut confirmation,
                 mut confirming,
                 error: _,
+                access,
             } => {
                 let mut error = None;
                 match key.code {
@@ -210,6 +241,7 @@ impl App {
                                 .position(|candidate| *candidate == filesystem)
                                 .unwrap_or(0),
                             whole_disk,
+                            access,
                         });
                         return AppMode::Partitions(view);
                     }
@@ -233,6 +265,7 @@ impl App {
                                 whole_disk,
                                 label.clone(),
                                 std::mem::take(&mut passphrase),
+                                access,
                             );
                             match action {
                                 Ok(action) => {
@@ -275,6 +308,7 @@ impl App {
                     confirmation,
                     confirming,
                     error,
+                    access,
                 });
                 AppMode::Partitions(view)
             }
@@ -512,6 +546,7 @@ impl App {
             PartitionOverlay::FormatLabel {
                 filesystem,
                 encrypted,
+                access,
                 mut input,
                 mut cursor,
                 error: _,
@@ -524,6 +559,7 @@ impl App {
                     view.overlay = Some(PartitionOverlay::FormatOptions {
                         selected,
                         encrypted,
+                        access,
                     });
                     return AppMode::Partitions(view);
                 }
@@ -533,6 +569,7 @@ impl App {
                         view.overlay = Some(PartitionOverlay::EncryptionPassphrase {
                             filesystem,
                             whole_disk: false,
+                            access,
                             label: (!input.trim().is_empty()).then(|| input.trim().to_owned()),
                             passphrase: SecretInput::default(),
                             confirmation: SecretInput::default(),
@@ -541,7 +578,7 @@ impl App {
                         });
                         return AppMode::Partitions(view);
                     }
-                    match self.partition_format_action(&view, filesystem, &input) {
+                    match self.partition_format_action(&view, filesystem, &input, access) {
                         Ok(action) => {
                             if let Err(validation) =
                                 partition::validate_snapshot(&action, &view.entries)
@@ -563,6 +600,7 @@ impl App {
                 view.overlay = Some(PartitionOverlay::FormatLabel {
                     filesystem,
                     encrypted,
+                    access,
                     input,
                     cursor,
                     error,
@@ -932,6 +970,7 @@ impl App {
                     target,
                     filesystem,
                     label,
+                    access: FilesystemAccess::SystemDefault,
                 })
             }
             PartitionTask::CreateTable => {
@@ -1136,6 +1175,7 @@ impl App {
         view: &PartitionView,
         filesystem: Filesystem,
         label: &str,
+        access: FilesystemAccess,
     ) -> std::result::Result<PartitionAction, String> {
         let entry = view
             .entries
@@ -1147,6 +1187,7 @@ impl App {
             target,
             filesystem,
             label,
+            access: access.effective_for(filesystem),
         })
     }
 
@@ -1157,6 +1198,7 @@ impl App {
         whole_disk: bool,
         label: Option<String>,
         passphrase: SecretInput,
+        access: FilesystemAccess,
     ) -> std::result::Result<PartitionAction, String> {
         let entry = view
             .entries
@@ -1172,6 +1214,7 @@ impl App {
                 filesystem,
                 label,
                 passphrase,
+                access: access.effective_for(filesystem),
             })
         } else {
             Ok(PartitionAction::EncryptFormat {
@@ -1179,6 +1222,7 @@ impl App {
                 filesystem,
                 label,
                 passphrase,
+                access: access.effective_for(filesystem),
             })
         }
     }

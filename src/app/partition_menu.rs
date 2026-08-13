@@ -78,6 +78,7 @@ impl App {
             view.overlay = Some(PartitionOverlay::FormatOptions {
                 selected: 0,
                 encrypted: false,
+                access: crate::partition::FilesystemAccess::SystemDefault,
             });
             return AppMode::Partitions(view);
         }

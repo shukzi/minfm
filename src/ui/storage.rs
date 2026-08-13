@@ -245,17 +245,19 @@ pub(super) fn draw_partition_overlay(
         PartitionOverlay::FormatOptions {
             selected,
             encrypted,
+            access,
         } => {
             let target = view
                 .entries
                 .get(view.selected)
                 .map(|entry| entry.device.path.display().to_string())
                 .unwrap_or_else(|| "selected device".into());
-            draw_format_options(frame, &target, *selected, *encrypted);
+            draw_format_options(frame, &target, *selected, *encrypted, *access);
         }
         PartitionOverlay::EncryptionFilesystem {
             selected,
             whole_disk,
+            ..
         } => {
             let target = view
                 .entries
@@ -380,13 +382,15 @@ pub(super) fn draw_format_options(
     target: &str,
     selected: usize,
     encrypted: bool,
+    access: crate::partition::FilesystemAccess,
 ) {
-    let area = responsive_centered(frame.area(), 80, 60, 110, 17);
+    let area = responsive_centered(frame.area(), 80, 60, 110, 20);
     draw_popup_halo(frame, area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(8),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
         ])
@@ -434,11 +438,22 @@ pub(super) fn draw_format_options(
         sections[1],
     );
     frame.render_widget(
+        Paragraph::new(if Filesystem::ALL[selected].supports_unix_ownership() {
+            format!("[o] Access: {}", access.description())
+        } else {
+            "Access: controlled by the mounting computer".into()
+        })
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(MUTED))
+        .block(Block::default().borders(Borders::ALL)),
+        sections[2],
+    );
+    frame.render_widget(
         Paragraph::new("Enter continue · Esc back")
             .alignment(Alignment::Center)
             .style(Style::default().fg(ACCENT))
             .block(Block::default().borders(Borders::ALL)),
-        sections[2],
+        sections[3],
     );
 }
 

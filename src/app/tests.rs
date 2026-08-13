@@ -1,4 +1,5 @@
 use super::*;
+use crate::partition::FilesystemAccess;
 use std::{
     ffi::OsString,
     fs::File,
@@ -2583,6 +2584,18 @@ fn partition_format_flow_chooses_a_filesystem_and_optional_label() {
         })
     ));
 
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+    assert!(matches!(
+        app.mode,
+        AppMode::Partitions(PartitionView {
+            overlay: Some(PartitionOverlay::FormatOptions {
+                access: FilesystemAccess::CurrentUser,
+                ..
+            }),
+            ..
+        })
+    ));
+
     for _ in 0..7 {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     }
@@ -2609,6 +2622,7 @@ fn partition_format_flow_chooses_a_filesystem_and_optional_label() {
                 action: PartitionAction::Format {
                     filesystem: Filesystem::Exfat,
                     label: Some(ref label),
+                    access: FilesystemAccess::SystemDefault,
                     ..
                 },
                 yes_selected: false,
@@ -3027,6 +3041,7 @@ fn partition_confirmation_opens_masked_administrator_authentication() {
         target: DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
         filesystem: Filesystem::Ext4,
         label: None,
+        access: FilesystemAccess::SystemDefault,
     };
     if !partition::authentication_required(&action) {
         return;
@@ -3067,6 +3082,7 @@ fn failed_partition_authentication_returns_to_a_clean_masked_prompt() {
         target: DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
         filesystem: Filesystem::Ext4,
         label: None,
+        access: FilesystemAccess::SystemDefault,
     };
     let (sender, receiver) = mpsc::sync_channel(1);
     sender
@@ -3165,6 +3181,7 @@ fn partition_failures_open_a_complete_error_dialog() {
         target: DeviceIdentity::from_entry(&view.entries[1]).unwrap(),
         filesystem: Filesystem::Ext4,
         label: None,
+        access: FilesystemAccess::SystemDefault,
     };
     let message = "mkfs.ext4 failed because the device became unavailable";
     let (sender, receiver) = mpsc::sync_channel(1);

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.8.1
+
+### Changed
+
+- New filesystems now keep the formatter's conventional system ownership by
+  default, matching KDE Partition Manager.
+- The format screen offers an explicit current-user ownership option for Linux
+  filesystems that store Unix ownership.
+- Portable filesystems such as FAT32, exFAT, and NTFS continue to derive access
+  from the mounting computer instead of receiving Linux ownership metadata.
+
 ## v0.8.0
 
 ### Changed

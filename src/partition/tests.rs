@@ -240,6 +240,7 @@ fn protected_identity_and_mounted_state_are_revalidated() {
         target: identity(&protected, "/dev/sdb1"),
         filesystem: Filesystem::Ext4,
         label: None,
+        access: FilesystemAccess::SystemDefault,
     };
     assert!(validate_action(&action, &protected)
         .unwrap_err()
@@ -259,6 +260,7 @@ fn protected_identity_and_mounted_state_are_revalidated() {
         target,
         filesystem: Filesystem::Ext4,
         label: None,
+        access: FilesystemAccess::SystemDefault,
     };
     assert!(validate_action(&action, &changed)
         .unwrap_err()
@@ -267,7 +269,7 @@ fn protected_identity_and_mounted_state_are_revalidated() {
 }
 
 #[test]
-fn ownership_capable_filesystems_are_assigned_to_the_formatting_user() {
+fn filesystem_access_policy_only_assigns_supported_filesystems_on_request() {
     for filesystem in [
         Filesystem::Ext4,
         Filesystem::Xfs,
@@ -285,7 +287,35 @@ fn ownership_capable_filesystems_are_assigned_to_the_formatting_user() {
         Filesystem::None,
     ] {
         assert!(!take_ownership_supported(filesystem));
+        assert_eq!(
+            FilesystemAccess::CurrentUser.effective_for(filesystem),
+            FilesystemAccess::SystemDefault
+        );
     }
+
+    assert_eq!(
+        FilesystemAccess::CurrentUser.effective_for(Filesystem::Ext4),
+        FilesystemAccess::CurrentUser
+    );
+
+    let inventory = operation_inventory(&[]);
+    let conventional = PartitionAction::Format {
+        target: identity(&inventory, "/dev/sdb1"),
+        filesystem: Filesystem::Ext4,
+        label: None,
+        access: FilesystemAccess::SystemDefault,
+    };
+    assert_eq!(newly_created_filesystem(&conventional), None);
+    let current_user = PartitionAction::Format {
+        target: identity(&inventory, "/dev/sdb1"),
+        filesystem: Filesystem::Ext4,
+        label: None,
+        access: FilesystemAccess::CurrentUser,
+    };
+    assert_eq!(
+        newly_created_filesystem(&current_user),
+        Some(Filesystem::Ext4)
+    );
 
     let commands = ownership_commands(
         Path::new("/dev/mapper/test-volume"),
@@ -368,6 +398,7 @@ fn format_plan_uses_argument_vectors_without_a_shell() {
         target: identity(&inventory, "/dev/sdb1"),
         filesystem: Filesystem::Ext4,
         label: Some("Archive Disk".into()),
+        access: FilesystemAccess::SystemDefault,
     };
     validate_action(&action, &inventory).unwrap();
     let plan = command_plan(&action, &inventory).unwrap();
@@ -452,6 +483,7 @@ fn final_state_confirms_an_empty_disk_and_the_requested_filesystem() {
         target: identity(&inventory, "/dev/sdb1"),
         filesystem: Filesystem::Ext4,
         label: None,
+        access: FilesystemAccess::SystemDefault,
     };
     verify_final_state(&format, &inventory).unwrap();
 }
@@ -463,6 +495,7 @@ fn confirmation_warnings_distinguish_erasing_from_layout_changes() {
         target: identity(&inventory, "/dev/sdb1"),
         filesystem: Filesystem::Ext4,
         label: None,
+        access: FilesystemAccess::SystemDefault,
     };
     assert!(format.erases_data());
     assert_eq!(
@@ -616,6 +649,7 @@ fn filesystem_formatters_use_expected_helpers_and_label_switches() {
             target: target.clone(),
             filesystem,
             label: Some("Label".into()),
+            access: FilesystemAccess::SystemDefault,
         };
         let plan = command_plan(&action, &inventory).unwrap();
         assert_eq!(plan[0].program, OsString::from("wipefs"));

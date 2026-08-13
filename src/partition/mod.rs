@@ -207,6 +207,29 @@ pub enum Filesystem {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemAccess {
+    SystemDefault,
+    CurrentUser,
+}
+
+impl FilesystemAccess {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::SystemDefault => "System defaults (conventional)",
+            Self::CurrentUser => "Assign filesystem root to current user",
+        }
+    }
+
+    pub fn effective_for(self, filesystem: Filesystem) -> Self {
+        if filesystem.supports_unix_ownership() {
+            self
+        } else {
+            Self::SystemDefault
+        }
+    }
+}
+
 impl Filesystem {
     pub const ALL: [Self; 10] = [
         Self::Ext4,
@@ -266,6 +289,13 @@ impl Filesystem {
             Self::Udf => "Removable media across many systems",
             Self::None => "Leave the partition unformatted",
         }
+    }
+
+    pub fn supports_unix_ownership(self) -> bool {
+        matches!(
+            self,
+            Self::Ext4 | Self::Xfs | Self::Btrfs | Self::F2fs | Self::Udf
+        )
     }
 
     fn current_matches(self, current: Option<&str>) -> bool {
@@ -350,18 +380,21 @@ pub enum PartitionAction {
         target: DeviceIdentity,
         filesystem: Filesystem,
         label: Option<String>,
+        access: FilesystemAccess,
     },
     EncryptFormat {
         target: DeviceIdentity,
         filesystem: Filesystem,
         label: Option<String>,
         passphrase: SecretInput,
+        access: FilesystemAccess,
     },
     CreateEncryptedDisk {
         disk: DeviceIdentity,
         filesystem: Filesystem,
         label: Option<String>,
         passphrase: SecretInput,
+        access: FilesystemAccess,
     },
     Grow {
         target: DeviceIdentity,
@@ -593,22 +626,36 @@ impl PartitionAction {
                 number, type_id, ..
             } => format!("Set partition {number} on {path} to type {type_id:?}."),
             Self::Format {
-                filesystem, label, ..
+                filesystem,
+                label,
+                access,
+                ..
             } => format!(
-                "Erase {path} and format it as {}{}.",
+                "Erase {path} and format it as {}{}. Access: {}.",
                 filesystem.name(),
                 label
                     .as_ref()
                     .map(|label| format!(" labeled {label:?}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                access.description()
             ),
-            Self::EncryptFormat { filesystem, .. } => format!(
-                "Erase {path}, create a LUKS2 encrypted container, and format its unlocked contents as {}.",
-                filesystem.name()
+            Self::EncryptFormat {
+                filesystem,
+                access,
+                ..
+            } => format!(
+                "Erase {path}, create a LUKS2 encrypted container, and format its unlocked contents as {}. Access: {}.",
+                filesystem.name(),
+                access.description()
             ),
-            Self::CreateEncryptedDisk { filesystem, .. } => format!(
-                "Erase {path}, create GPT with one LUKS2 encrypted partition, and format its unlocked contents as {}.",
-                filesystem.name()
+            Self::CreateEncryptedDisk {
+                filesystem,
+                access,
+                ..
+            } => format!(
+                "Erase {path}, create GPT with one LUKS2 encrypted partition, and format its unlocked contents as {}. Access: {}.",
+                filesystem.name(),
+                access.description()
             ),
             Self::Grow { end_bytes, .. } => format!(
                 "Grow {path} to end at {}. Shrinking is never performed.",
@@ -778,10 +825,13 @@ pub fn execute(
             }
         }
         if let PartitionAction::Format {
-            target, filesystem, ..
+            target,
+            filesystem,
+            access,
+            ..
         } = action
         {
-            if take_ownership_supported(*filesystem) {
+            if *access == FilesystemAccess::CurrentUser && take_ownership_supported(*filesystem) {
                 report_phase("Assigning filesystem ownership");
                 take_filesystem_ownership(
                     &target.path,
@@ -1141,23 +1191,26 @@ fn execute_encrypted_format(
             "encrypted mapping {mapping_name} already exists; close it before retrying"
         )));
     }
-    let (filesystem, label, passphrase, target_path) = match action {
+    let (filesystem, label, passphrase, target_path, access) = match action {
         PartitionAction::EncryptFormat {
             target,
             filesystem,
             label,
             passphrase,
+            access,
         } => (
             *filesystem,
             label.as_deref(),
             passphrase,
             target.path.clone(),
+            *access,
         ),
         PartitionAction::CreateEncryptedDisk {
             disk,
             filesystem,
             label,
             passphrase,
+            access,
         } => {
             report_phase("Creating GPT partition layout");
             let mut commands = wipe_disk_commands(disk, inventory);
@@ -1209,6 +1262,7 @@ fn execute_encrypted_format(
                 label.as_deref(),
                 passphrase,
                 partition.device.path.clone(),
+                *access,
             )
         }
         _ => {
@@ -1266,7 +1320,10 @@ fn execute_encrypted_format(
         use_sudo,
         administrator_password,
     );
-    let access_result = if format_result.is_ok() {
+    let access_result = if format_result.is_ok()
+        && access == FilesystemAccess::CurrentUser
+        && take_ownership_supported(filesystem)
+    {
         report_phase("Assigning filesystem ownership");
         take_filesystem_ownership(&mapping, filesystem, use_sudo, administrator_password)
     } else {
@@ -1315,17 +1372,26 @@ fn take_filesystem_ownership(
 }
 
 fn take_ownership_supported(filesystem: Filesystem) -> bool {
-    matches!(
-        filesystem,
-        Filesystem::Ext4 | Filesystem::Xfs | Filesystem::Btrfs | Filesystem::F2fs | Filesystem::Udf
-    )
+    filesystem.supports_unix_ownership()
 }
 
 fn newly_created_filesystem(action: &PartitionAction) -> Option<Filesystem> {
     match action {
-        PartitionAction::Format { filesystem, .. }
-        | PartitionAction::EncryptFormat { filesystem, .. }
-        | PartitionAction::CreateEncryptedDisk { filesystem, .. } => Some(*filesystem),
+        PartitionAction::Format {
+            filesystem,
+            access: FilesystemAccess::CurrentUser,
+            ..
+        }
+        | PartitionAction::EncryptFormat {
+            filesystem,
+            access: FilesystemAccess::CurrentUser,
+            ..
+        }
+        | PartitionAction::CreateEncryptedDisk {
+            filesystem,
+            access: FilesystemAccess::CurrentUser,
+            ..
+        } => Some(*filesystem),
         _ => None,
     }
 }
