@@ -28,7 +28,7 @@ functionality.
   filesystem maintenance, raw images, SMART tests, ATA drive settings, LUKS,
   persistent mount/encryption options, and safe eject
 - **Network:** Discover, add, open, remember, and safely disconnect Samba shares
-- **Tools:** Open the built-in launcher with `M` for device management and network shares
+- **Tools:** Open the built-in launcher with `m`; use `M` for direct device management and `N` for network shares
 - **Updates:** Background startup checks with checksum-verified installation
 - **Configuration:** Invalid-configuration detection with safe-operation blocking
 

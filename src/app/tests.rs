@@ -2473,11 +2473,11 @@ fn read_only_network_manager_can_open_connected_share_but_not_change_it() {
 }
 
 #[test]
-fn uppercase_m_opens_and_navigates_the_apps_launcher() {
+fn lowercase_m_opens_and_navigates_the_apps_launcher() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app(temp.path());
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
     assert!(matches!(app.mode, AppMode::Apps(AppsView { selected: 0 })));
 
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -2493,7 +2493,7 @@ fn configured_app_hotkey_replaces_the_default() {
     let mut app = test_app(temp.path());
     app.config = toml::from_str("[hotkeys]\ntools = 'F2'\n").unwrap();
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
     assert!(matches!(app.mode, AppMode::Browser));
 
     app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
@@ -2501,11 +2501,11 @@ fn configured_app_hotkey_replaces_the_default() {
 }
 
 #[test]
-fn one_device_hotkey_opens_the_unified_manager() {
+fn uppercase_m_opens_the_unified_device_manager() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app(temp.path());
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
     assert!(matches!(app.mode, AppMode::Partitions(_)));
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
