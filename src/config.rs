@@ -318,8 +318,8 @@ impl Default for HotkeyConfig {
             help: key("?"),
             open: key("o"),
             edit: key("e"),
-            tools: key("M"),
-            devices: key("m"),
+            tools: key("m"),
+            devices: key("M"),
             network_shares: key("N"),
             device_eject: key("e"),
             device_action: key("m"),
@@ -809,7 +809,7 @@ mod tests {
         assert_eq!(config.open.editor, "nano");
         assert_eq!(config.open.opener, "xdg-open");
         assert!(config.behavior.verify_copies);
-        assert_eq!(config.hotkeys.tools.display(), "M");
+        assert_eq!(config.hotkeys.tools.display(), "m");
         assert_eq!(config.hotkeys.archive.display(), "z");
         assert!(config.icons.overrides.file.is_none());
     }

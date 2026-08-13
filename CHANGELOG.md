@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## v0.8.0
+
+### Changed
+
+- Replaced the previous application structure with a performance-first Rust
+  rewrite while preserving the complete minfm feature set, configuration,
+  safety rules, and established hot-path behavior.
+- Split runtime, browser, file, search, network, device, partition, rendering,
+  and test responsibilities into focused modules with explicit boundaries.
+- Kept the event-driven UI, bounded worker queues, cancellation, stale-result
+  rejection, visible-row rendering, and byte-preserving Linux path handling.
+- Separated storage validation, planning, privileged process execution, and
+  orchestration without weakening protected-device or postcondition checks.
+- Changed the default manager shortcuts so `m` opens Tools, `M` opens Device
+  Manager, and `N` opens Network Shares.
+
+### Fixed
+
+- File creation and paste operations in tree view now target the focused
+  directory, or the focused file parent directory.
+- Network shares are matched to settled GVFS mounts case-insensitively and get
+  a short settling window before reporting that the local path is unavailable.
+- Network Shares now exposes Add, Refresh, Disconnect, and Forget actions in
+  the footer, with Disconnect and Forget shown only when applicable.
+
 ## v0.7.0
 
 ### Added
