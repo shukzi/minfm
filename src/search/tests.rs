@@ -107,22 +107,27 @@ struct FakeRg {
 }
 
 impl FakeRg {
+    fn install(program: &Path, body: impl AsRef<[u8]>) {
+        let staged = program.with_extension("staged");
+        fs::write(&staged, body).unwrap();
+        let mut permissions = fs::metadata(&staged).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged, permissions).unwrap();
+        fs::rename(staged, program).unwrap();
+    }
+
     fn capturing_arguments() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("rg");
         let capture = temp.path().join("arguments");
-        fs::write(
+        Self::install(
                 &program,
                 format!(
                     "#!/bin/sh\n: > '{}'\nafter_separator=\nfor argument do\n  printf '%s\\0' \"$argument\" >> '{}'\n  if [ \"$after_separator\" = yes ]; then\n    printf '%s\\0' \"$argument\"\n  fi\n  if [ \"$argument\" = -- ]; then after_separator=yes; fi\ndone\n",
                     capture.display(),
                     capture.display()
                 ),
-            )
-            .unwrap();
-        let mut permissions = fs::metadata(&program).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&program, permissions).unwrap();
+            );
         Self {
             _temp: temp,
             command: RgCommand {
@@ -139,14 +144,10 @@ impl FakeRg {
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("rg");
         let capture = temp.path().join("capture");
-        fs::write(
+        Self::install(
             &program,
             script.replace("$CAPTURE", &capture.to_string_lossy()),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&program).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&program, permissions).unwrap();
+        );
         Self {
             _temp: temp,
             command: RgCommand {
@@ -188,7 +189,7 @@ fn wait_for_pids(capture: &Path, count: usize) -> Vec<String> {
                 return pids;
             }
         }
-        thread::yield_now();
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -208,7 +209,7 @@ fn wait_for_processes_gone(pids: &[String]) {
                 std::time::Instant::now() < deadline,
                 "escaped writer did not exit after reader closure"
             );
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }

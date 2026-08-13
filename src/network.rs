@@ -1153,10 +1153,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn executable(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
+        let staged = path.with_extension("staged");
+        fs::write(&staged, body).unwrap();
+        let mut permissions = fs::metadata(&staged).unwrap().permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).unwrap();
+        fs::set_permissions(&staged, permissions).unwrap();
+        fs::rename(staged, path).unwrap();
     }
 
     fn environment(temp: &tempfile::TempDir) -> NetworkEnvironment {
