@@ -226,6 +226,7 @@ pub enum SearchReturn {
 pub enum ReturnDestination {
     Browser,
     SearchResults,
+    Tools,
 }
 
 #[derive(Debug)]
@@ -239,6 +240,7 @@ impl ReturnDestination {
         match self {
             Self::Browser => AppMode::Browser,
             Self::SearchResults => AppMode::SearchResults,
+            Self::Tools => AppMode::Tools(ToolsView { selected: 0 }),
         }
     }
 }
@@ -504,12 +506,12 @@ pub struct NetworkView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltinApp {
+pub enum BuiltinTool {
     DeviceManager,
     NetworkShares,
 }
 
-impl BuiltinApp {
+impl BuiltinTool {
     pub const ALL: [Self; 2] = [Self::DeviceManager, Self::NetworkShares];
 
     pub fn name(self) -> &'static str {
@@ -530,8 +532,14 @@ impl BuiltinApp {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppsView {
+pub struct ToolsView {
     pub selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerReturn {
+    Files,
+    Tools,
 }
 
 #[derive(Debug, Clone)]
@@ -746,7 +754,7 @@ pub enum AppMode {
     Browser,
     SearchForm(SearchForm),
     Archive(ArchiveView),
-    Apps(AppsView),
+    Tools(ToolsView),
     Prompt(Prompt),
     Progress,
     SearchProgress,
@@ -875,7 +883,7 @@ pub struct App {
     partition_operation: Option<RunningPartitionOperation>,
     partition_return_view: Option<PartitionView>,
     partition_preflight: Option<PendingPartitionPreflight>,
-    partition_return_to_apps: bool,
+    manager_return: ManagerReturn,
     selector_memory: HashMap<PathBuf, PathBuf>,
     expanded_directories: HashSet<PathBuf>,
     loaded_dir: PathBuf,
@@ -951,7 +959,7 @@ impl App {
             partition_operation: None,
             partition_return_view: None,
             partition_preflight: None,
-            partition_return_to_apps: false,
+            manager_return: ManagerReturn::Files,
             selector_memory: HashMap::new(),
             expanded_directories: HashSet::new(),
             loaded_dir: start.clone(),

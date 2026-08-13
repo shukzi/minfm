@@ -10,9 +10,9 @@ use ratatui::{
 
 use crate::{
     app::{
-        format_elapsed, App, AppMode, AppsView, ArchiveView, BrowserView, BuiltinApp,
-        ClipboardMode, DeviceView, NetworkView, PartitionOverlay, PartitionView, Prompt,
-        SearchForm, SearchView, TrashView,
+        format_elapsed, App, AppMode, ArchiveView, BrowserView, BuiltinTool, ClipboardMode,
+        DeviceView, NetworkView, PartitionOverlay, PartitionView, Prompt, SearchForm, SearchView,
+        ToolsView, TrashView,
     },
     entry::{human_size, EntryKind},
     icons::Icons,
@@ -44,7 +44,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(1),
+            Constraint::Length(status_bar_height(app)),
             Constraint::Length(shortcut_bar_height(app, frame.area().width)),
         ])
         .split(frame.area());
@@ -55,7 +55,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.mode {
         AppMode::Browser => {}
         AppMode::Archive(view) => draw_archive(frame, app, view),
-        AppMode::Apps(view) => draw_apps(frame, app, view),
+        AppMode::Tools(view) => draw_tools(frame, app, view),
         AppMode::Prompt(prompt) => draw_prompt(frame, app, prompt),
         AppMode::Progress => draw_progress_modal(frame, app),
         AppMode::SearchProgress => draw_search_progress(frame, app),

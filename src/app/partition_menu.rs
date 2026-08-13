@@ -11,13 +11,9 @@ impl App {
         }
         let hotkeys = self.config.hotkeys.clone();
         if key.code == KeyCode::Esc {
-            if self.partition_return_to_apps {
-                AppMode::Apps(AppsView { selected: 0 })
-            } else {
-                AppMode::Browser
-            }
+            self.manager_return_mode()
         } else if hotkeys.tools.matches(key) {
-            AppMode::Apps(AppsView { selected: 0 })
+            AppMode::Tools(ToolsView { selected: 0 })
         } else if hotkeys.quit.matches(key) {
             AppMode::Browser
         } else if key.code == KeyCode::Down || hotkeys.down.matches(key) {
@@ -640,14 +636,18 @@ impl App {
         }
     }
 
-    pub(crate) fn open_partitions(&mut self, return_to_apps: bool) -> AppMode {
+    pub(crate) fn open_partitions(&mut self, manager_return: ManagerReturn) -> AppMode {
+        self.manager_return = manager_return;
         if !self.device_manager_available() {
+            self.modal_return = match manager_return {
+                ManagerReturn::Files => ReturnDestination::Browser,
+                ManagerReturn::Tools => ReturnDestination::Tools,
+            };
             return AppMode::Prompt(Prompt::Message {
                 title: "Device Manager unavailable".into(),
                 body: "Device discovery cannot start because the lsblk command is unavailable. Install util-linux, then try again.".into(),
             });
         }
-        self.partition_return_to_apps = return_to_apps;
         self.start_partition_refresh(None);
         AppMode::Partitions(PartitionView {
             entries: Vec::new(),
@@ -657,10 +657,22 @@ impl App {
     }
 
     pub(crate) fn reopen_partitions(&mut self) -> AppMode {
-        self.open_partitions(self.partition_return_to_apps)
+        self.open_partitions(self.manager_return)
     }
 
-    pub(crate) fn partition_returns_to_apps(&self) -> bool {
-        self.partition_return_to_apps
+    pub(crate) fn manager_returns_to_tools(&self) -> bool {
+        self.manager_return == ManagerReturn::Tools
+    }
+
+    pub(crate) fn manager_return_mode(&self) -> AppMode {
+        match self.manager_return {
+            ManagerReturn::Files => AppMode::Browser,
+            ManagerReturn::Tools => AppMode::Tools(ToolsView { selected: 0 }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_manager_return_for_test(&mut self, manager_return: ManagerReturn) {
+        self.manager_return = manager_return;
     }
 }

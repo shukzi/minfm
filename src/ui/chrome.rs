@@ -98,6 +98,16 @@ pub(super) fn header_action_line(app: &App, arrow: &str, compact: bool) -> Line<
 }
 
 pub(super) fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    if matches!(
+        app.mode,
+        AppMode::Tools(_)
+            | AppMode::Trash(_)
+            | AppMode::Devices(_)
+            | AppMode::Network(_)
+            | AppMode::Partitions(_)
+    ) {
+        return;
+    }
     if let AppMode::Archive(view) = &app.mode {
         let noun = if view.entries.len() == 1 {
             "archive item"
@@ -148,54 +158,154 @@ pub(super) fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+pub(super) fn status_bar_height(app: &App) -> u16 {
+    if matches!(
+        app.mode,
+        AppMode::Tools(_)
+            | AppMode::Trash(_)
+            | AppMode::Devices(_)
+            | AppMode::Network(_)
+            | AppMode::Partitions(_)
+    ) {
+        0
+    } else {
+        1
+    }
+}
+
 pub(super) fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
-    if let AppMode::Network(view) = &app.mode {
-        let items = network_shortcut_items(app, view);
+    if let Some(items) = shortcut_items(app) {
         let lines = shortcut_lines_owned(&items, area.width, usize::from(area.height));
         frame.render_widget(
             Paragraph::new(Text::from(lines)).style(Style::default().fg(MUTED)),
             area,
         );
-        return;
     }
+}
 
-    let context = match &app.mode {
-        AppMode::Browser => None,
-        AppMode::Apps(_) => Some(format!(
-            " ↑↓/{}/{}: move · Enter: open · {}/{}/Esc: close ",
-            app.config.hotkeys.down.display(),
-            app.config.hotkeys.up.display(),
-            app.config.hotkeys.tools.display(),
-            app.config.hotkeys.quit.display(),
-        )),
-        AppMode::Archive(_) => Some(format!(
-            " ↑↓/{}/{}: move · {}/Esc: close ",
-            app.config.hotkeys.down.display(),
-            app.config.hotkeys.up.display(),
-            app.config.hotkeys.quit.display(),
-        )),
-        AppMode::Partitions(view) => Some(partition_shortcuts(app, view)),
-        AppMode::Prompt(Prompt::PartitionAuthentication { .. }) => {
-            Some(" Type administrator password · Enter: authenticate · Esc: cancel ".into())
+pub(super) fn shortcut_items(app: &App) -> Option<Vec<(String, &'static str)>> {
+    match &app.mode {
+        AppMode::Browser => Some(browser_shortcut_items(app)),
+        AppMode::Tools(_) => Some(tools_shortcut_items(app)),
+        AppMode::Archive(_) => Some(vec![
+            (move_key(app), "Move"),
+            (
+                format!("{}/Esc", app.config.hotkeys.quit.display()),
+                "Files",
+            ),
+        ]),
+        AppMode::Trash(_) => Some(trash_shortcut_items(app)),
+        AppMode::Devices(view) => Some(device_shortcut_items(app, view)),
+        AppMode::Network(view) => Some(network_shortcut_items(app, view)),
+        AppMode::Partitions(view) if view.overlay.is_none() => Some(partition_shortcut_items(app)),
+        _ => None,
+    }
+}
+
+fn move_key(app: &App) -> String {
+    format!(
+        "↑↓/{}/{}",
+        app.config.hotkeys.down.display(),
+        app.config.hotkeys.up.display()
+    )
+}
+
+pub(super) fn tools_shortcut_items(app: &App) -> Vec<(String, &'static str)> {
+    vec![
+        (move_key(app), "Move"),
+        ("Enter".into(), "Open"),
+        (
+            format!(
+                "{}/{}/Esc",
+                app.config.hotkeys.tools.display(),
+                app.config.hotkeys.quit.display()
+            ),
+            "Files",
+        ),
+    ]
+}
+
+pub(super) fn trash_shortcut_items(app: &App) -> Vec<(String, &'static str)> {
+    vec![
+        (move_key(app), "Move"),
+        (app.config.hotkeys.select.display().into(), "Mark"),
+        (
+            format!("Enter/{}", app.config.hotkeys.restore.display()),
+            "Restore",
+        ),
+        (
+            app.config.hotkeys.permanent_delete.display().into(),
+            "Delete permanently",
+        ),
+        (
+            app.config.hotkeys.quick_permanent_delete.display().into(),
+            "Quick delete",
+        ),
+        (
+            app.config.hotkeys.clear_trash.display().into(),
+            "Empty Trash",
+        ),
+        (
+            format!("{}/Esc", app.config.hotkeys.trash_bin.display()),
+            "Files",
+        ),
+    ]
+}
+
+pub(super) fn manager_exit_shortcuts(app: &App) -> Vec<(String, &'static str)> {
+    let mut items = Vec::new();
+    if app.manager_returns_to_tools() {
+        items.push((
+            format!("Esc/{}", app.config.hotkeys.tools.display()),
+            "Tools",
+        ));
+        items.push((app.config.hotkeys.quit.display().into(), "Files"));
+    } else {
+        items.push((app.config.hotkeys.tools.display().into(), "Tools"));
+        items.push((
+            format!("Esc/{}", app.config.hotkeys.quit.display()),
+            "Files",
+        ));
+    }
+    items
+}
+
+pub(super) fn partition_shortcut_items(app: &App) -> Vec<(String, &'static str)> {
+    let mut items = vec![
+        (move_key(app), "Move"),
+        (
+            format!("Enter/{}", app.config.hotkeys.partition_actions.display()),
+            "Actions",
+        ),
+        (app.config.hotkeys.refresh.display().into(), "Refresh"),
+    ];
+    items.extend(manager_exit_shortcuts(app));
+    items
+}
+
+pub(super) fn device_shortcut_items(
+    app: &App,
+    view: &crate::app::DeviceView,
+) -> Vec<(String, &'static str)> {
+    let mut items = vec![(move_key(app), "Move")];
+    if let Some(device) = view.devices.get(view.selected) {
+        if !device.system_protected && (device.encrypted || device.filesystem.is_some()) {
+            let label = if device.encrypted && device.is_locked() {
+                "Unlock"
+            } else if device.is_mounted() {
+                "Unmount"
+            } else {
+                "Mount"
+            };
+            items.push(("Enter".into(), label));
         }
-        _ => Some(" A dialog owns input · File shortcuts are disabled until it closes. ".into()),
-    };
-    if let Some(context) = context {
-        frame.render_widget(
-            Paragraph::new(context)
-                .alignment(Alignment::Left)
-                .style(Style::default().fg(MUTED)),
-            area,
-        );
-        return;
+        if device.ejectable && !device.eject_blocked && !device.system_protected {
+            items.push((app.config.hotkeys.device_eject.display().into(), "Eject"));
+        }
     }
-
-    let items = browser_shortcut_items(app);
-    let lines = shortcut_lines_owned(&items, area.width, usize::from(area.height));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).style(Style::default().fg(MUTED)),
-        area,
-    );
+    items.push((app.config.hotkeys.refresh.display().into(), "Refresh"));
+    items.extend(manager_exit_shortcuts(app));
+    items
 }
 
 pub(super) fn browser_shortcut_items(app: &App) -> Vec<(String, &'static str)> {
@@ -246,14 +356,7 @@ pub(super) fn network_shortcut_items(
     view: &crate::app::NetworkView,
 ) -> Vec<(String, &'static str)> {
     let mut items = vec![
-        (
-            format!(
-                "↑↓/{}/{}",
-                app.config.hotkeys.down.display(),
-                app.config.hotkeys.up.display()
-            ),
-            "Move",
-        ),
+        (move_key(app), "Move"),
         ("Enter".into(), "Open/Connect"),
         (app.config.hotkeys.network_add.display().into(), "Add"),
         (app.config.hotkeys.refresh.display().into(), "Refresh"),
@@ -269,26 +372,27 @@ pub(super) fn network_shortcut_items(
             items.push((app.config.hotkeys.network_forget.display().into(), "Forget"));
         }
     }
-    items.extend([
-        ("Esc".into(), "Back"),
-        (app.config.hotkeys.quit.display().into(), "Files"),
-    ]);
+    items.extend(manager_exit_shortcuts(app));
     items
 }
 
 pub(super) fn shortcut_bar_height(app: &App, width: u16) -> u16 {
-    let items = match &app.mode {
-        AppMode::Browser => Some(browser_shortcut_items(app)),
-        AppMode::Network(view) => Some(network_shortcut_items(app, view)),
-        _ => None,
+    let Some(items) = shortcut_items(app) else {
+        return 0;
     };
-    if items
-        .as_ref()
-        .is_some_and(|items| shortcut_items_width(items) > usize::from(width))
-    {
+    if shortcut_items_width(&items) > usize::from(width) {
         2
     } else {
         1
+    }
+}
+
+pub(super) fn manager_content_area(app: &App, screen: Rect) -> Rect {
+    Rect {
+        height: screen
+            .height
+            .saturating_sub(shortcut_bar_height(app, screen.width)),
+        ..screen
     }
 }
 
@@ -335,62 +439,4 @@ pub(super) fn shortcut_lines_owned(
         line_width += separator + pair_width;
     }
     lines.into_iter().map(Line::from).collect()
-}
-
-pub(super) fn partition_shortcuts(app: &App, view: &crate::app::PartitionView) -> String {
-    let down = app.config.hotkeys.down.display();
-    let up = app.config.hotkeys.up.display();
-    let actions = app.config.hotkeys.partition_actions.display();
-    let refresh = app.config.hotkeys.refresh.display();
-    let hint = match &view.overlay {
-        None => {
-            let exit = if app.partition_returns_to_apps() {
-                format!(
-                    "Esc: back to menu · {}: files",
-                    app.config.hotkeys.quit.display()
-                )
-            } else {
-                format!(
-                    "Esc/{}: back to files · {}: menu",
-                    app.config.hotkeys.quit.display(),
-                    app.config.hotkeys.tools.display()
-                )
-            };
-            return format!(
-                " ↑↓/{down}/{up}: move · Enter/{actions}: actions · {refresh}: refresh · {exit} "
-            );
-        }
-        Some(crate::app::PartitionOverlay::Actions { .. }) => {
-            return format!(" ↑↓/{down}/{up}: move · Enter: continue · {actions}/Esc: back ")
-        }
-        Some(crate::app::PartitionOverlay::FormatOptions { .. }) => {
-            return format!(
-                " ↑↓/{down}/{up}: filesystem · p: permissions · e: encryption · Enter: continue · Esc: back "
-            )
-        }
-        Some(crate::app::PartitionOverlay::EncryptionFilesystem { .. }) => {
-            return format!(" ↑↓/{down}/{up}: filesystem · Enter: continue · Esc: back ")
-        }
-        Some(crate::app::PartitionOverlay::EncryptionPassphrase { .. })
-        | Some(crate::app::PartitionOverlay::ChangePassphrase { .. }) => {
-            " Enter: continue · Esc: back "
-        }
-        Some(crate::app::PartitionOverlay::DiskLayoutOptions { .. }) => {
-            return format!(" ↑↓/{down}/{up}: layout · Enter: review · Esc: back ")
-        }
-        Some(crate::app::PartitionOverlay::FreeRegionOptions { .. }) => {
-            return format!(" ↑↓/{down}/{up}: free space · Enter: continue · Esc: back ")
-        }
-        Some(crate::app::PartitionOverlay::PartitionSize { .. }) => {
-            " Type size or max · Enter: review · Esc: regions "
-        }
-        Some(crate::app::PartitionOverlay::FormatLabel { .. }) => {
-            " Type optional label · Enter: review · Esc: filesystems "
-        }
-        Some(crate::app::PartitionOverlay::Input { .. }) => " Enter: review · Esc: back ",
-        Some(crate::app::PartitionOverlay::Confirm { .. }) => {
-            " ←/→: choose · Enter: apply · Esc: cancel "
-        }
-    };
-    hint.into()
 }

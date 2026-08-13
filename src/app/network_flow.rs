@@ -4,7 +4,8 @@ impl App {
     pub(crate) fn handle_network_key(&mut self, mut view: NetworkView, key: KeyEvent) -> AppMode {
         let hotkeys = self.config.hotkeys.clone();
         match key.code {
-            KeyCode::Esc => AppMode::Browser,
+            KeyCode::Esc => self.manager_return_mode(),
+            _ if hotkeys.tools.matches(key) => AppMode::Tools(ToolsView { selected: 0 }),
             _ if hotkeys.quit.matches(key) || hotkeys.network_shares.matches(key) => {
                 AppMode::Browser
             }
@@ -114,6 +115,11 @@ impl App {
                 error: None,
             })
         }
+    }
+
+    pub(crate) fn open_network_from(&mut self, manager_return: ManagerReturn) -> AppMode {
+        self.manager_return = manager_return;
+        self.open_network()
     }
 
     pub(crate) fn open_network(&mut self) -> AppMode {
