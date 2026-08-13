@@ -149,6 +149,16 @@ pub(super) fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
+    if let AppMode::Network(view) = &app.mode {
+        let items = network_shortcut_items(app, view);
+        let lines = shortcut_lines_owned(&items, area.width, usize::from(area.height));
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
+
     let context = match &app.mode {
         AppMode::Browser => None,
         AppMode::Apps(_) => Some(format!(
@@ -231,10 +241,51 @@ pub(super) fn browser_shortcut_items(app: &App) -> Vec<(String, &'static str)> {
     items
 }
 
+pub(super) fn network_shortcut_items(
+    app: &App,
+    view: &crate::app::NetworkView,
+) -> Vec<(String, &'static str)> {
+    let mut items = vec![
+        (
+            format!(
+                "↑↓/{}/{}",
+                app.config.hotkeys.down.display(),
+                app.config.hotkeys.up.display()
+            ),
+            "Move",
+        ),
+        ("Enter".into(), "Open/Connect"),
+        (app.config.hotkeys.network_add.display().into(), "Add"),
+        (app.config.hotkeys.refresh.display().into(), "Refresh"),
+    ];
+    if let Some(share) = view.shares.get(view.selected) {
+        if share.mount_path.is_some() {
+            items.push((
+                app.config.hotkeys.network_disconnect.display().into(),
+                "Disconnect",
+            ));
+        }
+        if share.saved {
+            items.push((app.config.hotkeys.network_forget.display().into(), "Forget"));
+        }
+    }
+    items.extend([
+        ("Esc".into(), "Back"),
+        (app.config.hotkeys.quit.display().into(), "Files"),
+    ]);
+    items
+}
+
 pub(super) fn shortcut_bar_height(app: &App, width: u16) -> u16 {
-    let needs_second_line = matches!(app.mode, AppMode::Browser)
-        && shortcut_items_width(&browser_shortcut_items(app)) > usize::from(width);
-    if needs_second_line {
+    let items = match &app.mode {
+        AppMode::Browser => Some(browser_shortcut_items(app)),
+        AppMode::Network(view) => Some(network_shortcut_items(app, view)),
+        _ => None,
+    };
+    if items
+        .as_ref()
+        .is_some_and(|items| shortcut_items_width(items) > usize::from(width))
+    {
         2
     } else {
         1

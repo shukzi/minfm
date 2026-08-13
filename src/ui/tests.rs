@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    app::{ArchiveView, PartitionView},
+    app::{ArchiveView, NetworkView, PartitionView},
     archive::{ArchiveEntry, ArchiveEntryKind},
     config::{Config, ConfigLoad},
-    network::{NetworkSecret, ShareAddress},
+    network::{NetworkSecret, NetworkShare, ShareAddress},
     partition,
 };
 use ratatui::{backend::TestBackend, Terminal};
@@ -1077,6 +1077,41 @@ fn footer_and_help_expose_the_network_share_hotkey() {
     app.mode = AppMode::Help;
     terminal.draw(|frame| draw(frame, &app)).unwrap();
     assert!(rendered_text(&terminal).contains("N              network shares"));
+}
+
+#[test]
+fn network_footer_exposes_disconnect_and_forget_for_selected_share() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mounted-share");
+    std::fs::create_dir(&mount).unwrap();
+    let mut app = App::new(
+        temp.path().to_path_buf(),
+        ConfigLoad::Valid {
+            config: Config::default(),
+            path: temp.path().join("config.toml"),
+        },
+        false,
+    );
+    app.mode = AppMode::Network(NetworkView {
+        shares: vec![NetworkShare {
+            address: ShareAddress::parse("smb://nas/documents").unwrap(),
+            mount_path: Some(mount),
+            username: Some("alice".into()),
+            domain: None,
+            saved: true,
+            discovered: true,
+        }],
+        selected: 0,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+
+    assert!(text.contains("u Disconnect"));
+    assert!(text.contains("d Forget"));
+    assert!(text.contains("a Add"));
+    assert!(text.contains("r Refresh"));
 }
 
 #[test]
