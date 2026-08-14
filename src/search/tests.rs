@@ -109,11 +109,18 @@ struct FakeRg {
 impl FakeRg {
     fn install(program: &Path, body: impl AsRef<[u8]>) {
         let staged = program.with_extension("staged");
-        fs::write(&staged, body).unwrap();
-        let mut permissions = fs::metadata(&staged).unwrap().permissions();
+        let mut file = fs::File::create(&staged).unwrap();
+        std::io::Write::write_all(&mut file, body.as_ref()).unwrap();
+        file.sync_all().unwrap();
+        let mut permissions = file.metadata().unwrap().permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&staged, permissions).unwrap();
+        file.set_permissions(permissions).unwrap();
+        drop(file);
         fs::rename(staged, program).unwrap();
+        fs::File::open(program.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
     }
 
     fn capturing_arguments() -> Self {

@@ -27,7 +27,8 @@ functionality.
 - **Devices:** One contextual manager for disk formatting, partition and
   filesystem maintenance, raw images, SMART tests, ATA drive settings, LUKS,
   persistent mount/encryption options, and safe eject
-- **Network:** Discover, add, open, remember, and safely disconnect Samba shares
+- **Network:** Discover, add, open, remember, transfer files through, and safely
+  disconnect Samba shares
 - **Tools:** Open the built-in launcher with `m`; use `M` for direct device management and `N` for network shares
 - **Updates:** Background startup checks with checksum-verified installation
 - **Configuration:** Invalid-configuration detection with safe-operation blocking
@@ -128,6 +129,16 @@ Without `ripgrep`, filename and metadata search remain available but content
 search is disabled. If an optional tool in `M` is unavailable, minfm explains
 what packages are required when you open it.
 
+Connected Samba shares use the desktop's authenticated GIO/GVfs session and
+behave like other browser directories. Copy, cut, and paste can transfer files
+between a share and local storage. When copy verification is enabled (the
+default), it checks file content and directory structure; metadata that one
+filesystem cannot represent, such as extended attributes on many Samba shares,
+is skipped with a warning. Cross-filesystem moves are always verified before
+minfm attempts to move the source to trash. If the source filesystem cannot do
+that, minfm keeps the source and identifies the verified destination instead of
+deleting data permanently.
+
 ## Uninstall
 
 Remove the minfm binary and its configuration data:
@@ -143,11 +154,11 @@ This deliberately leaves the shared desktop trash untouched.
 
 ## Install a specific version
 
-Pin both the installer and release asset to the same tag. Replace `v0.8.5` in
+Pin both the installer and release asset to the same tag. Replace `v0.8.6` in
 both places with the version you want:
 
 ```sh
-curl -fsSL https://github.com/shukzi/minfm/raw/v0.8.5/install.sh | MINFM_VERSION=v0.8.5 sh
+curl -fsSL https://github.com/shukzi/minfm/raw/v0.8.6/install.sh | MINFM_VERSION=v0.8.6 sh
 minfm
 ```
 

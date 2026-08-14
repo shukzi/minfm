@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -23,6 +24,71 @@ use crate::{
     safety,
     trash::{TrashEntry, TrashManager},
 };
+
+#[derive(Debug)]
+struct MetadataPreservation {
+    permissions: bool,
+    timestamps: bool,
+    xattrs: bool,
+}
+
+impl Default for MetadataPreservation {
+    fn default() -> Self {
+        Self {
+            permissions: true,
+            timestamps: true,
+            xattrs: true,
+        }
+    }
+}
+
+impl MetadataPreservation {
+    fn skip_permissions(&mut self, warnings: &mut Vec<String>) {
+        if self.permissions {
+            self.permissions = false;
+            push_warning_once(
+                warnings,
+                "destination filesystem cannot preserve Unix permissions exactly; that metadata was skipped"
+                    .into(),
+            );
+        }
+    }
+
+    fn skip_timestamps(&mut self, warnings: &mut Vec<String>) {
+        if self.timestamps {
+            self.timestamps = false;
+            push_warning_once(
+                warnings,
+                "destination filesystem cannot preserve timestamps exactly; that metadata was skipped"
+                    .into(),
+            );
+        }
+    }
+
+    fn skip_xattrs(&mut self, warnings: &mut Vec<String>) {
+        if self.xattrs {
+            self.xattrs = false;
+            push_warning_once(
+                warnings,
+                "extended attributes are unsupported by one side of this transfer; that metadata was skipped"
+                    .into(),
+            );
+        }
+    }
+}
+
+fn push_warning_once(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum XattrMatch {
+    Match,
+    Mismatch,
+    Unsupported,
+}
 
 #[derive(Debug, Clone)]
 pub enum OperationRequest {
@@ -220,10 +286,16 @@ fn copy_or_move(
             )
         })
     } else {
-        copy_safely(source, &destination, verify, cancel, warnings).and_then(|()| {
+        copy_safely(
+            source,
+            &destination,
+            verification_required(verify, cut),
+            cancel,
+            warnings,
+        )
+        .and_then(|()| {
             if cut {
-                let trash = TrashManager::for_path(source)?;
-                trash.move_to_trash(source, current_dir, config_dir)?;
+                trash_source_after_verified_copy(source, &destination, current_dir, config_dir)?;
             }
             Ok(())
         })
@@ -254,6 +326,31 @@ fn copy_or_move(
     Ok(())
 }
 
+fn verification_required(configured: bool, cut: bool) -> bool {
+    configured || cut
+}
+
+fn trash_source_after_verified_copy(
+    source: &Path,
+    destination: &Path,
+    current_dir: &Path,
+    config_dir: &Path,
+) -> Result<()> {
+    let trash_result = safety::ensure_trashable(source, current_dir, config_dir).and_then(|()| {
+        TrashManager::for_path(source).and_then(|trash| {
+            trash
+                .move_to_trash(source, current_dir, config_dir)
+                .map(|_| ())
+        })
+    });
+    trash_result.map_err(|error| {
+        MinfmError::Message(format!(
+            "copy verified at {}, but the source was retained because it could not be moved to trash: {error}",
+            destination.display()
+        ))
+    })
+}
+
 fn copy_safely(
     source: &Path,
     destination: &Path,
@@ -280,12 +377,13 @@ fn copy_safely(
         ));
     }
     let temporary = unique_partial_path(parent, name);
-    let result = copy_path(source, &temporary, cancel, warnings);
+    let mut preservation = MetadataPreservation::default();
+    let result = copy_path(source, &temporary, cancel, warnings, &mut preservation);
     if let Err(error) = result {
         cleanup_partial(&temporary);
         return Err(error);
     }
-    if verify && !verify_tree(source, &temporary)? {
+    if verify && !verify_tree(source, &temporary, &mut preservation, warnings)? {
         cleanup_partial(&temporary);
         return Err(MinfmError::Message(format!(
             "verification failed while copying {}",
@@ -399,6 +497,7 @@ fn copy_path(
     destination: &Path,
     cancel: &AtomicBool,
     warnings: &mut Vec<String>,
+    preservation: &mut MetadataPreservation,
 ) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         return Err(MinfmError::Cancelled);
@@ -412,7 +511,7 @@ fn copy_path(
         symlink(target, destination).map_err(|error| {
             io_error(format!("could not copy link {}", source.display()), error)
         })?;
-        preserve_xattrs(source, destination, warnings);
+        preserve_xattrs(source, destination, warnings, preservation);
         return Ok(());
     }
     if metadata.is_dir() {
@@ -428,9 +527,10 @@ fn copy_path(
                 &destination.join(item.file_name()),
                 cancel,
                 warnings,
+                preservation,
             )?;
         }
-        preserve_metadata(source, &metadata, destination, warnings);
+        preserve_metadata(source, &metadata, destination, warnings, preservation);
         return Ok(());
     }
     if !metadata.is_file() {
@@ -465,7 +565,7 @@ fn copy_path(
     output
         .sync_all()
         .map_err(|error| io_error(format!("could not flush {}", destination.display()), error))?;
-    preserve_metadata(source, &metadata, destination, warnings);
+    preserve_metadata(source, &metadata, destination, warnings, preservation);
     Ok(())
 }
 
@@ -474,31 +574,50 @@ fn preserve_metadata(
     metadata: &fs::Metadata,
     destination: &Path,
     warnings: &mut Vec<String>,
+    preservation: &mut MetadataPreservation,
 ) {
-    preserve_xattrs(source, destination, warnings);
-    if let Err(error) =
-        fs::set_permissions(destination, fs::Permissions::from_mode(metadata.mode()))
-    {
-        warnings.push(format!(
-            "could not preserve permissions for {}: {error}",
-            destination.display()
-        ));
+    preserve_xattrs(source, destination, warnings, preservation);
+    if preservation.permissions {
+        let expected_mode = metadata.mode() & 0o7777;
+        let permissions = fs::Permissions::from_mode(expected_mode);
+        let preserved = fs::set_permissions(destination, permissions)
+            .and_then(|()| fs::metadata(destination))
+            .map(|actual| actual.mode() & 0o7777 == expected_mode)
+            .unwrap_or(false);
+        if !preserved {
+            preservation.skip_permissions(warnings);
+        }
     }
-    let atime = FileTime::from_last_access_time(metadata);
-    let mtime = FileTime::from_last_modification_time(metadata);
-    if let Err(error) = filetime::set_file_times(destination, atime, mtime) {
-        warnings.push(format!(
-            "could not preserve timestamps for {}: {error}",
-            destination.display()
-        ));
+    if preservation.timestamps {
+        let atime = FileTime::from_last_access_time(metadata);
+        let mtime = FileTime::from_last_modification_time(metadata);
+        let preserved = filetime::set_file_times(destination, atime, mtime)
+            .and_then(|()| fs::metadata(destination))
+            .map(|actual| FileTime::from_last_modification_time(&actual) == mtime)
+            .unwrap_or(false);
+        if !preserved {
+            preservation.skip_timestamps(warnings);
+        }
     }
 }
 
-fn preserve_xattrs(source: &Path, destination: &Path, warnings: &mut Vec<String>) {
+fn preserve_xattrs(
+    source: &Path,
+    destination: &Path,
+    warnings: &mut Vec<String>,
+    preservation: &mut MetadataPreservation,
+) {
+    if !preservation.xattrs {
+        return;
+    }
     let attributes = match xattr::list(source) {
         Ok(attributes) => attributes
             .filter(|name| should_verify_xattr(name))
             .collect::<Vec<_>>(),
+        Err(error) if is_unsupported_xattr_error(&error) => {
+            preservation.skip_xattrs(warnings);
+            return;
+        }
         Err(error) => {
             warnings.push(format!(
                 "could not list extended attributes for {}: {error}",
@@ -511,6 +630,10 @@ fn preserve_xattrs(source: &Path, destination: &Path, warnings: &mut Vec<String>
         match xattr::get(source, &name) {
             Ok(Some(value)) => {
                 if let Err(error) = xattr::set(destination, &name, &value) {
+                    if is_unsupported_xattr_error(&error) {
+                        preservation.skip_xattrs(warnings);
+                        return;
+                    }
                     warnings.push(format!(
                         "could not preserve extended attribute {:?} for {}: {error}",
                         name,
@@ -519,6 +642,10 @@ fn preserve_xattrs(source: &Path, destination: &Path, warnings: &mut Vec<String>
                 }
             }
             Ok(None) => {}
+            Err(error) if is_unsupported_xattr_error(&error) => {
+                preservation.skip_xattrs(warnings);
+                return;
+            }
             Err(error) => warnings.push(format!(
                 "could not read extended attribute {:?} from {}: {error}",
                 name,
@@ -539,7 +666,12 @@ fn finalize_no_replace(temporary: &Path, destination: &Path) -> std::io::Result<
     .map_err(std::io::Error::from)
 }
 
-fn verify_tree(source: &Path, destination: &Path) -> Result<bool> {
+fn verify_tree(
+    source: &Path,
+    destination: &Path,
+    preservation: &mut MetadataPreservation,
+    warnings: &mut Vec<String>,
+) -> Result<bool> {
     let source_meta = fs::symlink_metadata(source)
         .map_err(|error| io_error(format!("could not verify {}", source.display()), error))?;
     let destination_meta = fs::symlink_metadata(destination)
@@ -547,17 +679,18 @@ fn verify_tree(source: &Path, destination: &Path) -> Result<bool> {
     if source_meta.file_type().is_symlink() {
         return Ok(destination_meta.file_type().is_symlink()
             && fs::read_link(source).ok() == fs::read_link(destination).ok()
-            && xattrs_match(source, destination)?);
+            && verified_xattrs_match(source, destination, preservation, warnings)?);
     }
     if source_meta.is_file() {
         return Ok(destination_meta.is_file()
-            && metadata_matches(&source_meta, &destination_meta)
+            && metadata_matches(&source_meta, &destination_meta, preservation)
             && source_meta.len() == destination_meta.len()
-            && xattrs_match(source, destination)?
+            && verified_xattrs_match(source, destination, preservation, warnings)?
             && files_match(source, destination)?);
     }
     if source_meta.is_dir() && destination_meta.is_dir() {
-        if !metadata_matches(&source_meta, &destination_meta) || !xattrs_match(source, destination)?
+        if !metadata_matches(&source_meta, &destination_meta, preservation)
+            || !verified_xattrs_match(source, destination, preservation, warnings)?
         {
             return Ok(false);
         }
@@ -567,7 +700,12 @@ fn verify_tree(source: &Path, destination: &Path) -> Result<bool> {
         {
             let item = item.map_err(|error| io_error("could not verify directory entry", error))?;
             source_names.insert(item.file_name());
-            if !verify_tree(&item.path(), &destination.join(item.file_name()))? {
+            if !verify_tree(
+                &item.path(),
+                &destination.join(item.file_name()),
+                preservation,
+                warnings,
+            )? {
                 return Ok(false);
             }
         }
@@ -586,50 +724,111 @@ fn verify_tree(source: &Path, destination: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn xattrs_match(source: &Path, destination: &Path) -> Result<bool> {
-    let source_names = xattr::list(source)
-        .map_err(|error| {
-            io_error(
-                format!("could not verify xattrs for {}", source.display()),
-                error,
-            )
-        })?
-        .filter(|name| should_verify_xattr(name))
-        .collect::<std::collections::HashSet<_>>();
-    let destination_names = xattr::list(destination)
-        .map_err(|error| {
-            io_error(
-                format!("could not verify xattrs for {}", destination.display()),
-                error,
-            )
-        })?
-        .filter(|name| should_verify_xattr(name))
-        .collect::<std::collections::HashSet<_>>();
-    if source_names != destination_names {
-        return Ok(false);
+fn verified_xattrs_match(
+    source: &Path,
+    destination: &Path,
+    preservation: &mut MetadataPreservation,
+    warnings: &mut Vec<String>,
+) -> Result<bool> {
+    if !preservation.xattrs {
+        return Ok(true);
     }
-    for name in source_names {
-        let source_value = xattr::get(source, &name).map_err(|error| {
-            io_error(
-                format!("could not verify xattr {:?} for {}", name, source.display()),
-                error,
-            )
-        })?;
-        let destination_value = xattr::get(destination, &name).map_err(|error| {
-            io_error(
-                format!(
-                    "could not verify xattr {:?} for {}",
-                    name,
-                    destination.display()
-                ),
-                error,
-            )
-        })?;
-        if source_value != destination_value {
-            return Ok(false);
+    match xattrs_match(source, destination)? {
+        XattrMatch::Match => Ok(true),
+        XattrMatch::Mismatch => Ok(false),
+        XattrMatch::Unsupported => {
+            preservation.skip_xattrs(warnings);
+            Ok(true)
         }
     }
-    Ok(true)
+}
+
+fn xattrs_match(source: &Path, destination: &Path) -> Result<XattrMatch> {
+    xattrs_match_with(
+        source,
+        destination,
+        |path| {
+            xattr::list(path).map(|attributes| {
+                attributes
+                    .filter(|name| should_verify_xattr(name))
+                    .collect()
+            })
+        },
+        |path, name| xattr::get(path, name),
+    )
+}
+
+fn xattrs_match_with<List, Get>(
+    source: &Path,
+    destination: &Path,
+    mut list: List,
+    mut get: Get,
+) -> Result<XattrMatch>
+where
+    List: FnMut(&Path) -> std::io::Result<HashSet<OsString>>,
+    Get: FnMut(&Path, &OsStr) -> std::io::Result<Option<Vec<u8>>>,
+{
+    let source_names = match list(source) {
+        Ok(names) => names,
+        Err(error) if is_unsupported_xattr_error(&error) => return Ok(XattrMatch::Unsupported),
+        Err(error) => {
+            return Err(io_error(
+                format!("could not verify xattrs for {}", source.display()),
+                error,
+            ));
+        }
+    };
+    let destination_names = match list(destination) {
+        Ok(names) => names,
+        Err(error) if is_unsupported_xattr_error(&error) => return Ok(XattrMatch::Unsupported),
+        Err(error) => {
+            return Err(io_error(
+                format!("could not verify xattrs for {}", destination.display()),
+                error,
+            ));
+        }
+    };
+    if source_names != destination_names {
+        return Ok(XattrMatch::Mismatch);
+    }
+    for name in source_names {
+        let source_value = match get(source, &name) {
+            Ok(value) => value,
+            Err(error) if is_unsupported_xattr_error(&error) => {
+                return Ok(XattrMatch::Unsupported);
+            }
+            Err(error) => {
+                return Err(io_error(
+                    format!("could not verify xattr {:?} for {}", name, source.display()),
+                    error,
+                ));
+            }
+        };
+        let destination_value = match get(destination, &name) {
+            Ok(value) => value,
+            Err(error) if is_unsupported_xattr_error(&error) => {
+                return Ok(XattrMatch::Unsupported);
+            }
+            Err(error) => {
+                return Err(io_error(
+                    format!(
+                        "could not verify xattr {:?} for {}",
+                        name,
+                        destination.display()
+                    ),
+                    error,
+                ));
+            }
+        };
+        if source_value != destination_value {
+            return Ok(XattrMatch::Mismatch);
+        }
+    }
+    Ok(XattrMatch::Match)
+}
+
+fn is_unsupported_xattr_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(nix::libc::EOPNOTSUPP)
 }
 
 fn should_verify_xattr(name: &OsStr) -> bool {
@@ -637,11 +836,16 @@ fn should_verify_xattr(name: &OsStr) -> bool {
     name.starts_with(b"user.") || name.starts_with(b"system.posix_acl_")
 }
 
-fn metadata_matches(source: &fs::Metadata, destination: &fs::Metadata) -> bool {
+fn metadata_matches(
+    source: &fs::Metadata,
+    destination: &fs::Metadata,
+    preservation: &MetadataPreservation,
+) -> bool {
     source.file_type() == destination.file_type()
-        && source.mode() & 0o7777 == destination.mode() & 0o7777
-        && FileTime::from_last_modification_time(source)
-            == FileTime::from_last_modification_time(destination)
+        && (!preservation.permissions || source.mode() & 0o7777 == destination.mode() & 0o7777)
+        && (!preservation.timestamps
+            || FileTime::from_last_modification_time(source)
+                == FileTime::from_last_modification_time(destination))
 }
 
 fn files_match(left: &Path, right: &Path) -> Result<bool> {
@@ -721,6 +925,12 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    fn verify_for_test(source: &Path, destination: &Path) -> bool {
+        let mut preservation = MetadataPreservation::default();
+        let mut warnings = Vec::new();
+        verify_tree(source, destination, &mut preservation, &mut warnings).unwrap()
+    }
+
     #[test]
     #[ignore]
     fn benchmark_operation_size_preflight() {
@@ -787,10 +997,98 @@ mod tests {
             xattr::get(&destination, "user.minfm-test").unwrap(),
             Some(b"preserved".to_vec())
         );
-        assert!(verify_tree(&source, &destination).unwrap());
+        assert!(verify_for_test(&source, &destination));
 
         xattr::set(&destination, "user.minfm-test", b"changed").unwrap();
-        assert!(!verify_tree(&source, &destination).unwrap());
+        assert!(!verify_for_test(&source, &destination));
+    }
+
+    #[test]
+    fn unsupported_xattrs_do_not_fail_content_verification() {
+        let source = Path::new("source");
+        let destination = Path::new("destination");
+        let result = xattrs_match_with(
+            source,
+            destination,
+            |_| Err(std::io::Error::from_raw_os_error(nix::libc::EOPNOTSUPP)),
+            |_, _| -> std::io::Result<Option<Vec<u8>>> {
+                panic!("values must not be read when xattrs are unsupported")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, XattrMatch::Unsupported);
+    }
+
+    #[test]
+    fn repeated_unsupported_metadata_has_one_operation_warning() {
+        let mut warnings = Vec::new();
+        MetadataPreservation::default().skip_xattrs(&mut warnings);
+        MetadataPreservation::default().skip_xattrs(&mut warnings);
+
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn unexpected_xattr_errors_remain_fatal() {
+        let result = xattrs_match_with(
+            Path::new("source"),
+            Path::new("destination"),
+            |_| Err(std::io::Error::from_raw_os_error(nix::libc::EIO)),
+            |_, _| -> std::io::Result<Option<Vec<u8>>> { unreachable!() },
+        );
+
+        assert!(
+            matches!(result, Err(MinfmError::Io { source, .. }) if source.raw_os_error() == Some(nix::libc::EIO))
+        );
+    }
+
+    #[test]
+    fn unavailable_metadata_does_not_weaken_byte_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::write(&source, b"matching bytes").unwrap();
+        fs::write(&destination, b"matching bytes").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut preservation = MetadataPreservation {
+            permissions: false,
+            timestamps: false,
+            xattrs: false,
+        };
+        let mut warnings = Vec::new();
+
+        assert!(verify_tree(&source, &destination, &mut preservation, &mut warnings,).unwrap());
+
+        fs::write(&destination, b"different bytes").unwrap();
+        assert!(!verify_tree(&source, &destination, &mut preservation, &mut warnings,).unwrap());
+    }
+
+    #[test]
+    fn failed_post_copy_trash_keeps_source_and_reports_verified_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(&destination, b"verified copy").unwrap();
+
+        let error = trash_source_after_verified_copy(&source, &destination, &source, temp.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"verified copy");
+        assert!(error.contains("copy verified"));
+        assert!(error.contains("source was retained"));
+    }
+
+    #[test]
+    fn cross_filesystem_moves_always_require_verification() {
+        assert!(verification_required(false, true));
+        assert!(verification_required(true, true));
+        assert!(verification_required(true, false));
+        assert!(!verification_required(false, false));
     }
 
     #[test]
@@ -913,12 +1211,12 @@ mod tests {
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("one"), b"one").unwrap();
         fs::write(destination.join("unexpected"), b"extra").unwrap();
-        assert!(!verify_tree(&source, &destination).unwrap());
+        assert!(!verify_for_test(&source, &destination));
 
         fs::remove_file(destination.join("unexpected")).unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(!verify_tree(&source, &destination).unwrap());
+        assert!(!verify_for_test(&source, &destination));
     }
 
     #[test]
@@ -944,6 +1242,39 @@ mod tests {
         copy_safely(&source, &destination, true, &cancel, &mut warnings).unwrap();
 
         assert!(warnings.is_empty());
-        assert!(verify_tree(&source, &destination).unwrap());
+        assert!(verify_for_test(&source, &destination));
+    }
+
+    #[test]
+    #[ignore = "requires MINFM_SAMBA_TEST_SOURCE to reference a mounted Samba file"]
+    fn samba_source_copy_verifies_contents_without_xattrs() {
+        let source = std::env::var_os("MINFM_SAMBA_TEST_SOURCE")
+            .map(PathBuf::from)
+            .expect("MINFM_SAMBA_TEST_SOURCE is required");
+        assert!(source.is_file());
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join(source.file_name().unwrap());
+        let operation = spawn(OperationRequest::Copy {
+            sources: vec![source.clone()],
+            destination: temp.path().to_path_buf(),
+            cut: false,
+            overwrite: false,
+            verify: true,
+            current_dir: source.parent().unwrap().to_path_buf(),
+            config_dir: temp.path().join("config"),
+        });
+        let summary = loop {
+            if let OperationUpdate::Finished(summary) = operation.receiver.recv().unwrap() {
+                break summary;
+            }
+        };
+
+        assert!(files_match(&source, &destination).unwrap());
+        assert_eq!(summary.completed, 1);
+        assert!(summary.failed.is_empty());
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("extended attributes are unsupported")));
     }
 }

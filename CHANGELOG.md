@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## v0.8.6
+
+### Changed
+
+- Connected Samba shares continue to use the authenticated GIO/GVfs session
+  for browsing and file transfers; no separate `smbclient` configuration or
+  credentials are required.
+- Copy verification now distinguishes required content integrity from optional
+  filesystem metadata. Bytes, sizes, file types, links, and directory contents
+  remain verified while unsupported permissions, timestamps, or extended
+  attributes produce one clear warning instead of invalidating the transfer.
+- Cross-filesystem moves always verify the completed destination before minfm
+  attempts to move the source to trash, even when optional copy verification is
+  disabled in configuration.
+
+### Fixed
+
+- Copying files from Samba shares no longer fails with Linux
+  `EOPNOTSUPP`/`os error 95` when GVfs cannot list extended attributes.
+- Cross-filesystem moves now explicitly report that the verified destination
+  exists and the source was retained when the source cannot be moved to trash.
+- Samba and Secret Service command launches now retry Linux's transient
+  `ETXTBSY` response, closing the remaining executable-publication race seen
+  under highly parallel test and update workloads.
+
 ## v0.8.5
 
 ### Changed

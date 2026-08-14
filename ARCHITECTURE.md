@@ -32,6 +32,9 @@ boundaries.
 - `src/cli.rs` owns command-line parsing and compatibility.
 - `src/runtime.rs` owns terminal setup/restoration, the event-driven loop,
   background polling, animation cadence, and terminal-editor handoff.
+- `src/process.rs` provides the shared bounded retry for transient Linux
+  executable-launch races; external-helper integrations should use it instead
+  of implementing feature-specific retry loops.
 
 The runtime polls every background domain in each loop turn. The bitwise `|`
 chain in `poll_background` is intentional: changing it to short-circuiting
@@ -107,7 +110,9 @@ cargo build --release --locked --target x86_64-unknown-linux-musl
 git diff --check
 ```
 
-Ignored tests are benchmarks. Run the relevant benchmark against both the
-reference and rewrite with identical fixtures, alternating run order and using
-at least five samples. A measured regression blocks a structural change until
-it is explained or removed.
+Ignored tests are benchmarks or environment-dependent integration checks. Run
+the relevant benchmark against both the reference and rewrite with identical
+fixtures, alternating run order and using at least five samples. A measured
+regression blocks a structural change until it is explained or removed. Run
+the opt-in Samba copy test with the documented mounted-file fixture when
+changing cross-filesystem transfer verification.
