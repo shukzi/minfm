@@ -96,6 +96,8 @@ Runtime integrations use Linux tools described in the README and checked by
   and persistent mount/encryption operations.
 - `src/network.rs` discovers and manages Samba shares while keeping credentials
   out of arguments and saved share metadata.
+- `src/process.rs` centralizes bounded retries for transient Linux executable
+  launch races used by external-helper integrations.
 - `src/launcher.rs` opens files and terminal editors; `src/updater.rs` performs
   checksum-verified self-updates.
 - `tests/installer.rs` exercises installer syntax, checksum handling, atomic
@@ -172,8 +174,21 @@ cargo build --release --locked --target x86_64-unknown-linux-musl
 
 That target needs a musl C toolchain such as Fedora's `musl-gcc` or Ubuntu's
 `musl-tools`. Installer changes should run `/bin/sh -n install.sh` and the
-installer integration tests. Tests marked `ignored` are isolated benchmarks;
-run the relevant benchmark explicitly when changing the path it measures.
+installer integration tests. Tests marked `ignored` are isolated benchmarks or
+environment-dependent integration checks; run the relevant one explicitly
+when changing the path it covers.
+
+To exercise verified copying from a mounted Samba share without modifying the
+share, point the opt-in test at an existing non-sensitive file:
+
+```sh
+MINFM_SAMBA_TEST_SOURCE='/run/user/UID/gvfs/smb-share:server=SERVER,share=SHARE/path/to/file' \
+  cargo test --locked operation::tests::samba_source_copy_verifies_contents_without_xattrs \
+  -- --ignored --exact
+```
+
+The test reads that file and writes only to an automatically removed local
+temporary directory.
 
 ## Changelog and releases
 

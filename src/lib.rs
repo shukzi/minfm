@@ -12,6 +12,7 @@ mod luks;
 mod network;
 mod operation;
 mod partition;
+mod process;
 mod runtime;
 mod safety;
 #[allow(dead_code)] // Foundational API consumed by the following search slices.

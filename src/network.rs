@@ -16,6 +16,8 @@ use std::{
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 
+use crate::process::spawn_with_retry;
+
 const COMMAND_OUTPUT_LIMIT: u64 = 1024 * 1024;
 const DISCOVERY_LIMIT: usize = 256;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -493,9 +495,8 @@ fn run_gio_mount(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     isolate_process_group(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start gio: {error}"))?;
+    let mut child =
+        spawn_with_retry(&mut command).map_err(|error| format!("Could not start gio: {error}"))?;
     let mut stdin = child
         .stdin
         .take()
@@ -888,8 +889,7 @@ fn store_secret(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     isolate_process_group(&mut command);
-    let mut child = command
-        .spawn()
+    let mut child = spawn_with_retry(&mut command)
         .map_err(|error| format!("Could not start secret-tool: {error}"))?;
     child
         .stdin
@@ -994,8 +994,7 @@ struct CommandOutput {
 fn run_command(mut command: Command, timeout: Duration) -> Result<CommandOutput, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     isolate_process_group(&mut command);
-    let child = command
-        .spawn()
+    let child = spawn_with_retry(&mut command)
         .map_err(|error| format!("Could not start command: {error}"))?;
     wait_for_child(child, timeout)
 }
@@ -1299,7 +1298,7 @@ mod tests {
         .unwrap();
 
         let shares = discover(&environment).unwrap();
-        assert_eq!(shares.len(), 3);
+        assert_eq!(shares.len(), 3, "shares: {shares:#?}");
         assert!(shares.iter().any(|share| share.saved));
         assert!(shares.iter().any(|share| share.discovered));
         assert!(shares.iter().any(|share| share.mount_path.is_some()));
@@ -1533,7 +1532,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("stalled command unexpectedly completed"),
         };
-        assert!(error.contains("timed out"));
+        assert!(error.contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

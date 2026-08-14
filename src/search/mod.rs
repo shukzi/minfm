@@ -29,7 +29,10 @@ thread_local! {
     static SORT_KEY_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-use crate::entry::{EntryKind, FileEntry};
+use crate::{
+    entry::{EntryKind, FileEntry},
+    process::spawn_with_retry,
+};
 
 const UPDATE_QUEUE_CAPACITY: usize = 256;
 const RG_BATCH_MAX_PATHS: usize = 128;
@@ -273,9 +276,8 @@ fn run_rg_batch_with_command(
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::from(stderr_writer))
         .process_group(0);
-    let mut child = process
-        .spawn()
-        .map_err(|error| RgError::Failed(error.to_string()))?;
+    let mut child =
+        spawn_with_retry(&mut process).map_err(|error| RgError::Failed(error.to_string()))?;
     #[cfg(test)]
     if let Some(metrics) = &request.metrics_hook {
         metrics.lock().unwrap().rg_leader_pid = Some(child.id());

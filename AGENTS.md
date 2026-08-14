@@ -27,7 +27,8 @@ The principal modules are:
 - `partition/`, `luks.rs`, and `safety.rs`: storage inventory, geometry, policy,
   validation, command planning, trusted execution, and destructive-operation
   safeguards.
-- `network.rs`: optional network-share integration.
+- `network.rs`: optional network-share integration; `process.rs`: bounded
+  recovery from transient executable-launch races shared by external helpers.
 - `config.rs`, `icons.rs`, and `updater.rs`: configuration, bundled icon use,
   and safe self-updates.
 
@@ -113,10 +114,10 @@ cargo build --release --locked --target x86_64-unknown-linux-musl
 git diff --check
 ```
 
-Tests marked `ignored` are isolated benchmarks or expensive measurements; run
-the relevant ones explicitly when changing the paths they measure. Hardware
-tests require a disposable device and explicit verification that it is not a
-system/root device.
+Tests marked `ignored` are isolated benchmarks, expensive measurements, or
+environment-dependent integration checks; run the relevant ones explicitly
+when changing the paths they cover. Hardware tests require a disposable device
+and explicit verification that it is not a system/root device.
 
 ## Releases
 
