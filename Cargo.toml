@@ -14,7 +14,7 @@ filetime = "0.2"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 globset = { version = "0.4", default-features = false }
 ignore = { version = "0.4", default-features = false }
-nix = { version = "0.29", default-features = false, features = ["fs", "user"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 percent-encoding = "2.3"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 regex = { version = "1", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 tar = "0.4"
 tempfile = "3"
 thiserror = "2"
-toml = "0.8"
+toml = "1.1"
 unicode-casefold = "0.2"
 unicode-segmentation = "1"
 unicode-width = "0.2"
