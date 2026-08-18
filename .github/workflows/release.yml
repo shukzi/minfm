@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
@@ -78,7 +78,7 @@ jobs:
           }
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: release/release-notes.md
           files: |
