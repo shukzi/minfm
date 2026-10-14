@@ -28,7 +28,7 @@ unicode-casefold = "0.2"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 xattr = "1.6"
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 
 [profile.release]
 lto = "thin"
