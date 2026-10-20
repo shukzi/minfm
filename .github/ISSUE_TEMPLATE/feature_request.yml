@@ -1,0 +1,42 @@
+name: Feature suggestion
+description: Suggest an improvement to minfm
+title: "[Feature]: "
+labels:
+  - enhancement
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues](https://github.com/shukzi/minfm/issues) and the [roadmap](https://github.com/shukzi/minfm/blob/main/ROADMAP.md) before opening a new suggestion.
+        Describe the problem and the outcome you need. Suggestions do not guarantee implementation or a delivery date.
+        The maintainer handles all official changes and pull requests; please use this form instead of submitting a patch.
+        Reports and attachments are public. Remove credentials, keys, private paths, hostnames, device identifiers, and other sensitive information.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and what is difficult or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: How would the improvement help your workflow? You do not need to propose an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround or alternatives
+      description: How do you handle this now? Mention existing minfm settings, commands, or other tools you have tried.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Optional. Add relevant examples, related issues, or redacted screenshots.

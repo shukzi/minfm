@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a problem with minfm
+title: "[Bug]: "
+labels:
+  - bug
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues](https://github.com/shukzi/minfm/issues) before opening a new report.
+        Reports and attachments are public. Remove credentials, keys, private paths, hostnames, device identifiers, and other sensitive information.
+        Report suspected vulnerabilities privately through the [security policy](https://github.com/shukzi/minfm/blob/main/SECURITY.md).
+        Use disposable data or devices when reproducing storage-sensitive behavior.
+
+  - type: input
+    id: version
+    attributes:
+      label: minfm version
+      description: Run `minfm --version`, or provide the commit if you built from source.
+      placeholder: Version or commit
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: System details
+      description: Include what you know; write "unknown" for details you cannot find.
+      placeholder: |
+        Linux distribution and version:
+        Terminal emulator:
+        Installation method (installer, in-app update, release binary, or source build):
+        Kernel and filesystem, if relevant:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Describe the smallest safe sequence and how often it fails. For intermittent problems, describe what happened before the failure.
+      placeholder: |
+        1. Start minfm in ...
+        2. Navigate to ...
+        3. Press ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include the exact sanitized error message when available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Relevant configuration
+      description: Optional. Include only relevant, sanitized differences from `config.example.toml`.
+      render: toml
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, screenshots, or additional context
+      description: Optional. Include only relevant, redacted evidence. Check text and attachments for private data before posting.
